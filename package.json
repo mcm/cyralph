@@ -1,0 +1,33 @@
+{
+  "name": "cyralph",
+  "version": "0.1.0",
+  "description": "A Cyrus-style Linear agent that executes ralph-tui structured PRD epics story by story",
+  "type": "module",
+  "bin": {
+    "cyralph": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js start",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.285",
+    "@linear/sdk": "^97.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  }
+}

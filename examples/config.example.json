@@ -1,0 +1,30 @@
+{
+  "port": 3457,
+  "model": "opus",
+  "maxConcurrentSessions": 2,
+  "linear": {
+    "clientId": "<linear oauth app client id>",
+    "clientSecret": "<linear oauth app client secret>",
+    "webhookSecret": "<linear oauth app webhook signing secret>"
+  },
+  "ralph": {
+    "maxAttemptsPerStory": 3,
+    "maxIterationsPerRun": 50,
+    "materializeStories": true,
+    "pushPerStory": true,
+    "createPullRequest": true,
+    "markPrReadyWhenComplete": true,
+    "epicCompletedStateName": "In Review"
+  },
+  "repositories": [
+    {
+      "id": "app",
+      "name": "acme/app",
+      "repositoryPath": "/home/me/code/app",
+      "baseBranch": "main",
+      "teamKeys": ["ENG"],
+      "setupCommand": "pnpm install",
+      "verifyCommands": ["pnpm typecheck", "pnpm lint", "pnpm test"]
+    }
+  ]
+}
