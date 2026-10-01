@@ -51,10 +51,26 @@ A `> Branch: \`name\`` line in the PRD sets the branch. Otherwise the branch is 
 - **Pull request**: attached to the session as an external link.
 - **Replies to the session**:
   - `stop` (or the stop button) aborts the current iteration. An interrupted attempt doesn't count.
-  - Anything else is **guidance**. It goes into every later story prompt. If the run is paused, it
-    also resets the attempt budget of stories that were set aside and resumes the loop.
+  - Anything else is an **instruction**. See *@mentions and requests* below.
 - **Re-delegation**: re-delegating the same issue creates a new session. It keeps the branch, the PR
   and the guidance, and skips stories that are already done.
+
+### @mentions and requests
+
+The text of an @mention comment (minus the mention itself), and any reply in the session, is
+treated the way Cyrus treats it, as something to act on:
+
+- **If stories are still to do**, the text becomes **guidance**. It goes into every later story
+  prompt, and the first story that runs with it counts as having handled it. Replying to a paused
+  run also gives the stories that were set aside a fresh attempt budget.
+- **If no story runs** (the epic is already finished, the rest is stuck, or the epic is blocked),
+  the text runs as one **direct request session** in the epic's worktree. Unlike story sessions,
+  that agent may commit, push the epic branch and use `gh`. Its prompt includes the epic status,
+  the branch, `origin` and the PR. Its final message becomes the session's response. For example:
+  > @cyralph there is now a git remote, git@github.com:me/app.git, can you push and create a PR?
+- **As a safety net**, when the epic finishes cyralph pushes any commits `origin` doesn't have
+  yet, and opens or links the PR. With no remote, stories are committed locally without push errors
+  and are pushed once a remote exists.
 
 ## Blocking / blocked-by
 

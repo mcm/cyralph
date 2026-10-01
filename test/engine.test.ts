@@ -14,7 +14,7 @@ import { FakeLinear } from "./fakes.js";
 
 const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 
-function makeRepo() {
+function makeRepo(opts: { remote?: boolean } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "cyralph-test-"));
 	const origin = join(root, "origin.git");
 	const repo = join(root, "repo");
@@ -27,6 +27,7 @@ function makeRepo() {
 	sh(repo, "add", ".");
 	sh(repo, "commit", "-m", "init");
 	sh(repo, "push", "-u", "origin", "main");
+	if (opts.remote === false) sh(repo, "remote", "remove", "origin");
 	return { root, origin, repo };
 }
 
@@ -58,8 +59,8 @@ class ScriptedRunner implements AgentRunner {
 	}
 }
 
-function setup(overrides: Record<string, unknown> = {}) {
-	const { root, repo, origin } = makeRepo();
+function setup(overrides: Record<string, unknown> = {}, repoOpts: { remote?: boolean } = {}) {
+	const { root, repo, origin } = makeRepo(repoOpts);
 	const config = parseConfig(
 		{
 			repositories: [{ id: "app", name: "app", repositoryPath: repo, baseBranch: "main" }],
@@ -342,6 +343,100 @@ describe("blocking / blocked-by relations", () => {
 		await t.manager.handle({ kind: "created", sessionId: "b-5", issueId: epic.id });
 		await t.manager.idle();
 		expect(t.store.get("b-5")?.status).toBe("completed");
+	});
+});
+
+describe("direct requests from the Linear thread (@mentions)", () => {
+	const isRequest = (c: RunRequest) => c.prompt.includes("## Request from your team");
+
+	it("acts on a mention when the epic is already finished: push + PR with a remote added later", async () => {
+		const t = setup({}, { remote: false });
+		const { epic } = ralphEpic(t.linear);
+
+		// Epic gets built while the repo has no remote: no push errors, nothing pushed.
+		await t.manager.handle({ kind: "created", sessionId: "r-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("r-1")?.status).toBe("completed");
+		expect(t.linear.bodies("error")).toEqual([]);
+		expect(t.git.prs).toEqual([]);
+
+		// The user adds a remote and @mentions the agent in a new session.
+		sh(t.repo, "remote", "add", "origin", t.origin);
+		const runner = t.runner;
+		const original = runner.run.bind(runner);
+		runner.run = async (req) => {
+			if (!isRequest(req)) return original(req);
+			runner.calls.push(req);
+			return { output: "Pushed the branch and opened https://github.com/acme/app/pull/7.", isError: false, aborted: false };
+		};
+		await t.manager.handle({
+			kind: "created",
+			sessionId: "r-2",
+			issueId: epic.id,
+			commentBody: "@minecraftmodscyralph there is now a git remote, git@github.com:acme/app.git, can you push and create a PR?",
+		});
+		await t.manager.idle();
+
+		const req = t.runner.calls.at(-1);
+		expect(t.runner.calls.filter(isRequest)).toHaveLength(1);
+		expect(req?.systemAppend).toContain("You may use git");
+		expect(req?.prompt).toContain("> there is now a git remote, git@github.com:acme/app.git, can you push and create a PR?");
+		expect(req?.prompt).toContain(`Git remote \`origin\`: \`${t.origin}\``);
+		expect(req?.prompt).toContain("## Status: 3/3 stories complete");
+		expect(req?.prompt).toContain("gh pr create --base main --head eng-1-task-priority");
+
+		// Safety net: the orchestrator pushes unpushed commits and links the PR either way.
+		const wt = t.store.get("r-2")?.worktreePath ?? "";
+		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(sh(wt, "rev-parse", "HEAD").trim());
+		expect(t.store.get("r-2")?.prUrl).toBe("https://github.com/acme/app/pull/7");
+		expect(t.store.get("r-2")?.pendingRequests).toEqual([]);
+		expect(t.linear.bodies("response").at(-1)).toBe("Pushed the branch and opened https://github.com/acme/app/pull/7.");
+	});
+
+	it("treats a mention as story guidance when stories remain (no extra request session)", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "r-3", issueId: epic.id, commentBody: "@cyralph use the existing Priority enum" });
+		await t.manager.idle();
+		expect(t.runner.calls.some(isRequest)).toBe(false);
+		expect(t.runner.calls[0]?.prompt).toContain("- use the existing Priority enum");
+		expect(t.store.get("r-3")?.pendingRequests).toEqual([]);
+		expect(t.linear.bodies("response").at(-1)).toContain("all 3 stories of **ENG-1**");
+	});
+
+	it("handles a reply on a finished session as a direct request", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "r-4", issueId: epic.id });
+		await t.manager.idle();
+		const before = t.runner.calls.length;
+		await t.manager.handle({ kind: "prompted", sessionId: "r-4", issueId: epic.id, body: "Add a CHANGELOG entry for this epic" });
+		await t.manager.idle();
+		const after = t.runner.calls.slice(before);
+		expect(after).toHaveLength(1);
+		expect(isRequest(after[0]!)).toBe(true);
+		expect(after[0]?.prompt).toContain("> Add a CHANGELOG entry for this epic");
+	});
+
+	it("runs a direct request even while the epic is blocked, then stays parked", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const blocker = t.linear.add({ title: "Design review", identifier: "ENG-99" });
+		t.linear.blocks.set(epic.id, [blocker.id]);
+		await t.manager.handle({ kind: "created", sessionId: "r-5", issueId: epic.id, commentBody: "@cyralph summarise the plan in the PR description" });
+		await t.manager.idle();
+		expect(t.runner.calls.map(isRequest)).toEqual([true]);
+		expect(t.store.get("r-5")?.status).toBe("blocked");
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("is still blocked on **ENG-99**");
+	});
+
+	it("ignores a bare mention with no instruction", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "r-6", issueId: epic.id, commentBody: "@cyralph" });
+		await t.manager.idle();
+		expect(t.runner.calls.some(isRequest)).toBe(false);
+		expect(t.store.get("r-6")?.guidance).toEqual([]);
 	});
 });
 

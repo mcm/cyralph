@@ -102,8 +102,12 @@ export class SessionManager {
 			record.guidance = [...previous.guidance];
 			record.completedKeys = [...previous.completedKeys];
 		}
-		const instruction = event.commentBody?.trim();
-		if (instruction && !/^@\S+$/.test(instruction)) record.guidance.push(instruction);
+		// The @mention comment is an instruction: guidance for stories, or a direct request.
+		const instruction = event.commentBody?.trim().replace(/^@[\w.-]+[,:]?\s*/, "").trim();
+		if (instruction) {
+			record.guidance.push(instruction);
+			record.pendingRequests.push(instruction);
+		}
 		await this.store.save(record);
 		this.enqueue(record);
 	}
@@ -137,16 +141,17 @@ export class SessionManager {
 			record.waitingOn = [];
 		} else if (text) {
 			record.guidance.push(text);
+			record.pendingRequests.push(text);
 		}
 		if (this.active.has(record.sessionId)) {
 			await this.store.save(record);
-			await reporter.thought("Got it. I'll apply this from the next story iteration onward.");
+			await reporter.thought("Got it. I'll apply this from the next story iteration, or handle it directly once the stories are done.");
 			return;
 		}
 		// Paused/finished/stopped: guidance earns every set-aside story a fresh set of attempts.
 		record.attempts = {};
 		await this.store.save(record);
-		await reporter.thought("Resuming the epic with your guidance.");
+		await reporter.thought("On it.");
 		this.enqueue(record);
 	}
 

@@ -73,6 +73,10 @@ export interface GitWorkspace {
 	prepare(opts: { repositoryPath: string; workspaceBaseDir: string; branch: string; baseBranch: string }): Promise<PreparedWorkspace>;
 	/** Stage everything and commit; returns the commit sha, or undefined when there was nothing to commit. */
 	commitAll(cwd: string, message: string): Promise<string | undefined>;
+	/** URL of the `origin` remote, if one is configured. */
+	remoteUrl(cwd: string): Promise<string | undefined>;
+	/** True when `origin` exists and the branch has commits it doesn't have yet. */
+	needsPush(cwd: string, baseBranch: string): Promise<boolean>;
 	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
 	stashAll(cwd: string, message: string): Promise<boolean>;
 	push(cwd: string, branch: string): Promise<void>;
@@ -121,6 +125,21 @@ export class CliGitWorkspace implements GitWorkspace {
 		if ((await git(["diff", "--cached", "--quiet"], cwd)).code === 0) return undefined;
 		await gitOrThrow(["commit", "-m", message], cwd);
 		return gitOrThrow(["rev-parse", "HEAD"], cwd);
+	}
+
+	async remoteUrl(cwd: string): Promise<string | undefined> {
+		const r = await git(["remote", "get-url", "origin"], cwd);
+		return r.code === 0 ? r.stdout.trim() || undefined : undefined;
+	}
+
+	async needsPush(cwd: string, baseBranch: string): Promise<boolean> {
+		if (!(await this.remoteUrl(cwd))) return false;
+		await git(["fetch", "origin"], cwd);
+		const upstream = await git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd);
+		const hasRemoteBase = (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${baseBranch}`], cwd)).code === 0;
+		const range = upstream.code === 0 ? "@{u}..HEAD" : `${hasRemoteBase ? `origin/${baseBranch}` : baseBranch}..HEAD`;
+		const count = await git(["rev-list", "--count", range], cwd);
+		return count.code === 0 && Number(count.stdout.trim()) > 0;
 	}
 
 	async stashAll(cwd: string, message: string): Promise<boolean> {

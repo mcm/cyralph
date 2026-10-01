@@ -185,3 +185,50 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 	};
 	return renderTemplate(template, vars).trim();
 }
+
+export interface RequestPromptContext {
+	epic: Epic;
+	requests: string[];
+	branch: string;
+	baseBranch: string;
+	remoteUrl?: string;
+	prUrl?: string;
+	progressFile: string;
+	qualityGates: string[];
+}
+
+/**
+ * Prompt for a direct request from the Linear thread (an @mention or reply that no story
+ * iteration picked up), e.g. "push and open a PR". Like Cyrus, the agent acts on it itself.
+ */
+export function buildRequestPrompt(ctx: RequestPromptContext): string {
+	const { epic } = ctx;
+	const done = epic.stories.filter((s) => s.status === "completed" || s.status === "cancelled").length;
+	const prd = epic.kind === "single" ? "" : epic.description.trim();
+	const lines = [
+		`You are working on Linear ${epic.identifier}: ${epic.title}.`,
+		epic.kind === "single"
+			? `It is implemented on branch \`${ctx.branch}\` (base \`${ctx.baseBranch}\`) in this git worktree.`
+			: `It is a PRD epic implemented one story per commit on branch \`${ctx.branch}\` (base \`${ctx.baseBranch}\`) in this git worktree.`,
+		"",
+		`## Status: ${done}/${epic.stories.length} stories complete`,
+		formatStoryList(epic),
+		"",
+		`- Git remote \`origin\`: ${ctx.remoteUrl ? `\`${ctx.remoteUrl}\`` : "none configured"}`,
+		`- Pull request: ${ctx.prUrl ?? "none opened yet"}`,
+		`- Progress log (learnings from earlier sessions): \`${ctx.progressFile}\``,
+		...(ctx.qualityGates.length ? [`- Quality gates: ${ctx.qualityGates.map((g) => `\`${g}\``).join(", ")}`] : []),
+		...(prd ? ["", "<prd-document>", prd.length > 6000 ? `${prd.slice(0, 6000)}\n…` : prd, "</prd-document>"] : []),
+		"",
+		"## Request from your team",
+		...ctx.requests.map((r) => `> ${r.trim().replace(/\n/g, "\n> ")}\n`),
+		"## How to handle it",
+		"- This is a direct request, not a story. Do what it asks, and nothing beyond it.",
+		`- You may commit, and push \`${ctx.branch}\` to \`origin\` (\`git push -u origin ${ctx.branch}\`), when the request calls for it. Never force-push and never push to \`${ctx.baseBranch}\`.`,
+		`- For a pull request: check \`gh pr view ${ctx.branch}\` first; if none exists, \`gh pr create --base ${ctx.baseBranch} --head ${ctx.branch} --title "${epic.identifier}: ${epic.title.replace(/"/g, "'")}"\` with a body summarising the stories. Use \`--draft\` unless all stories are complete.`,
+		"- If you change code, run the quality gates and commit with a clear message.",
+		"- If the request is ambiguous or can't be done (e.g. missing credentials), say exactly what's missing instead of guessing.",
+		"- Finish with a short summary for the Linear thread of what you did, including any PR URL.",
+	];
+	return lines.join("\n").trim();
+}

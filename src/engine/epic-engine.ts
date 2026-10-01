@@ -10,14 +10,14 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ActivityReporter } from "../agent/activity.js";
-import type { AgentRunner } from "../agent/runner.js";
+import { type AgentRunner, REQUEST_SYSTEM_APPEND } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, GitWorkspace } from "../git/workspace.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
 import type { LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
-import { COMPLETE_PATTERN, DEFAULT_STORY_TEMPLATE, buildStoryPrompt } from "../ralph/prompt.js";
+import { COMPLETE_PATTERN, DEFAULT_STORY_TEMPLATE, buildRequestPrompt, buildStoryPrompt } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
 import { selectRepository } from "./routing.js";
@@ -101,13 +101,17 @@ export class EpicEngine {
 		record.focusStoryKey ??= loaded.focusStoryKey;
 		for (const s of epic.stories) if (record.completedKeys.includes(s.key)) s.status = "completed";
 
+		let rootBlockers: Array<{ id: string; identifier: string }> = [];
 		if (record.ignoreBlockers) {
 			// A human said to go ahead: outside blockers no longer gate any story.
 			for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d));
 		} else {
-			// Blocked-by on the epic (or plain issue) itself gates the whole run, as in Cyrus.
-			const rootBlockers = await openRootBlockers(linear, epic);
-			if (rootBlockers.length > 0) return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is blocked`);
+			// Blocked-by on the epic (or plain issue) itself gates the story work, as in Cyrus.
+			rootBlockers = await openRootBlockers(linear, epic);
+			// Direct requests (e.g. "push and open a PR") aren't story work, so they still run.
+			if (rootBlockers.length > 0 && record.pendingRequests.length === 0) {
+				return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is blocked`);
+			}
 		}
 		record.waitingOn = [];
 
@@ -148,6 +152,14 @@ export class EpicEngine {
 
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
+
+		if (rootBlockers.length > 0) {
+			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+			if (requestOutput) await reporter.thought(requestOutput);
+			await this.adoptPullRequest(ctx, epic, repo, worktree);
+			return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is still blocked`);
+		}
+
 		const template = repo.promptTemplatePath ? await readFile(repo.promptTemplatePath, "utf8") : DEFAULT_STORY_TEMPLATE;
 		const verifyCommands = [...(repo.verifyCommands ?? []), ...(repo.runPrdQualityGates ? epic.qualityGates : [])];
 
@@ -174,7 +186,59 @@ export class EpicEngine {
 			await this.runStory({ ctx, epic, story, repo, worktree, progressFile, template, verifyCommands, exhausted });
 		}
 
-		return this.finish({ ctx, epic, repo, worktree, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap });
+		// Instructions no story iteration picked up (e.g. "push and open a PR" on a finished epic)
+		// run as a direct request, the way Cyrus handles an @mention.
+		const requestOutput = ctx.abortSignal.aborted
+			? undefined
+			: await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+
+		return this.finish({ ctx, epic, repo, worktree, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap, requestOutput });
+	}
+
+	/** Run pending thread requests as one direct agent session. Returns its summary for the thread. */
+	private async runRequests(args: { ctx: EngineRun; epic: Epic; repo: RepositoryConfig; worktree: string; progressFile: string }): Promise<string | undefined> {
+		const { ctx, epic, repo, worktree, progressFile } = args;
+		const { config, runner, git } = this.deps;
+		const { record, reporter } = ctx;
+		const requests = [...record.pendingRequests];
+		if (requests.length === 0) return undefined;
+
+		await reporter.thought(requests.length === 1 ? "Working on your request." : `Working on your ${requests.length} requests.`);
+		const prompt = buildRequestPrompt({
+			epic,
+			requests,
+			branch: record.branch ?? epic.branchName,
+			baseBranch: repo.baseBranch,
+			remoteUrl: await git.remoteUrl(worktree),
+			prUrl: record.prUrl,
+			progressFile,
+			qualityGates: [...epic.qualityGates, ...(repo.verifyCommands ?? [])],
+		});
+		const result = await runner.run({
+			prompt,
+			cwd: worktree,
+			additionalDirectories: [join(progressFile, "..")],
+			model: repo.model ?? config.model,
+			fallbackModel: config.fallbackModel,
+			allowedTools: repo.allowedTools,
+			disallowedTools: repo.disallowedTools,
+			permissionMode: config.permissionMode,
+			abortSignal: ctx.abortSignal,
+			onEvent: reporter.onRunnerEvent,
+			systemAppend: REQUEST_SYSTEM_APPEND,
+		});
+		record.totalCostUsd += result.costUsd ?? 0;
+		if (result.aborted) return undefined; // keep the requests pending for the next run
+		record.pendingRequests = record.pendingRequests.filter((r) => !requests.includes(r));
+		await ctx.persist();
+		if (result.isError) return `I ran into an error working on your request (${result.errorMessage ?? "unknown error"}).\n\n${tail(result.output, 2000)}`.trim();
+		return result.output.trim() || "Done.";
+	}
+
+	/** Pick up a PR the agent opened itself (e.g. via a direct request) so the session links it. */
+	private async adoptPullRequest(ctx: EngineRun, epic: Epic, repo: RepositoryConfig, worktree: string): Promise<void> {
+		if (ctx.record.prUrl || !(await this.deps.git.remoteUrl(worktree))) return;
+		await this.syncPullRequest(ctx, epic, repo, worktree, false).catch((e: unknown) => this.deps.log.warn(`PR sync failed: ${String(e)}`));
 	}
 
 	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig): string {
@@ -219,6 +283,7 @@ export class EpicEngine {
 		await reporter.plan(planFor(epic, story, args.exhausted()));
 		await reporter.thought(`▶️ **${story.storyId}: ${story.title}** (attempt ${attempt}/${max})`);
 
+		const pendingAtStart = [...record.pendingRequests];
 		const progress = await readProgress(progressFile);
 		const prompt = buildStoryPrompt(
 			{
@@ -249,6 +314,10 @@ export class EpicEngine {
 			onEvent: reporter.onRunnerEvent,
 		});
 		record.totalCostUsd += result.costUsd ?? 0;
+		if (!result.aborted) {
+			// The story prompt carried these as guidance, so they've been acted on.
+			record.pendingRequests = record.pendingRequests.filter((r) => !pendingAtStart.includes(r));
+		}
 
 		if (result.aborted) {
 			record.attempts[story.key] = attempt - 1; // an interrupted attempt doesn't count
@@ -319,7 +388,8 @@ export class EpicEngine {
 			await linear.addComment(story.issueId, note).catch((e: unknown) => log.warn(String(e)));
 		}
 
-		if (sha && config.ralph.pushPerStory && record.branch) {
+		// No remote yet is fine: commits stay local and are pushed once `origin` exists.
+		if (sha && config.ralph.pushPerStory && record.branch && (await git.remoteUrl(worktree))) {
 			try {
 				await git.push(worktree, record.branch);
 				await this.syncPullRequest(ctx, epic, repo, worktree, false);
@@ -335,6 +405,7 @@ export class EpicEngine {
 		const { config, git } = this.deps;
 		const { record, reporter } = ctx;
 		if (!config.ralph.createPullRequest || !record.branch) return;
+		if (!(await git.remoteUrl(worktree))) return; // nothing to open a PR against yet
 		const body = prBody(epic);
 		if (!record.prUrl) {
 			const pr = await git.ensurePullRequest(worktree, {
@@ -361,8 +432,10 @@ export class EpicEngine {
 		inScope: (s: Story) => boolean;
 		exhausted: Set<string>;
 		hitCap: boolean;
+		/** Summary from a direct request session, posted as the outcome. */
+		requestOutput?: string;
 	}): Promise<SessionStatus> {
-		const { ctx, epic, repo, worktree, inScope, exhausted, hitCap } = args;
+		const { ctx, epic, repo, worktree, inScope, exhausted, hitCap, requestOutput } = args;
 		const { config, linear, log } = this.deps;
 		const { record, reporter } = ctx;
 		await reporter.plan(planFor(epic, undefined, exhausted));
@@ -376,6 +449,14 @@ export class EpicEngine {
 		const cost = record.totalCostUsd > 0 ? ` (≈$${record.totalCostUsd.toFixed(2)} of agent usage)` : "";
 		if (isEpicComplete(scoped)) {
 			const all = isEpicComplete(epic.stories);
+			// Commits that never reached a remote (e.g. origin was added after the stories ran).
+			if (config.ralph.pushPerStory && record.branch) {
+				try {
+					if (await this.deps.git.needsPush(worktree, repo.baseBranch)) await this.deps.git.push(worktree, record.branch);
+				} catch (err) {
+					await reporter.error(`Push failed: ${String(err)}`);
+				}
+			}
 			try {
 				await this.syncPullRequest(ctx, epic, repo, worktree, all && config.ralph.markPrReadyWhenComplete);
 			} catch (err) {
@@ -386,12 +467,20 @@ export class EpicEngine {
 					.setIssueState(epic.issueId, { name: config.ralph.epicCompletedStateName, type: config.ralph.epicCompletedStateType ?? undefined })
 					.catch((e: unknown) => log.warn(String(e)));
 			}
+			if (requestOutput) {
+				const link = record.prUrl && !requestOutput.includes(record.prUrl) ? `\n\nPull request: ${record.prUrl}` : "";
+				await reporter.response(`${requestOutput}${link}`);
+				return "completed";
+			}
 			const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
 			await reporter.response(
 				`Finished ${what} on \`${record.branch}\`${cost}.${record.prUrl ? `\n\nPull request: ${record.prUrl}` : ""}`,
 			);
 			return "completed";
 		}
+
+		if (requestOutput) await reporter.thought(requestOutput);
+		await this.adoptPullRequest(ctx, epic, repo, worktree);
 
 		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
 		const isOpen = (d: string) => {

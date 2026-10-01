@@ -20,6 +20,8 @@ export interface RunRequest {
 	permissionMode: "bypassPermissions" | "acceptEdits" | "dontAsk" | "auto";
 	abortSignal: AbortSignal;
 	onEvent?: (event: RunnerEvent) => void;
+	/** Replaces the story-mode system prompt addition (e.g. for direct requests). */
+	systemAppend?: string;
 }
 
 export interface RunResult {
@@ -45,6 +47,12 @@ export const RALPH_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer wo
 - Work only on the single story you are given; other stories get their own sessions.
 - Never run git commit, git push, or open pull requests: the orchestrator handles version control and Linear updates.
 - Be precise and verifiable. Only emit <promise>COMPLETE</promise> when the story truly meets its acceptance criteria.`;
+
+/** System prompt addition for direct requests from the Linear thread (Cyrus-style @mentions). */
+export const REQUEST_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer responding to a request in a Linear agent session about a PRD epic.
+- Do what the request asks. You may use git (commit, push) and the GitHub CLI (gh) when the request calls for it.
+- Only push the epic branch you are on. Never force-push, rewrite published history, or push to the base branch.
+- Your final message is posted to the Linear thread: summarise what you did, with links (e.g. the PR URL).`;
 
 function textOfToolResult(content: unknown): string {
 	if (typeof content === "string") return content;
@@ -73,7 +81,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 			disallowedTools: req.disallowedTools,
 			permissionMode: req.permissionMode,
 			allowDangerouslySkipPermissions: req.permissionMode === "bypassPermissions",
-			systemPrompt: { type: "preset", preset: "claude_code", append: RALPH_SYSTEM_APPEND },
+			systemPrompt: { type: "preset", preset: "claude_code", append: req.systemAppend ?? RALPH_SYSTEM_APPEND },
 			settingSources: ["project", "local"],
 		};
 

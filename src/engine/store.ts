@@ -23,6 +23,11 @@ export interface SessionRecord {
 	lastFeedback: Record<string, string>;
 	/** Follow-up instructions from the Linear session, included in every prompt. */
 	guidance: string[];
+	/**
+	 * Instructions (from the @mention comment or replies) not yet acted on. A story iteration that
+	 * saw them as guidance consumes them; otherwise they run as a direct request session.
+	 */
+	pendingRequests: string[];
 	/** Completed story keys for in-memory ("prd" kind) epics that were not materialized. */
 	completedKeys: string[];
 	focusStoryKey?: string;
@@ -48,6 +53,7 @@ export function newRecord(sessionId: string, issueId: string, identifier?: strin
 		attempts: {},
 		lastFeedback: {},
 		guidance: [],
+		pendingRequests: [],
 		completedKeys: [],
 		waitingOn: [],
 		totalCostUsd: 0,
@@ -65,7 +71,7 @@ export class SessionStore {
 	async load(): Promise<void> {
 		try {
 			const data = JSON.parse(await readFile(this.file, "utf8")) as { sessions?: SessionRecord[] };
-			for (const r of data.sessions ?? []) this.records.set(r.sessionId, { ...r, waitingOn: r.waitingOn ?? [] });
+			for (const r of data.sessions ?? []) this.records.set(r.sessionId, { ...r, waitingOn: r.waitingOn ?? [], pendingRequests: r.pendingRequests ?? [] });
 		} catch {
 			// first run
 		}
