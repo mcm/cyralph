@@ -14,7 +14,7 @@ import { type AgentRunner, REQUEST_SYSTEM_APPEND } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, GitWorkspace } from "../git/workspace.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
-import type { LinearGateway, PlanStep } from "../linear/gateway.js";
+import type { IssueSummary, LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
 import { COMPLETE_PATTERN, DEFAULT_STORY_TEMPLATE, buildRequestPrompt, buildStoryPrompt } from "../ralph/prompt.js";
@@ -40,6 +40,8 @@ export interface EngineRun {
 	persist: () => Promise<void>;
 	/** Reserve the worktree for this run; false if another live session is using it. */
 	claimWorktree?: (path: string) => boolean;
+	/** Receives the live session's message injector while an agent session runs. */
+	setInjector?: (inject: ((text: string) => boolean) | undefined) => void;
 }
 
 const MAX_FEEDBACK = 6000;
@@ -91,7 +93,9 @@ export class EpicEngine {
 
 		let loaded: LoadedEpic;
 		try {
-			loaded = await loadEpic(linear, record.issueId, { materializeStories: config.ralph.materializeStories });
+			// A mention only reads the epic for context; it never creates story issues.
+			const materializeStories = record.mode === "epic" && config.ralph.materializeStories;
+			loaded = await loadEpic(linear, record.issueId, { materializeStories });
 		} catch (err) {
 			await reporter.error(`Could not load the issue from Linear: ${String(err)}`);
 			return "failed";
@@ -100,6 +104,8 @@ export class EpicEngine {
 		record.identifier = epic.identifier;
 		record.focusStoryKey ??= loaded.focusStoryKey;
 		for (const s of epic.stories) if (record.completedKeys.includes(s.key)) s.status = "completed";
+
+		if (record.mode === "request") return this.runRequestOnly(ctx, epic);
 
 		let rootBlockers: Array<{ id: string; identifier: string }> = [];
 		if (record.ignoreBlockers) {
@@ -116,39 +122,12 @@ export class EpicEngine {
 		record.waitingOn = [];
 
 		const issue = await linear.getIssue(epic.issueId);
-		const repo = record.repoId ? (config.repositories.find((r) => r.id === record.repoId) ?? selectRepository(config.repositories, issue)) : selectRepository(config.repositories, issue);
-		record.repoId = repo.id;
+		const repo = this.resolveRepo(record, issue);
 
 		await reporter.thought(this.describeEpic(epic, loaded, repo));
 
-		// Workspace
-		let worktree: string;
-		try {
-			const ws = await this.deps.git.prepare({
-				repositoryPath: repo.repositoryPath,
-				workspaceBaseDir: repo.workspaceBaseDir ?? join(config.stateDir, "worktrees", repo.id),
-				branch: record.branch ?? epic.branchName,
-				baseBranch: repo.baseBranch,
-			});
-			worktree = ws.path;
-			if (ctx.claimWorktree && !ctx.claimWorktree(ws.path)) {
-				await reporter.elicitation(
-					`Another cyralph session is already working on \`${ws.branch}\`. Reply here once it finishes and I'll pick up.`,
-				);
-				return "awaiting_input";
-			}
-			record.branch = ws.branch;
-			record.worktreePath = ws.path;
-			await ctx.persist();
-			if (ws.created && repo.setupCommand) {
-				await reporter.action("Setup", repo.setupCommand);
-				const r = await this.deps.shell(repo.setupCommand, worktree);
-				if (r.code !== 0) await reporter.thought(`Setup command failed (continuing):\n\n\`\`\`\n${tail(r.stderr || r.stdout, 2000)}\n\`\`\``);
-			}
-		} catch (err) {
-			await reporter.error(`Could not prepare the git worktree: ${String(err)}`);
-			return "failed";
-		}
+		const worktree = await this.prepareWorkspace(ctx, epic, repo);
+		if (typeof worktree !== "string") return worktree.status;
 
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
@@ -156,7 +135,7 @@ export class EpicEngine {
 		if (rootBlockers.length > 0) {
 			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
 			if (requestOutput) await reporter.thought(requestOutput);
-			await this.adoptPullRequest(ctx, epic, repo, worktree);
+			await this.adoptPullRequest(ctx, worktree);
 			return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is still blocked`);
 		}
 
@@ -195,6 +174,73 @@ export class EpicEngine {
 		return this.finish({ ctx, epic, repo, worktree, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap, requestOutput });
 	}
 
+	private resolveRepo(record: SessionRecord, issue: IssueSummary): RepositoryConfig {
+		const repos = this.deps.config.repositories;
+		const repo = (record.repoId && repos.find((r) => r.id === record.repoId)) || selectRepository(repos, issue);
+		record.repoId = repo.id;
+		return repo;
+	}
+
+	/** Create/reuse the epic's worktree. Returns its path, or the status to end the run with. */
+	private async prepareWorkspace(ctx: EngineRun, epic: Epic, repo: RepositoryConfig): Promise<string | { status: SessionStatus }> {
+		const { config } = this.deps;
+		const { record, reporter } = ctx;
+		try {
+			const ws = await this.deps.git.prepare({
+				repositoryPath: repo.repositoryPath,
+				workspaceBaseDir: repo.workspaceBaseDir ?? join(config.stateDir, "worktrees", repo.id),
+				branch: record.branch ?? epic.branchName,
+				baseBranch: repo.baseBranch,
+			});
+			if (ctx.claimWorktree && !ctx.claimWorktree(ws.path)) {
+				await reporter.elicitation(
+					`Another cyralph session is already working on \`${ws.branch}\`. Reply here once it finishes and I'll pick up.`,
+				);
+				return { status: "awaiting_input" };
+			}
+			record.branch = ws.branch;
+			record.worktreePath = ws.path;
+			await ctx.persist();
+			if (ws.created && repo.setupCommand) {
+				await reporter.action("Setup", repo.setupCommand);
+				const r = await this.deps.shell(repo.setupCommand, ws.path);
+				if (r.code !== 0) await reporter.thought(`Setup command failed (continuing):\n\n\`\`\`\n${tail(r.stderr || r.stdout, 2000)}\n\`\`\``);
+			}
+			return ws.path;
+		} catch (err) {
+			await reporter.error(`Could not prepare the git worktree: ${String(err)}`);
+			return { status: "failed" };
+		}
+	}
+
+	/**
+	 * An @mention: like Cyrus, act only on what the comment asks, with the epic as context. No story
+	 * loop, no Linear state changes, and blockers don't apply. `/ralph` in the comment opts into the loop.
+	 */
+	private async runRequestOnly(ctx: EngineRun, epic: Epic): Promise<SessionStatus> {
+		const { config, linear } = this.deps;
+		const { record, reporter } = ctx;
+		if (record.pendingRequests.length === 0) {
+			await reporter.response("Nothing to do: the mention didn't include a request. Delegate the issue to me to work the epic.");
+			return "completed";
+		}
+		const repo = this.resolveRepo(record, await linear.getIssue(epic.issueId));
+		const worktree = await this.prepareWorkspace(ctx, epic, repo);
+		if (typeof worktree !== "string") return worktree.status;
+		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
+		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
+
+		const output = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+		if (ctx.abortSignal.aborted) {
+			await reporter.response("Stopped.");
+			return "stopped";
+		}
+		await this.adoptPullRequest(ctx, worktree);
+		const link = record.prUrl && output && !output.includes(record.prUrl) ? `\n\nPull request: ${record.prUrl}` : "";
+		await reporter.response(`${output ?? "Done."}${link}`);
+		return "completed";
+	}
+
 	/** Run pending thread requests as one direct agent session. Returns its summary for the thread. */
 	private async runRequests(args: { ctx: EngineRun; epic: Epic; repo: RepositoryConfig; worktree: string; progressFile: string }): Promise<string | undefined> {
 		const { ctx, epic, repo, worktree, progressFile } = args;
@@ -214,19 +260,29 @@ export class EpicEngine {
 			progressFile,
 			qualityGates: [...epic.qualityGates, ...(repo.verifyCommands ?? [])],
 		});
-		const result = await runner.run({
-			prompt,
-			cwd: worktree,
-			additionalDirectories: [join(progressFile, "..")],
-			model: repo.model ?? config.model,
-			fallbackModel: config.fallbackModel,
-			allowedTools: repo.allowedTools,
-			disallowedTools: repo.disallowedTools,
-			permissionMode: config.permissionMode,
-			abortSignal: ctx.abortSignal,
-			onEvent: reporter.onRunnerEvent,
-			systemAppend: REQUEST_SYSTEM_APPEND,
-		});
+		const runOnce = (resume?: string) =>
+			runner.run({
+				prompt,
+				cwd: worktree,
+				additionalDirectories: [join(progressFile, "..")],
+				model: repo.model ?? config.model,
+				fallbackModel: config.fallbackModel,
+				allowedTools: repo.allowedTools,
+				disallowedTools: repo.disallowedTools,
+				permissionMode: config.permissionMode,
+				abortSignal: ctx.abortSignal,
+				onEvent: reporter.onRunnerEvent,
+				onInjector: ctx.setInjector,
+				systemAppend: REQUEST_SYSTEM_APPEND,
+				resume,
+			});
+		// Follow-ups continue the previous request conversation, like Cyrus resuming its Claude session.
+		let result = await runOnce(record.requestClaudeSessionId);
+		if (result.isError && record.requestClaudeSessionId && !result.sessionId && !ctx.abortSignal.aborted) {
+			this.deps.log.warn(`could not resume request session ${record.requestClaudeSessionId}; starting fresh`);
+			result = await runOnce(undefined);
+		}
+		if (result.sessionId) record.requestClaudeSessionId = result.sessionId;
 		record.totalCostUsd += result.costUsd ?? 0;
 		if (result.aborted) return undefined; // keep the requests pending for the next run
 		record.pendingRequests = record.pendingRequests.filter((r) => !requests.includes(r));
@@ -235,10 +291,16 @@ export class EpicEngine {
 		return result.output.trim() || "Done.";
 	}
 
-	/** Pick up a PR the agent opened itself (e.g. via a direct request) so the session links it. */
-	private async adoptPullRequest(ctx: EngineRun, epic: Epic, repo: RepositoryConfig, worktree: string): Promise<void> {
-		if (ctx.record.prUrl || !(await this.deps.git.remoteUrl(worktree))) return;
-		await this.syncPullRequest(ctx, epic, repo, worktree, false).catch((e: unknown) => this.deps.log.warn(`PR sync failed: ${String(e)}`));
+	/** Pick up a PR the agent opened itself (e.g. via a direct request) so the session links it. Never opens one. */
+	private async adoptPullRequest(ctx: EngineRun, worktree: string): Promise<void> {
+		const { record, reporter } = ctx;
+		if (record.prUrl || !record.branch || !(await this.deps.git.remoteUrl(worktree))) return;
+		const pr = await this.deps.git.findPullRequest(worktree, record.branch).catch(() => undefined);
+		if (!pr) return;
+		record.prUrl = pr.url;
+		record.prNumber = pr.number;
+		await ctx.persist();
+		await reporter.externalUrl("Pull request", pr.url);
 	}
 
 	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig): string {
@@ -312,6 +374,7 @@ export class EpicEngine {
 			permissionMode: config.permissionMode,
 			abortSignal: ctx.abortSignal,
 			onEvent: reporter.onRunnerEvent,
+			onInjector: ctx.setInjector,
 		});
 		record.totalCostUsd += result.costUsd ?? 0;
 		if (!result.aborted) {
@@ -480,7 +543,7 @@ export class EpicEngine {
 		}
 
 		if (requestOutput) await reporter.thought(requestOutput);
-		await this.adoptPullRequest(ctx, epic, repo, worktree);
+		await this.adoptPullRequest(ctx, worktree);
 
 		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
 		const isOpen = (d: string) => {

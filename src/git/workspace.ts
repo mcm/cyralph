@@ -80,6 +80,8 @@ export interface GitWorkspace {
 	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
 	stashAll(cwd: string, message: string): Promise<boolean>;
 	push(cwd: string, branch: string): Promise<void>;
+	/** An existing PR for the branch, if any (never creates one). */
+	findPullRequest(cwd: string, branch: string): Promise<PullRequestInfo | undefined>;
 	ensurePullRequest(cwd: string, opts: { branch: string; baseBranch: string; title: string; body: string }): Promise<PullRequestInfo | undefined>;
 	updatePullRequest(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void>;
 }
@@ -153,15 +155,19 @@ export class CliGitWorkspace implements GitWorkspace {
 		await gitOrThrow(["push", "-u", "origin", branch], cwd);
 	}
 
+	async findPullRequest(cwd: string, branch: string): Promise<PullRequestInfo | undefined> {
+		const existing = await run("gh", ["pr", "view", branch, "--json", "url,number,state"], cwd);
+		if (existing.code !== 0) return undefined;
+		const data = JSON.parse(existing.stdout) as { url: string; number: number; state?: string };
+		return data.state === "CLOSED" ? undefined : { url: data.url, number: data.number };
+	}
+
 	async ensurePullRequest(
 		cwd: string,
 		opts: { branch: string; baseBranch: string; title: string; body: string },
 	): Promise<PullRequestInfo | undefined> {
-		const existing = await run("gh", ["pr", "view", opts.branch, "--json", "url,number"], cwd);
-		if (existing.code === 0) {
-			const data = JSON.parse(existing.stdout) as { url: string; number: number };
-			return { url: data.url, number: data.number };
-		}
+		const existing = await this.findPullRequest(cwd, opts.branch);
+		if (existing) return existing;
 		const created = await run(
 			"gh",
 			["pr", "create", "--draft", "--base", opts.baseBranch, "--head", opts.branch, "--title", opts.title, "--body", opts.body],

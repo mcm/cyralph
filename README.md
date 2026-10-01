@@ -51,26 +51,37 @@ A `> Branch: \`name\`` line in the PRD sets the branch. Otherwise the branch is 
 - **Pull request**: attached to the session as an external link.
 - **Replies to the session**:
   - `stop` (or the stop button) aborts the current iteration. An interrupted attempt doesn't count.
-  - Anything else is an **instruction**. See *@mentions and requests* below.
+  - Anything else is a follow-up. See *Delegation, @mentions and replies* below.
 - **Re-delegation**: re-delegating the same issue creates a new session. It keeps the branch, the PR
   and the guidance, and skips stories that are already done.
 
-### @mentions and requests
+### Delegation, @mentions and replies
 
-The text of an @mention comment (minus the mention itself), and any reply in the session, is
-treated the way Cyrus treats it, as something to act on:
+These follow Cyrus:
 
-- **If stories are still to do**, the text becomes **guidance**. It goes into every later story
-  prompt, and the first story that runs with it counts as having handled it. Replying to a paused
-  run also gives the stories that were set aside a fresh attempt budget.
-- **If no story runs** (the epic is already finished, the rest is stuck, or the epic is blocked),
-  the text runs as one **direct request session** in the epic's worktree. Unlike story sessions,
-  that agent may commit, push the epic branch and use `gh`. Its prompt includes the epic status,
-  the branch, `origin` and the PR. Its final message becomes the session's response. For example:
+- **Delegating** an issue to the agent works the epic with the Ralph loop. Linear also attaches a
+  system note to delegations (*"This thread is for an agent session…"*). Like Cyrus, cyralph uses it
+  to tell delegations from mentions and otherwise ignores it.
+- **An @mention** does only what the comment asks, with the epic as context: its stories and
+  their status, the branch, `origin`, the PR and the PRD. It doesn't start the story loop, change
+  Linear issue states or create story issues, and blockers don't apply. That one agent session may
+  commit, push the epic branch and use `gh`, and its final message becomes the response. For
+  example:
   > @cyralph there is now a git remote, git@github.com:me/app.git, can you push and create a PR?
-- **As a safety net**, when the epic finishes cyralph pushes any commits `origin` doesn't have
-  yet, and opens or links the PR. With no remote, stories are committed locally without push errors
-  and are pushed once a remote exists.
+
+  Add **`/ralph`** to a mention (`/label-based-prompt`, Cyrus's spelling, also works) to have it
+  work the epic like a delegation. The rest of the comment then becomes story guidance.
+- **Replies in a session:**
+  - If an agent is running right now (a story, or a request), the reply is **delivered into that
+    live session**, as Cyrus streams follow-ups. On an epic it also becomes guidance for later
+    stories. A mention on an epic that is being worked is handed to that running agent too.
+  - If nothing is running, a reply to a mention continues **the same Claude conversation** (the
+    session is resumed). A reply to a delegated epic resumes the loop with the reply as guidance and
+    a fresh attempt budget. If no story runs, for example because the epic is finished or blocked,
+    the reply runs as a direct request in that session.
+- **As a safety net** for delegated epics, when the epic finishes cyralph pushes any commits
+  `origin` doesn't have yet, and opens or links the PR. With no remote, stories are committed
+  locally without push errors.
 
 ## Blocking / blocked-by
 

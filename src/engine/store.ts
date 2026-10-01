@@ -7,11 +7,20 @@ import { dirname } from "node:path";
 
 export type SessionStatus = "queued" | "running" | "awaiting_input" | "blocked" | "completed" | "stopped" | "failed";
 
+/**
+ * - "epic": delegated work, which runs the Ralph loop over the epic's stories.
+ * - "request": an @mention, which only acts on what the comment asks (as Cyrus does), with the epic as context.
+ */
+export type SessionMode = "epic" | "request";
+
 export interface SessionRecord {
 	sessionId: string;
 	issueId: string;
 	identifier?: string;
 	status: SessionStatus;
+	mode: SessionMode;
+	/** Claude session of the last direct request, resumed for follow-ups so the agent keeps its history. */
+	requestClaudeSessionId?: string;
 	repoId?: string;
 	branch?: string;
 	worktreePath?: string;
@@ -50,6 +59,7 @@ export function newRecord(sessionId: string, issueId: string, identifier?: strin
 		issueId,
 		identifier,
 		status: "queued",
+		mode: "epic",
 		attempts: {},
 		lastFeedback: {},
 		guidance: [],
@@ -71,7 +81,7 @@ export class SessionStore {
 	async load(): Promise<void> {
 		try {
 			const data = JSON.parse(await readFile(this.file, "utf8")) as { sessions?: SessionRecord[] };
-			for (const r of data.sessions ?? []) this.records.set(r.sessionId, { ...r, waitingOn: r.waitingOn ?? [], pendingRequests: r.pendingRequests ?? [] });
+			for (const r of data.sessions ?? []) this.records.set(r.sessionId, { ...r, mode: r.mode ?? "epic", waitingOn: r.waitingOn ?? [], pendingRequests: r.pendingRequests ?? [] });
 		} catch {
 			// first run
 		}

@@ -14,6 +14,24 @@ import { PARKED, type SessionRecord, type SessionStore, newRecord } from "./stor
 
 const RESOLVED_STATE_TYPES = new Set(["completed", "canceled"]);
 
+/**
+ * Linear always fills `agentSession.comment.body`; for a delegation (not an @mention) it holds a
+ * system note containing this marker. Cyrus uses the same check to tell the two apart.
+ */
+export const AGENT_SESSION_MARKER = "This thread is for an agent session";
+/** In a mention or reply, opts into running the epic's story loop (`/label-based-prompt` is Cyrus' spelling). */
+const LOOP_COMMAND = /(^|\s)\/(ralph|label-based-prompt)\b/i;
+
+export function parseInstruction(body: string | undefined): { text: string; wantsLoop: boolean } {
+	const raw = (body ?? "").trim();
+	const wantsLoop = LOOP_COMMAND.test(raw);
+	const text = raw
+		.replace(LOOP_COMMAND, " ")
+		.replace(/^\s*@[\w.-]+[,:]?\s*/, "")
+		.trim();
+	return { text, wantsLoop };
+}
+
 interface Active {
 	abort: AbortController;
 	done: Promise<void>;
@@ -28,6 +46,8 @@ export class SessionManager {
 	/** Worktree path -> session id; an epic session and a story session share one branch. */
 	private readonly busyWorktrees = new Map<string, string>();
 	private readonly toldQueued = new Set<string>();
+	/** Delivers a message into the agent session currently running for a cyralph session. */
+	private readonly injectors = new Map<string, (text: string) => boolean>();
 
 	constructor(
 		private readonly deps: EngineDeps,
@@ -102,11 +122,21 @@ export class SessionManager {
 			record.guidance = [...previous.guidance];
 			record.completedKeys = [...previous.completedKeys];
 		}
-		// The @mention comment is an instruction: guidance for stories, or a direct request.
-		const instruction = event.commentBody?.trim().replace(/^@[\w.-]+[,:]?\s*/, "").trim();
-		if (instruction) {
-			record.guidance.push(instruction);
-			record.pendingRequests.push(instruction);
+		const isMention = !!event.commentBody?.trim() && !event.commentBody.includes(AGENT_SESSION_MARKER);
+		if (isMention) {
+			const { text, wantsLoop } = parseInstruction(event.commentBody);
+			// Like Cyrus: a mention addresses its comment; only delegation (or `/ralph`) works the epic.
+			record.mode = wantsLoop ? "epic" : "request";
+			if (text) {
+				if (wantsLoop) record.guidance.push(text);
+				record.pendingRequests.push(text);
+			}
+			// The epic is being worked right now: hand the mention to that live agent.
+			if (!wantsLoop && text && this.injectIntoIssue(event.issueId, text)) {
+				await this.store.save(record);
+				await reporter.response("Passed this to the agent that's working on this epic right now; it will answer in that session.");
+				return;
+			}
 		}
 		await this.store.save(record);
 		this.enqueue(record);
@@ -135,17 +165,33 @@ export class SessionManager {
 			return;
 		}
 
-		const text = event.body.trim();
+		const { text, wantsLoop } = parseInstruction(event.body);
 		if (isStartAnywayRequest(text)) {
 			record.ignoreBlockers = true;
 			record.waitingOn = [];
 		} else if (text) {
-			record.guidance.push(text);
+			// Running: deliver into the live agent session, as Cyrus streams follow-ups.
+			const inject = this.injectors.get(record.sessionId);
+			if (inject?.(text)) {
+				if (record.mode === "epic") record.guidance.push(text); // later stories should know too
+				await this.store.save(record);
+				await reporter.thought("Passed this to the agent that's working right now.");
+				return;
+			}
+			if (record.mode === "epic") record.guidance.push(text);
 			record.pendingRequests.push(text);
+		}
+		if (wantsLoop && record.mode === "request") {
+			record.mode = "epic";
+			record.guidance.push(...record.pendingRequests.filter((r) => !record.guidance.includes(r)));
 		}
 		if (this.active.has(record.sessionId)) {
 			await this.store.save(record);
-			await reporter.thought("Got it. I'll apply this from the next story iteration, or handle it directly once the stories are done.");
+			await reporter.thought(
+				record.mode === "epic"
+					? "Got it. I'll apply this from the next story iteration, or handle it directly once the stories are done."
+					: "Got it. I'll handle this as soon as the current step finishes.",
+			);
 			return;
 		}
 		// Paused/finished/stopped: guidance earns every set-aside story a fresh set of attempts.
@@ -153,6 +199,13 @@ export class SessionManager {
 		await this.store.save(record);
 		await reporter.thought("On it.");
 		this.enqueue(record);
+	}
+
+	/** Deliver text into a live agent session working on this issue, if there is one. */
+	private injectIntoIssue(issueId: string, text: string): boolean {
+		const owner = this.busyIssues.get(issueId);
+		const inject = owner ? this.injectors.get(owner) : undefined;
+		return inject ? inject(text) : false;
 	}
 
 	private enqueue(record: SessionRecord) {
@@ -194,6 +247,10 @@ export class SessionManager {
 					reporter,
 					abortSignal: abort.signal,
 					persist: () => this.store.save(record),
+					setInjector: (inject) => {
+						if (inject) this.injectors.set(record.sessionId, inject);
+						else this.injectors.delete(record.sessionId);
+					},
 					claimWorktree: (path) => {
 						const owner = this.busyWorktrees.get(path);
 						if (owner && owner !== record.sessionId) return false;
@@ -212,6 +269,7 @@ export class SessionManager {
 				this.active.delete(record.sessionId);
 				this.busyIssues.delete(record.issueId);
 				this.toldQueued.delete(record.sessionId);
+				this.injectors.delete(record.sessionId);
 				for (const [path, owner] of this.busyWorktrees) if (owner === record.sessionId) this.busyWorktrees.delete(path);
 				this.pump();
 			}

@@ -33,6 +33,11 @@ function makeRepo(opts: { remote?: boolean } = {}) {
 
 class TestGit extends CliGitWorkspace {
 	prs: string[] = [];
+	/** Simulates a PR opened outside the orchestrator (e.g. by the agent via `gh`). */
+	externalPr = false;
+	override async findPullRequest(): Promise<PullRequestInfo | undefined> {
+		return this.prs.length || this.externalPr ? { url: "https://github.com/acme/app/pull/7", number: 7 } : undefined;
+	}
 	override async ensurePullRequest(): Promise<PullRequestInfo> {
 		this.prs.push("created");
 		return { url: "https://github.com/acme/app/pull/7", number: 7 };
@@ -346,97 +351,200 @@ describe("blocking / blocked-by relations", () => {
 	});
 });
 
-describe("direct requests from the Linear thread (@mentions)", () => {
-	const isRequest = (c: RunRequest) => c.prompt.includes("## Request from your team");
+const DELEGATION_BODY = "This thread is for an agent session with cyralph.";
 
-	it("acts on a mention when the epic is already finished: push + PR with a remote added later", async () => {
+describe("mentions, delegation and replies (Cyrus semantics)", () => {
+	const isRequest = (c: RunRequest) => c.prompt.includes("## Request from your team");
+	const storyIds = (t: ReturnType<typeof setup>) =>
+		t.runner.calls.filter((c) => !isRequest(c)).map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+
+	/** Request sessions answer with a fixed summary and report a Claude session id. */
+	function answerRequests(t: ReturnType<typeof setup>, output = "Done as asked.") {
+		const original = t.runner.run.bind(t.runner);
+		let n = 0;
+		t.runner.run = async (req) => {
+			if (!isRequest(req)) return original(req);
+			t.runner.calls.push(req);
+			return { output, isError: false, aborted: false, sessionId: `claude-req-${++n}` };
+		};
+	}
+
+	it("ignores Linear's delegation note: delegation works the epic with no request or guidance", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "m-1", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await t.manager.idle();
+		expect(storyIds(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(t.runner.calls.some(isRequest)).toBe(false);
+		expect(t.store.get("m-1")?.guidance).toEqual([]);
+		expect(t.runner.calls[0]?.prompt).not.toContain("This thread is for an agent session");
+	});
+
+	it("a mention only does what it asks, even with stories left (no story loop, no Linear changes)", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		answerRequests(t, "The epic has 3 open stories; US-001 is next.");
+		await t.manager.handle({ kind: "created", sessionId: "m-2", issueId: epic.id, commentBody: "@cyralph what's left on this epic?" });
+		await t.manager.idle();
+		expect(storyIds(t)).toEqual([]);
+		expect(t.runner.calls.filter(isRequest)).toHaveLength(1);
+		expect(t.runner.calls[0]?.prompt).toContain("> what's left on this epic?");
+		expect(t.runner.calls[0]?.prompt).toContain("## Status: 0/3 stories complete");
+		expect(t.linear.issues.get(epic.id)?.stateType).toBe("unstarted");
+		expect(t.linear.issues.get(s1.id)?.stateType).toBe("unstarted");
+		expect(t.store.get("m-2")?.mode).toBe("request");
+		expect(t.git.prs).toEqual([]); // a question never opens a PR
+		expect(t.linear.bodies("response").at(-1)).toBe("The epic has 3 open stories; US-001 is next.");
+	});
+
+	it("`/ralph` in a mention opts into the story loop, with the rest of the comment as guidance", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "m-3", issueId: epic.id, commentBody: "@cyralph /ralph use the existing Priority enum" });
+		await t.manager.idle();
+		expect(storyIds(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(t.runner.calls[0]?.prompt).toContain("- use the existing Priority enum");
+		// The first story consumed it, so no extra request session runs.
+		expect(t.runner.calls.some(isRequest)).toBe(false);
+		expect(t.store.get("m-3")?.pendingRequests).toEqual([]);
+	});
+
+	it("push + PR on a finished epic whose remote was added later (the MOD-50 case)", async () => {
 		const t = setup({}, { remote: false });
 		const { epic } = ralphEpic(t.linear);
-
-		// Epic gets built while the repo has no remote: no push errors, nothing pushed.
-		await t.manager.handle({ kind: "created", sessionId: "r-1", issueId: epic.id });
+		await t.manager.handle({ kind: "created", sessionId: "m-4", issueId: epic.id, commentBody: DELEGATION_BODY });
 		await t.manager.idle();
-		expect(t.store.get("r-1")?.status).toBe("completed");
 		expect(t.linear.bodies("error")).toEqual([]);
 		expect(t.git.prs).toEqual([]);
 
-		// The user adds a remote and @mentions the agent in a new session.
 		sh(t.repo, "remote", "add", "origin", t.origin);
-		const runner = t.runner;
-		const original = runner.run.bind(runner);
-		runner.run = async (req) => {
-			if (!isRequest(req)) return original(req);
-			runner.calls.push(req);
-			return { output: "Pushed the branch and opened https://github.com/acme/app/pull/7.", isError: false, aborted: false };
-		};
+		answerRequests(t, "Pushed the branch and opened https://github.com/acme/app/pull/7.");
+		t.git.externalPr = true; // the agent ran `gh pr create`
 		await t.manager.handle({
 			kind: "created",
-			sessionId: "r-2",
+			sessionId: "m-5",
 			issueId: epic.id,
 			commentBody: "@minecraftmodscyralph there is now a git remote, git@github.com:acme/app.git, can you push and create a PR?",
 		});
 		await t.manager.idle();
-
 		const req = t.runner.calls.at(-1);
-		expect(t.runner.calls.filter(isRequest)).toHaveLength(1);
+		expect(isRequest(req!)).toBe(true);
 		expect(req?.systemAppend).toContain("You may use git");
 		expect(req?.prompt).toContain("> there is now a git remote, git@github.com:acme/app.git, can you push and create a PR?");
 		expect(req?.prompt).toContain(`Git remote \`origin\`: \`${t.origin}\``);
 		expect(req?.prompt).toContain("## Status: 3/3 stories complete");
 		expect(req?.prompt).toContain("gh pr create --base main --head eng-1-task-priority");
-
-		// Safety net: the orchestrator pushes unpushed commits and links the PR either way.
-		const wt = t.store.get("r-2")?.worktreePath ?? "";
-		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(sh(wt, "rev-parse", "HEAD").trim());
-		expect(t.store.get("r-2")?.prUrl).toBe("https://github.com/acme/app/pull/7");
-		expect(t.store.get("r-2")?.pendingRequests).toEqual([]);
+		expect(t.store.get("m-5")?.prUrl).toBe("https://github.com/acme/app/pull/7");
 		expect(t.linear.bodies("response").at(-1)).toBe("Pushed the branch and opened https://github.com/acme/app/pull/7.");
 	});
 
-	it("treats a mention as story guidance when stories remain (no extra request session)", async () => {
-		const t = setup();
+	it("re-delegating a finished epic pushes commits a later-added remote doesn't have", async () => {
+		const t = setup({}, { remote: false });
 		const { epic } = ralphEpic(t.linear);
-		await t.manager.handle({ kind: "created", sessionId: "r-3", issueId: epic.id, commentBody: "@cyralph use the existing Priority enum" });
+		await t.manager.handle({ kind: "created", sessionId: "m-6", issueId: epic.id, commentBody: DELEGATION_BODY });
 		await t.manager.idle();
-		expect(t.runner.calls.some(isRequest)).toBe(false);
-		expect(t.runner.calls[0]?.prompt).toContain("- use the existing Priority enum");
-		expect(t.store.get("r-3")?.pendingRequests).toEqual([]);
-		expect(t.linear.bodies("response").at(-1)).toContain("all 3 stories of **ENG-1**");
+		sh(t.repo, "remote", "add", "origin", t.origin);
+		await t.manager.handle({ kind: "created", sessionId: "m-7", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await t.manager.idle();
+		const wt = t.store.get("m-7")?.worktreePath ?? "";
+		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(sh(wt, "rev-parse", "HEAD").trim());
+		expect(t.store.get("m-7")?.prUrl).toBe("https://github.com/acme/app/pull/7");
 	});
 
-	it("handles a reply on a finished session as a direct request", async () => {
+	it("follow-up replies to a mention resume the same Claude conversation", async () => {
 		const t = setup();
 		const { epic } = ralphEpic(t.linear);
-		await t.manager.handle({ kind: "created", sessionId: "r-4", issueId: epic.id });
+		answerRequests(t);
+		await t.manager.handle({ kind: "created", sessionId: "m-8", issueId: epic.id, commentBody: "@cyralph summarise the PRD" });
+		await t.manager.idle();
+		await t.manager.handle({ kind: "prompted", sessionId: "m-8", issueId: epic.id, body: "Shorter please" });
+		await t.manager.idle();
+		const reqs = t.runner.calls.filter(isRequest);
+		expect(reqs.map((r) => r.resume)).toEqual([undefined, "claude-req-1"]);
+		expect(reqs[1]?.prompt).toContain("> Shorter please");
+		expect(reqs[1]?.prompt).not.toContain("> summarise the PRD");
+		expect(storyIds(t)).toEqual([]);
+	});
+
+	it("a reply on a finished delegated session runs as a direct request", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "m-9", issueId: epic.id, commentBody: DELEGATION_BODY });
 		await t.manager.idle();
 		const before = t.runner.calls.length;
-		await t.manager.handle({ kind: "prompted", sessionId: "r-4", issueId: epic.id, body: "Add a CHANGELOG entry for this epic" });
+		await t.manager.handle({ kind: "prompted", sessionId: "m-9", issueId: epic.id, body: "Add a CHANGELOG entry for this epic" });
 		await t.manager.idle();
 		const after = t.runner.calls.slice(before);
-		expect(after).toHaveLength(1);
-		expect(isRequest(after[0]!)).toBe(true);
+		expect(after.map(isRequest)).toEqual([true]);
 		expect(after[0]?.prompt).toContain("> Add a CHANGELOG entry for this epic");
 	});
 
-	it("runs a direct request even while the epic is blocked, then stays parked", async () => {
+	it("a reply on a parked (blocked) epic runs as a request and the session stays parked", async () => {
 		const t = setup();
 		const { epic } = ralphEpic(t.linear);
 		const blocker = t.linear.add({ title: "Design review", identifier: "ENG-99" });
 		t.linear.blocks.set(epic.id, [blocker.id]);
-		await t.manager.handle({ kind: "created", sessionId: "r-5", issueId: epic.id, commentBody: "@cyralph summarise the plan in the PR description" });
+		await t.manager.handle({ kind: "created", sessionId: "m-10", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await t.manager.idle();
+		expect(t.store.get("m-10")?.status).toBe("blocked");
+		await t.manager.handle({ kind: "prompted", sessionId: "m-10", issueId: epic.id, body: "summarise the plan in the PR description" });
 		await t.manager.idle();
 		expect(t.runner.calls.map(isRequest)).toEqual([true]);
-		expect(t.store.get("r-5")?.status).toBe("blocked");
+		expect(t.store.get("m-10")?.status).toBe("blocked");
 		expect(t.linear.bodies("elicitation").at(-1)).toContain("is still blocked on **ENG-99**");
 	});
 
-	it("ignores a bare mention with no instruction", async () => {
+	it("mentions ignore blockers (they aren't story work)", async () => {
 		const t = setup();
 		const { epic } = ralphEpic(t.linear);
-		await t.manager.handle({ kind: "created", sessionId: "r-6", issueId: epic.id, commentBody: "@cyralph" });
+		const blocker = t.linear.add({ title: "Design review", identifier: "ENG-98" });
+		t.linear.blocks.set(epic.id, [blocker.id]);
+		answerRequests(t);
+		await t.manager.handle({ kind: "created", sessionId: "m-11", issueId: epic.id, commentBody: "@cyralph what does US-002 need?" });
 		await t.manager.idle();
+		expect(t.runner.calls.map(isRequest)).toEqual([true]);
+		expect(t.store.get("m-11")?.status).toBe("completed");
+	});
+
+	it("replies and mentions are delivered into a running story session", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const injected: string[] = [];
+		let release: () => void = () => {};
+		const original = t.runner.run.bind(t.runner);
+		t.runner.run = async (req) => {
+			if (/## Your Task: US-001/.test(req.prompt) && injected.length === 0) {
+				req.onInjector?.((text) => {
+					injected.push(text);
+					return true;
+				});
+				await new Promise<void>((r) => {
+					release = r;
+				});
+				req.onInjector?.(undefined);
+			}
+			return original(req);
+		};
+		await t.manager.handle({ kind: "created", sessionId: "m-12", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await new Promise((r) => setTimeout(r, 300));
+		await t.manager.handle({ kind: "prompted", sessionId: "m-12", issueId: epic.id, body: "Use a smallint column" });
+		await t.manager.handle({ kind: "created", sessionId: "m-13", issueId: epic.id, commentBody: "@cyralph how is it going?" });
+		expect(injected).toEqual(["Use a smallint column", "how is it going?"]);
+		expect(t.linear.bodies("thought")).toContain("Passed this to the agent that's working right now.");
+		expect(t.linear.activities.some((a) => a.sessionId === "m-13" && a.content.type === "response")).toBe(true);
+		release();
+		await t.manager.idle();
+		// Delivered live, so it is not re-run as a request; later stories still see it as guidance.
 		expect(t.runner.calls.some(isRequest)).toBe(false);
-		expect(t.store.get("r-6")?.guidance).toEqual([]);
+		expect(t.runner.calls.find((c) => /## Your Task: US-002/.test(c.prompt))?.prompt).toContain("- Use a smallint column");
+	});
+
+	it("a bare mention with no instruction does nothing", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "m-14", issueId: epic.id, commentBody: "@cyralph" });
+		await t.manager.idle();
+		expect(t.runner.calls).toHaveLength(0);
+		expect(t.linear.bodies("response").at(-1)).toContain("Nothing to do");
 	});
 });
-

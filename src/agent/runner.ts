@@ -1,7 +1,11 @@
 /**
  * One Ralph iteration = one fresh Claude Agent SDK session on one story.
+ *
+ * Input is streamed, so replies from the Linear thread can be delivered into the live session
+ * (like Cyrus does) instead of waiting for the next iteration.
  */
-import { query, type Options, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { randomUUID } from "node:crypto";
+import { query, type Options, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 
 export type RunnerEvent =
 	| { type: "text"; text: string }
@@ -22,6 +26,63 @@ export interface RunRequest {
 	onEvent?: (event: RunnerEvent) => void;
 	/** Replaces the story-mode system prompt addition (e.g. for direct requests). */
 	systemAppend?: string;
+	/** Claude session id to resume (keeps the earlier conversation). */
+	resume?: string;
+	/**
+	 * Called with a function that delivers a message into the live session (or `undefined` once
+	 * the session can no longer take input). The function returns false if it was too late.
+	 */
+	onInjector?: (inject: ((text: string) => boolean) | undefined) => void;
+}
+
+/** If an injected message never gets answered, stop waiting for it after this long. */
+const INJECTION_IDLE_TIMEOUT_MS = 5 * 60_000;
+
+/** Async-iterable message queue used as streaming input to `query()`. */
+class InputQueue implements AsyncIterable<SDKUserMessage> {
+	private items: SDKUserMessage[] = [];
+	private waiting: ((r: IteratorResult<SDKUserMessage>) => void) | undefined;
+	closed = false;
+
+	push(msg: SDKUserMessage): void {
+		if (this.closed) return;
+		const w = this.waiting;
+		if (w) {
+			this.waiting = undefined;
+			w({ value: msg, done: false });
+		} else this.items.push(msg);
+	}
+
+	close(): void {
+		this.closed = true;
+		const w = this.waiting;
+		this.waiting = undefined;
+		w?.({ value: undefined, done: true });
+	}
+
+	[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
+		return {
+			next: () => {
+				const item = this.items.shift();
+				if (item) return Promise.resolve({ value: item, done: false });
+				if (this.closed) return Promise.resolve({ value: undefined, done: true });
+				return new Promise((resolve) => {
+					this.waiting = resolve;
+				});
+			},
+		};
+	}
+}
+
+function userMessage(text: string, uuid: string, priority?: "next"): SDKUserMessage {
+	return {
+		type: "user",
+		message: { role: "user", content: text },
+		parent_tool_use_id: null,
+		uuid: uuid as SDKUserMessage["uuid"],
+		...(priority && { priority }),
+		origin: { kind: "human" },
+	};
 }
 
 export interface RunResult {
@@ -83,12 +144,39 @@ export class ClaudeAgentRunner implements AgentRunner {
 			allowDangerouslySkipPermissions: req.permissionMode === "bypassPermissions",
 			systemPrompt: { type: "preset", preset: "claude_code", append: req.systemAppend ?? RALPH_SYSTEM_APPEND },
 			settingSources: ["project", "local"],
+			...(req.resume && { resume: req.resume }),
 		};
+
+		// Streaming input: the session stays open until every message we sent has been answered.
+		const input = new InputQueue();
+		const outstanding = new Set<string>();
+		const send = (text: string, priority?: "next") => {
+			const id = randomUUID();
+			outstanding.add(id);
+			input.push(userMessage(text, id, priority));
+		};
+		send(req.prompt);
+		let idleTimer: NodeJS.Timeout | undefined;
+		const finishInput = () => {
+			if (idleTimer) clearTimeout(idleTimer);
+			req.onInjector?.(undefined);
+			input.close();
+		};
+		req.onInjector?.((text) => {
+			if (input.closed) return false;
+			send(text, "next");
+			return true;
+		});
+		abortController.signal.addEventListener("abort", finishInput, { once: true });
 
 		const texts: string[] = [];
 		let result: RunResult = { output: "", isError: false, aborted: false };
 		try {
-			for await (const msg of query({ prompt: req.prompt, options }) as AsyncIterable<SDKMessage>) {
+			for await (const msg of query({ prompt: input, options }) as AsyncIterable<SDKMessage>) {
+				if (idleTimer) {
+					clearTimeout(idleTimer);
+					idleTimer = undefined;
+				}
 				if (msg.type === "assistant" && !msg.parent_tool_use_id) {
 					for (const block of msg.message.content) {
 						if (block.type === "text" && block.text.trim()) {
@@ -121,6 +209,11 @@ export class ClaudeAgentRunner implements AgentRunner {
 						numTurns: msg.num_turns,
 						errorMessage: msg.subtype === "success" ? undefined : msg.subtype,
 					};
+					// Which of our messages this turn answered; older producers don't say, so assume all.
+					const answered = msg.user_message_uuids ?? (msg.user_message_uuid ? [msg.user_message_uuid] : [...outstanding]);
+					for (const id of answered) outstanding.delete(id);
+					if (outstanding.size === 0 || result.isError) finishInput();
+					else idleTimer = setTimeout(finishInput, INJECTION_IDLE_TIMEOUT_MS);
 				}
 			}
 		} catch (err) {
@@ -129,9 +222,11 @@ export class ClaudeAgentRunner implements AgentRunner {
 				output: texts[texts.length - 1] ?? "",
 				isError: !aborted,
 				aborted,
+				sessionId: result.sessionId,
 				errorMessage: err instanceof Error ? err.message : String(err),
 			};
 		} finally {
+			finishInput();
 			req.abortSignal.removeEventListener("abort", onAbort);
 		}
 		if (!result.output) result.output = texts[texts.length - 1] ?? "";
