@@ -19,8 +19,15 @@ export const RepositoryConfigSchema = z.object({
 	teamKeys: z.array(z.string()).optional(),
 	/** Route issues carrying any of these labels to this repo. */
 	routingLabels: z.array(z.string()).optional(),
-	/** Route issues in these Linear projects (by name) to this repo. */
+	/** Route issues in these Linear projects (by name) to this repo. Cyrus calls this `projectKeys`. */
+	projectKeys: z.array(z.string()).optional(),
+	/** Alias of `projectKeys`. */
 	projectNames: z.array(z.string()).optional(),
+	/** Repository web URLs, used to match `[repo=...]` tags and in the repository picker (as in Cyrus). */
+	githubUrl: z.string().optional(),
+	gitlabUrl: z.string().optional(),
+	/** Set false to keep a repository configured but never route to it. */
+	isActive: z.boolean().optional(),
 	/**
 	 * Commands the orchestrator runs itself after the agent signals completion.
 	 * A story only passes when all of these exit 0. PRD quality gates are always given to the agent.

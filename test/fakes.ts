@@ -1,4 +1,4 @@
-import type { ActivityContent, Blocker, IssueSummary, LinearGateway, PlanStep } from "../src/linear/gateway.js";
+import type { ActivityContent, ActivityOptions, Blocker, IssueSummary, LinearGateway, PlanStep } from "../src/linear/gateway.js";
 
 let seq = 0;
 
@@ -7,7 +7,7 @@ export class FakeLinear implements LinearGateway {
 	/** blocked id -> blocker ids */
 	blocks = new Map<string, string[]>();
 	comments: Array<{ issueId: string; body: string }> = [];
-	activities: Array<{ sessionId: string; content: ActivityContent; ephemeral?: boolean }> = [];
+	activities: Array<{ sessionId: string; content: ActivityContent; ephemeral?: boolean; signal?: string; signalMetadata?: Record<string, unknown> }> = [];
 	plans: PlanStep[][] = [];
 	urls: Array<{ label: string; url: string }> = [];
 
@@ -62,8 +62,8 @@ export class FakeLinear implements LinearGateway {
 	async addComment(issueId: string, body: string) {
 		this.comments.push({ issueId, body });
 	}
-	async createActivity(sessionId: string, content: ActivityContent, opts?: { ephemeral?: boolean }) {
-		this.activities.push({ sessionId, content, ephemeral: opts?.ephemeral });
+	async createActivity(sessionId: string, content: ActivityContent, opts?: ActivityOptions) {
+		this.activities.push({ sessionId, content, ephemeral: opts?.ephemeral, signal: opts?.signal, signalMetadata: opts?.signalMetadata });
 	}
 	async updateSessionPlan(_s: string, plan: PlanStep[]) {
 		this.plans.push(plan);

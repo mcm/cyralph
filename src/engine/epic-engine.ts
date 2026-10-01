@@ -20,7 +20,7 @@ import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgre
 import { COMPLETE_PATTERN, DEFAULT_STORY_TEMPLATE, buildRequestPrompt, buildStoryPrompt } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
-import { selectRepository } from "./routing.js";
+import { describeRouting, routeIssue, selectionValue } from "./routing.js";
 import type { SessionRecord, SessionStatus } from "./store.js";
 
 export interface EngineDeps {
@@ -130,9 +130,10 @@ export class EpicEngine {
 		record.waitingOn = [];
 
 		const issue = await linear.getIssue(epic.issueId);
-		const repo = this.resolveRepo(record, issue);
+		const repo = await this.resolveRepo(ctx, issue);
+		if (!repo) return "awaiting_input";
 
-		await reporter.thought(this.describeEpic(epic, loaded, repo));
+		await reporter.thought(this.describeEpic(epic, loaded, repo, record.routedBy));
 
 		const worktree = await this.prepareWorkspace(ctx, epic, repo);
 		if (typeof worktree !== "string") return worktree.status;
@@ -182,11 +183,35 @@ export class EpicEngine {
 		return this.finish({ ctx, epic, repo, worktree, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap, requestOutput });
 	}
 
-	private resolveRepo(record: SessionRecord, issue: IssueSummary): RepositoryConfig {
+	/**
+	 * The repository for this session (Cyrus routing: tags, labels, project, team, catch-all). Sticky once
+	 * chosen. Returns undefined after asking the user to pick one when nothing matches.
+	 */
+	private async resolveRepo(ctx: EngineRun, epicIssue: IssueSummary): Promise<RepositoryConfig | undefined> {
+		const { record, reporter } = ctx;
 		const repos = this.deps.config.repositories;
-		const repo = (record.repoId && repos.find((r) => r.id === record.repoId)) || selectRepository(repos, issue);
-		record.repoId = repo.id;
-		return repo;
+		const withBase = (r: RepositoryConfig) => (record.baseBranchOverride ? { ...r, baseBranch: record.baseBranchOverride } : r);
+		const sticky = record.repoId && repos.find((r) => r.id === record.repoId);
+		if (sticky) return withBase(sticky);
+
+		// The delegated issue first (a story may carry its own tag/labels), then its epic.
+		const delegated = record.issueId === epicIssue.id ? epicIssue : await this.deps.linear.getIssue(record.issueId);
+		const issues = delegated.id === epicIssue.id ? [epicIssue] : [delegated, epicIssue];
+		const routed = routeIssue(repos, issues);
+		if (routed.type === "needs_selection") {
+			record.repoSelection = routed.candidates.map((r) => r.id);
+			await ctx.persist();
+			await reporter.select(
+				"Which repository should I work in for this issue?\n\n(Add a `[repo=name]` tag, a routing label, or team/project routing in the config to skip this next time.)",
+				routed.candidates.map(selectionValue),
+			);
+			return undefined;
+		}
+		record.repoId = routed.repo.id;
+		record.routedBy = describeRouting(routed);
+		record.baseBranchOverride = routed.baseBranch;
+		await ctx.persist();
+		return withBase(routed.repo);
 	}
 
 	/** Create/reuse the epic's worktree. Returns its path, or the status to end the run with. */
@@ -232,7 +257,8 @@ export class EpicEngine {
 			await reporter.response("Nothing to do: the mention didn't include a request. Delegate the issue to me to work the epic.");
 			return "completed";
 		}
-		const repo = this.resolveRepo(record, await linear.getIssue(epic.issueId));
+		const repo = await this.resolveRepo(ctx, await linear.getIssue(epic.issueId));
+		if (!repo) return "awaiting_input";
 		const worktree = await this.prepareWorkspace(ctx, epic, repo);
 		if (typeof worktree !== "string") return worktree.status;
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
@@ -325,13 +351,14 @@ export class EpicEngine {
 		await reporter.externalUrl(prLabel(record.prUrl), pr.url);
 	}
 
-	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig): string {
+	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig, routedBy?: string): string {
 		const done = epic.stories.filter(isStoryDone).length;
 		const kind =
 			epic.kind === "single"
 				? "a single issue (no PRD structure found), so I'll treat it as one story"
 				: `a Ralph epic with ${epic.stories.length} stories (${done} already done)`;
-		const lines = [`**${epic.identifier}** is ${kind}. Working in \`${repo.name}\` on branch \`${epic.branchName}\`.`];
+		const via = routedBy ? ` (routed by ${routedBy})` : "";
+		const lines = [`**${epic.identifier}** is ${kind}. Working in \`${repo.name}\`${via} on branch \`${epic.branchName}\`, based on \`${repo.baseBranch}\`.`];
 		if (loaded.materialized > 0) lines.push(`Created ${loaded.materialized} story sub-issues from the PRD in the description.`);
 		if (loaded.focusStoryKey) {
 			const s = epic.stories.find((x) => x.key === loaded.focusStoryKey);

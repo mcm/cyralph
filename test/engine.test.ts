@@ -631,3 +631,69 @@ describe("GitHub vs GitLab forges", () => {
 	});
 });
 
+describe("repository routing in sessions", () => {
+	function twoRepos() {
+		const t = setup();
+		const second = makeRepo();
+		const base = t.config.repositories[0]!;
+		t.config.repositories[0] = { ...base, id: "api", name: "platform/api", routingLabels: ["backend"] };
+		t.config.repositories.push({ ...base, id: "web", name: "platform/web", repositoryPath: second.repo, routingLabels: ["frontend"], workspaceBaseDir: join(second.root, "wt") });
+		return t;
+	}
+
+	it("routes by label and says so in the session", async () => {
+		const t = twoRepos();
+		const { epic } = ralphEpic(t.linear);
+		t.linear.issues.get(epic.id)!.labels = ["frontend"];
+		await t.manager.handle({ kind: "created", sessionId: "rt-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("rt-1")?.repoId).toBe("web");
+		expect(t.linear.bodies("thought").some((b) => b.includes("Working in `platform/web` (routed by label `frontend`)"))).toBe(true);
+	});
+
+	it("asks which repository when nothing matches, then continues with the reply", async () => {
+		const t = twoRepos();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "rt-2", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.calls).toHaveLength(0);
+		const ask = t.linear.activities.find((a) => a.signal === "select");
+		expect(ask?.content).toMatchObject({ type: "elicitation" });
+		expect(ask?.signalMetadata).toEqual({ options: [{ value: "platform/api" }, { value: "platform/web" }] });
+		expect(t.store.get("rt-2")?.status).toBe("awaiting_input");
+
+		// An unmatched reply re-asks; a matching one picks the repo and starts.
+		await t.manager.handle({ kind: "prompted", sessionId: "rt-2", issueId: epic.id, body: "mobile" });
+		expect(t.linear.activities.filter((a) => a.signal === "select")).toHaveLength(2);
+		await t.manager.handle({ kind: "prompted", sessionId: "rt-2", issueId: epic.id, body: "platform/web" });
+		await t.manager.idle();
+		expect(t.store.get("rt-2")).toMatchObject({ repoId: "web", routedBy: "your selection", status: "completed" });
+		expect(t.store.get("rt-2")?.guidance).toEqual([]); // the selection isn't story guidance
+		expect(t.runner.calls).toHaveLength(3);
+
+		// Re-delegating the same issue keeps the chosen repository without asking again.
+		await t.manager.handle({ kind: "created", sessionId: "rt-3", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("rt-3")?.repoId).toBe("web");
+		expect(t.linear.activities.filter((a) => a.signal === "select")).toHaveLength(2);
+	});
+
+	it("applies a [repo=name#branch] base branch override to new epic branches", async () => {
+		const t = twoRepos();
+		const { epic } = ralphEpic(t.linear);
+		const wsRepo = t.config.repositories[0]!.repositoryPath;
+		sh(wsRepo, "checkout", "-q", "-b", "release-2");
+		writeFileSync(join(wsRepo, "RELEASE"), "2\n");
+		sh(wsRepo, "add", ".");
+		sh(wsRepo, "commit", "-qm", "release branch");
+		sh(wsRepo, "checkout", "-q", "main");
+		t.linear.issues.get(epic.id)!.description = "PRD overview\n\n\\[repo=api#release-2\\]";
+		await t.manager.handle({ kind: "created", sessionId: "rt-4", issueId: epic.id });
+		await t.manager.idle();
+		const rec = t.store.get("rt-4");
+		expect(rec).toMatchObject({ repoId: "api", baseBranchOverride: "release-2" });
+		expect(existsSync(join(rec?.worktreePath ?? "", "RELEASE"))).toBe(true);
+		expect(t.linear.bodies("thought").some((b) => b.includes("based on `release-2`"))).toBe(true);
+	});
+});
+

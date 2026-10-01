@@ -22,6 +22,12 @@ export interface SessionRecord {
 	/** Claude session of the last direct request, resumed for follow-ups so the agent keeps its history. */
 	requestClaudeSessionId?: string;
 	repoId?: string;
+	/** How the repository was chosen (for the session log), e.g. "label `backend`". */
+	routedBy?: string;
+	/** Base branch from a `[repo=name#branch]` tag. */
+	baseBranchOverride?: string;
+	/** Repository ids offered in a pending "which repository?" elicitation. */
+	repoSelection?: string[];
 	branch?: string;
 	worktreePath?: string;
 	prUrl?: string;

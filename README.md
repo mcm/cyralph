@@ -204,12 +204,38 @@ cyralph run ENG-123                             # run the loop from the terminal
 
 ### Repository routing
 
-The checks run in this order, as in Cyrus:
-1. A `[repo=<id|name>]` tag in the description.
-2. `routingLabels`.
-3. `projectNames`.
-4. `teamKeys`.
-5. The first repository.
+Routing follows Cyrus's priorities. The delegated issue is checked first, then its epic (for a
+story delegated on its own):
+
+1. **Description tag**: `[repo=platform/api]`, `[repo=api#release-2]` (base branch override),
+   or unbracketed `repo=api` / `repos=api,web`. Linear's escaped `\[repo=…\]` also works. A tag
+   matches a repository's `id`, `name`, the last segment of its name, or its `githubUrl`/`gitlabUrl`.
+2. **`routingLabels`**: any label on the issue (case-insensitive).
+3. **`projectKeys`** (alias `projectNames`): the issue's Linear project.
+4. **`teamKeys`**: the issue's team, then the identifier prefix (`ENG-123` gives `ENG`).
+5. **Catch-all**: the first repository with no routing configuration at all.
+
+If nothing matches, the session asks *"Which repository should I work in?"* with a picker (Linear's
+`select` elicitation) and continues once you answer. You can pick an option, or reply with a name or
+a number. With only one repository configured, it is used without asking. The choice is sticky for
+the issue, including on re-delegation, and the first thought says how the repo was chosen, e.g.
+*"Working in `platform/web` (routed by label `frontend`)…"*. Set `"isActive": false` to keep a
+repository configured but never route to it.
+
+```json
+{
+  "repositories": [
+    { "id": "api", "name": "platform/api", "repositoryPath": "/srv/api", "baseBranch": "main",
+      "routingLabels": ["backend"], "teamKeys": ["API"], "gitlabUrl": "https://git.example.com/platform/api" },
+    { "id": "web", "name": "platform/web", "repositoryPath": "/srv/web", "baseBranch": "main",
+      "routingLabels": ["frontend"], "projectKeys": ["Website"] }
+  ]
+}
+```
+
+A `#branch` override only affects a newly created epic branch. An existing branch keeps its
+history. Unlike Cyrus, one issue routes to **one** repository. If several match, the first wins,
+in priority order and then config order.
 
 ## Development
 

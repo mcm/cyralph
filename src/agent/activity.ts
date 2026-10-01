@@ -2,7 +2,7 @@
  * Posts agent activities to a Linear agent session, serialized so they appear in order,
  * and never throws into the engine (Linear hiccups must not kill a long epic run).
  */
-import type { ActivityContent, LinearGateway, PlanStep } from "../linear/gateway.js";
+import type { ActivityContent, ActivityOptions, LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
 import type { RunnerEvent } from "./runner.js";
 
@@ -49,10 +49,11 @@ export class ActivityReporter {
 		private readonly log: Logger,
 	) {}
 
-	private post(content: ActivityContent, ephemeral?: boolean): Promise<void> {
+	private post(content: ActivityContent, ephemeral?: boolean, extra?: Omit<ActivityOptions, "ephemeral">): Promise<void> {
 		if ("body" in content) content = { ...content, body: truncate(content.body, MAX_BODY) };
+		const opts = ephemeral === undefined && !extra ? undefined : { ...(ephemeral !== undefined && { ephemeral }), ...extra };
 		this.chain = this.chain
-			.then(() => this.linear.createActivity(this.sessionId, content, ephemeral === undefined ? undefined : { ephemeral }))
+			.then(() => this.linear.createActivity(this.sessionId, content, opts))
 			.catch((err: unknown) => this.log.warn(`activity post failed for session ${this.sessionId}: ${String(err)}`));
 		return this.chain;
 	}
@@ -71,6 +72,10 @@ export class ActivityReporter {
 	}
 	elicitation(body: string) {
 		return this.post({ type: "elicitation", body });
+	}
+	/** An elicitation Linear renders as a picker of `options`. */
+	select(body: string, options: string[]) {
+		return this.post({ type: "elicitation", body }, undefined, { signal: "select", signalMetadata: { options: options.map((value) => ({ value })) } });
 	}
 
 	plan(steps: PlanStep[]): Promise<void> {

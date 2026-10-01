@@ -10,6 +10,7 @@ import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
 import { EpicEngine } from "./epic-engine.js";
+import { matchSelection, selectionValue } from "./routing.js";
 import { PARKED, type SessionRecord, type SessionStore, newRecord } from "./store.js";
 
 const RESOLVED_STATE_TYPES = new Set(["completed", "canceled"]);
@@ -117,6 +118,10 @@ export class SessionManager {
 		const previous = this.store.latestForIssue(event.issueId);
 		if (previous && previous.sessionId !== record.sessionId) {
 			record.branch ??= previous.branch;
+			// Routing is sticky per issue, like Cyrus' issue -> repository cache.
+			record.repoId ??= previous.repoId;
+			record.routedBy ??= previous.routedBy;
+			record.baseBranchOverride ??= previous.baseBranchOverride;
 			record.prUrl ??= previous.prUrl;
 			record.prNumber ??= previous.prNumber;
 			record.guidance = [...previous.guidance];
@@ -166,6 +171,24 @@ export class SessionManager {
 		}
 
 		const { text, wantsLoop } = parseInstruction(event.body);
+
+		// Answer to "Which repository should I work in?"
+		if (record.repoSelection?.length) {
+			const candidates = this.deps.config.repositories.filter((r) => record.repoSelection?.includes(r.id));
+			const repo = matchSelection(text, candidates);
+			if (!repo) {
+				await reporter.select(`I couldn't match "${text}" to a repository. Which one should I use?`, candidates.map(selectionValue));
+				return;
+			}
+			record.repoId = repo.id;
+			record.routedBy = "your selection";
+			record.repoSelection = undefined;
+			await this.store.save(record);
+			await reporter.thought(`Using \`${repo.name}\`.`);
+			this.enqueue(record);
+			return;
+		}
+
 		if (isStartAnywayRequest(text)) {
 			record.ignoreBlockers = true;
 			record.waitingOn = [];

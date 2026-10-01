@@ -2,7 +2,7 @@
  * The narrow slice of Linear the agent needs, behind an interface so the engine can be
  * tested without the network. `SdkLinearGateway` implements it with @linear/sdk.
  */
-import { IssueRelationType, LinearClient } from "@linear/sdk";
+import { AgentActivitySignal, IssueRelationType, LinearClient } from "@linear/sdk";
 
 export interface IssueSummary {
 	id: string;
@@ -34,6 +34,13 @@ export type ActivityContent =
 	| { type: "error"; body: string }
 	| { type: "elicitation"; body: string };
 
+export interface ActivityOptions {
+	ephemeral?: boolean;
+	/** e.g. "select" with `signalMetadata: { options: [{ value }] }` renders a picker in Linear. */
+	signal?: "select" | "auth" | "stop" | "continue";
+	signalMetadata?: Record<string, unknown>;
+}
+
 export interface PlanStep {
 	content: string;
 	status: "pending" | "inProgress" | "completed" | "canceled";
@@ -57,7 +64,7 @@ export interface LinearGateway {
 	/** Move to the team's first workflow state of this type (or the named state). */
 	setIssueState(issueId: string, target: { type?: string; name?: string }): Promise<void>;
 	addComment(issueId: string, body: string): Promise<void>;
-	createActivity(sessionId: string, content: ActivityContent, opts?: { ephemeral?: boolean }): Promise<void>;
+	createActivity(sessionId: string, content: ActivityContent, opts?: ActivityOptions): Promise<void>;
 	updateSessionPlan(sessionId: string, plan: PlanStep[]): Promise<void>;
 	addSessionExternalUrl(sessionId: string, label: string, url: string): Promise<void>;
 }
@@ -177,11 +184,19 @@ export class SdkLinearGateway implements LinearGateway {
 		await this.client.createComment({ issueId, body });
 	}
 
-	async createActivity(sessionId: string, content: ActivityContent, opts?: { ephemeral?: boolean }): Promise<void> {
+	async createActivity(sessionId: string, content: ActivityContent, opts?: ActivityOptions): Promise<void> {
+		const signals = {
+			select: AgentActivitySignal.Select,
+			auth: AgentActivitySignal.Auth,
+			stop: AgentActivitySignal.Stop,
+			continue: AgentActivitySignal.Continue,
+		} as const;
 		await this.client.createAgentActivity({
 			agentSessionId: sessionId,
 			content,
 			...(opts?.ephemeral !== undefined && { ephemeral: opts.ephemeral }),
+			...(opts?.signal && { signal: signals[opts.signal] }),
+			...(opts?.signalMetadata && { signalMetadata: opts.signalMetadata }),
 		});
 	}
 
@@ -211,9 +226,10 @@ export class ConsoleSessionGateway implements LinearGateway {
 	createBlocksRelation = (a: string, b: string) => this.inner.createBlocksRelation(a, b);
 	setIssueState = (id: string, t: { type?: string; name?: string }) => this.inner.setIssueState(id, t);
 	addComment = (id: string, body: string) => this.inner.addComment(id, body);
-	async createActivity(_sessionId: string, content: ActivityContent): Promise<void> {
+	async createActivity(_sessionId: string, content: ActivityContent, opts?: ActivityOptions): Promise<void> {
+		const options = (opts?.signalMetadata?.options as Array<{ value: string }> | undefined)?.map((o, i) => `\n  ${i + 1}. ${o.value}`).join("") ?? "";
 		const text = content.type === "action" ? `${content.action} ${content.parameter}${content.result ? ` -> ${content.result}` : ""}` : content.body;
-		this.print(`[${content.type}] ${text}`);
+		this.print(`[${content.type}] ${text}${options}`);
 	}
 	async updateSessionPlan(_sessionId: string, plan: PlanStep[]): Promise<void> {
 		const mark = { pending: " ", inProgress: "~", completed: "x", canceled: "-" } as const;
