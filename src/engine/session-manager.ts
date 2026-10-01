@@ -7,10 +7,12 @@
  */
 import { ActivityReporter } from "../agent/activity.js";
 import type { AgentWebhookEvent } from "../linear/webhook.js";
-import { isStopRequest } from "../linear/webhook.js";
+import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
 import { EpicEngine } from "./epic-engine.js";
-import { type SessionRecord, type SessionStore, newRecord } from "./store.js";
+import { PARKED, type SessionRecord, type SessionStore, newRecord } from "./store.js";
+
+const RESOLVED_STATE_TYPES = new Set(["completed", "canceled"]);
 
 interface Active {
 	abort: AbortController;
@@ -41,6 +43,49 @@ export class SessionManager {
 	async handle(event: AgentWebhookEvent): Promise<void> {
 		if (event.kind === "created") return this.onCreated(event);
 		if (event.kind === "prompted") return this.onPrompted(event);
+		if (event.kind === "issue_state") {
+			if (this.store.waitingOnIssue(event.issueId).length === 0) return;
+			// Issue webhooks don't always carry the state type; ask Linear when missing.
+			let stateType = event.stateType;
+			if (!event.removed && !stateType) stateType = (await this.deps.linear.getIssue(event.issueId)).stateType;
+			if (event.removed || (stateType && RESOLVED_STATE_TYPES.has(stateType))) {
+				await this.onIssueResolved(event.issueId, event.removed ? "was deleted" : stateType === "canceled" ? "was canceled" : "is done");
+			}
+		}
+	}
+
+	/** A blocker was completed/canceled/deleted: wake every session parked on it. */
+	async onIssueResolved(issueId: string, how = "is done"): Promise<void> {
+		for (const record of this.store.waitingOnIssue(issueId)) {
+			const blocker = record.waitingOn.find((w) => w.id === issueId);
+			record.waitingOn = record.waitingOn.filter((w) => w.id !== issueId);
+			await this.store.save(record);
+			await this.reporter(record.sessionId).thought(`${blocker?.identifier ?? "A blocking issue"} ${how}. Re-checking blockers and resuming.`);
+			this.enqueue(record);
+		}
+	}
+
+	/**
+	 * Fallback for missed webhooks (downtime, Issue webhooks not enabled): look up the state of every
+	 * blocker parked sessions wait on and wake the ones that resolved. Run at startup and periodically.
+	 */
+	async reconcileParked(): Promise<void> {
+		const ids = new Set(
+			this.store
+				.all()
+				.filter((r) => PARKED.has(r.status))
+				.flatMap((r) => r.waitingOn.map((w) => w.id)),
+		);
+		for (const id of ids) {
+			try {
+				const issue = await this.deps.linear.getIssue(id);
+				if (RESOLVED_STATE_TYPES.has(issue.stateType)) await this.onIssueResolved(id, issue.stateType === "canceled" ? "was canceled" : "is done");
+			} catch (err) {
+				// Deleted or no longer visible: stop waiting on it.
+				this.deps.log.warn(`blocker ${id} lookup failed (${String(err)}); treating as resolved`);
+				await this.onIssueResolved(id, "is no longer accessible");
+			}
+		}
 	}
 
 	private async onCreated(event: Extract<AgentWebhookEvent, { kind: "created" }>) {
@@ -87,7 +132,12 @@ export class SessionManager {
 		}
 
 		const text = event.body.trim();
-		if (text) record.guidance.push(text);
+		if (isStartAnywayRequest(text)) {
+			record.ignoreBlockers = true;
+			record.waitingOn = [];
+		} else if (text) {
+			record.guidance.push(text);
+		}
 		if (this.active.has(record.sessionId)) {
 			await this.store.save(record);
 			await reporter.thought("Got it. I'll apply this from the next story iteration onward.");

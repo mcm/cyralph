@@ -56,6 +56,15 @@ export type AgentWebhookEvent =
 			signal?: string;
 			authorName?: string;
 	  }
+	| {
+			/** An issue changed workflow state (or was deleted); may unblock parked sessions. */
+			kind: "issue_state";
+			issueId: string;
+			identifier?: string;
+			/** Workflow state type from the payload, when present ("completed", "canceled", ...). */
+			stateType?: string;
+			removed: boolean;
+	  }
 	| { kind: "ignored"; reason: string };
 
 function obj(v: unknown): Record<string, unknown> {
@@ -65,7 +74,18 @@ function str(v: unknown): string | undefined {
 	return typeof v === "string" ? v : undefined;
 }
 
+function classifyIssueWebhook(payload: Record<string, unknown>): AgentWebhookEvent {
+	const data = obj(payload.data);
+	const issueId = str(data.id);
+	if (!issueId) return { kind: "ignored", reason: "issue webhook without id" };
+	const removed = payload.action === "remove";
+	const stateChanged = payload.action === "update" && "stateId" in obj(payload.updatedFrom);
+	if (!removed && !stateChanged) return { kind: "ignored", reason: "issue update without state change" };
+	return { kind: "issue_state", issueId, identifier: str(data.identifier), stateType: str(obj(data.state).type), removed };
+}
+
 export function classifyWebhook(payload: Record<string, unknown>): AgentWebhookEvent {
+	if (payload.type === "Issue") return classifyIssueWebhook(payload);
 	if (payload.type !== "AgentSessionEvent") return { kind: "ignored", reason: `type ${String(payload.type)}` };
 	const session = obj(payload.agentSession);
 	const sessionId = str(session.id);
@@ -98,6 +118,11 @@ export function classifyWebhook(payload: Record<string, unknown>): AgentWebhookE
 		};
 	}
 	return { kind: "ignored", reason: `action ${String(payload.action)}` };
+}
+
+/** "start anyway", "ignore the blockers", "go ahead anyway"… */
+export function isStartAnywayRequest(body: string): boolean {
+	return /\b(start|go|proceed|run|work on it|go ahead)\s+anyway\b|\bignore\s+(the\s+)?block(er|ers|ing|ed)?\b/i.test(body);
 }
 
 export function isStopRequest(event: Extract<AgentWebhookEvent, { kind: "prompted" }>): boolean {

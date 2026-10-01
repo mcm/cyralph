@@ -41,7 +41,12 @@ export interface LoadOptions {
 	materializeStories: boolean;
 }
 
-async function storyFromIssue(linear: LinearGateway, issue: IssueSummary, epicKeys: Set<string>): Promise<Story> {
+async function storyFromIssue(
+	linear: LinearGateway,
+	issue: IssueSummary,
+	epicKeys: Set<string>,
+	external: Record<string, string>,
+): Promise<Story> {
 	const body = parseStoryIssueBody(issue.description);
 	const titled = parseStoryTitle(issue.title);
 	const blockers = await linear.getBlockers(issue.id);
@@ -49,7 +54,10 @@ async function storyFromIssue(linear: LinearGateway, issue: IssueSummary, epicKe
 	for (const b of blockers) {
 		if (epicKeys.has(b.id)) dependsOn.push(b.id);
 		// External blockers only matter while they are still open.
-		else if (!DONE_TYPES.has(b.stateType)) dependsOn.push(`${EXTERNAL_DEP_PREFIX}${b.identifier}`);
+		else if (!DONE_TYPES.has(b.stateType)) {
+			dependsOn.push(`${EXTERNAL_DEP_PREFIX}${b.id}`);
+			external[b.id] = b.identifier;
+		}
 	}
 	return {
 		key: issue.id,
@@ -82,9 +90,10 @@ function epicBase(issue: IssueSummary, prd: ParsedPrd | null): Omit<Epic, "kind"
 
 async function loadChildrenEpic(linear: LinearGateway, parent: IssueSummary, children: IssueSummary[]): Promise<Epic> {
 	const keys = new Set(children.map((c) => c.id));
-	const stories = await Promise.all(children.map((c) => storyFromIssue(linear, c, keys)));
+	const externalIssues: Record<string, string> = {};
+	const stories = await Promise.all(children.map((c) => storyFromIssue(linear, c, keys, externalIssues)));
 	const prd = parsePrdFromText(parent.description);
-	return { ...epicBase(parent, prd), kind: "children", stories };
+	return { ...epicBase(parent, prd), kind: "children", stories, externalIssues };
 }
 
 function inMemoryStories(prd: ParsedPrd): Story[] {
@@ -154,6 +163,16 @@ function singleStoryEpic(issue: IssueSummary): Epic {
 			},
 		],
 	};
+}
+
+/**
+ * Open issues blocking the epic issue itself (or the plain issue, for single-issue epics).
+ * Its own stories never count: "parent blocked by child" just means "do the children first".
+ */
+export async function openRootBlockers(linear: LinearGateway, epic: Epic): Promise<Array<{ id: string; identifier: string }>> {
+	const own = new Set(epic.stories.map((s) => s.issueId).filter(Boolean));
+	const blockers = await linear.getBlockers(epic.issueId);
+	return blockers.filter((b) => !own.has(b.id) && !DONE_TYPES.has(b.stateType)).map(({ id, identifier }) => ({ id, identifier }));
 }
 
 export async function loadEpic(linear: LinearGateway, issueId: string, opts: LoadOptions): Promise<LoadedEpic> {

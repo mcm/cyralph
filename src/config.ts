@@ -82,6 +82,11 @@ export const ConfigSchema = z.object({
 	model: z.string().default("opus"),
 	fallbackModel: z.string().optional(),
 	maxConcurrentSessions: z.number().int().positive().default(2),
+	/**
+	 * How often to re-check blockers of parked sessions, as a fallback for missed Issue webhooks.
+	 * 0 disables polling (startup reconciliation still runs).
+	 */
+	blockerPollMinutes: z.number().nonnegative().default(10),
 	/** Claude Agent SDK permission mode. Agents run unattended, so edits must not prompt. */
 	permissionMode: z.enum(["bypassPermissions", "acceptEdits", "dontAsk", "auto"]).default("bypassPermissions"),
 	linear: LinearConfigSchema.prefault({}),

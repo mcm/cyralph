@@ -240,3 +240,108 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(readFileSync(join(t.root, "sessions.json"), "utf8")).toContain('"stopped"');
 	});
 });
+
+describe("blocking / blocked-by relations", () => {
+	const taskOrder = (t: ReturnType<typeof setup>) => t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+
+	it("parks an epic that is blocked by another issue and resumes when the blocker is done (Issue webhook)", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const blocker = t.linear.add({ title: "Design review", identifier: "ENG-99", stateType: "started" });
+		t.linear.blocks.set(epic.id, [blocker.id]);
+
+		await t.manager.handle({ kind: "created", sessionId: "b-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.calls).toHaveLength(0);
+		const rec = t.store.get("b-1");
+		expect(rec?.status).toBe("blocked");
+		expect(rec?.waitingOn).toEqual([{ id: blocker.id, identifier: "ENG-99" }]);
+		expect(rec?.worktreePath).toBeUndefined();
+		expect(t.linear.issues.get(epic.id)?.stateType).toBe("unstarted");
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("**ENG-1** is blocked on **ENG-99**");
+
+		// Unrelated state changes and non-resolving transitions don't wake it.
+		await t.manager.handle({ kind: "issue_state", issueId: blocker.id, stateType: "unstarted", removed: false });
+		await t.manager.idle();
+		expect(t.store.get("b-1")?.status).toBe("blocked");
+
+		t.linear.issues.get(blocker.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "issue_state", issueId: blocker.id, identifier: "ENG-99", stateType: "completed", removed: false });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(t.store.get("b-1")?.status).toBe("completed");
+		expect(t.linear.bodies("thought")).toContain("ENG-99 is done. Re-checking blockers and resuming.");
+	});
+
+	it("runs unblocked stories first, parks on an outside blocker of one story, and resumes via reconcile", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		const api = t.linear.add({ title: "Ship API v2", identifier: "API-7", stateType: "started" });
+		// US-001 waits on another team's issue; US-002 depends on US-001; US-003 is free.
+		t.linear.blocks.set(s1.id, [api.id]);
+
+		await t.manager.handle({ kind: "created", sessionId: "b-2", issueId: epic.id });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(t.store.get("b-2")?.status).toBe("blocked");
+		expect(t.store.get("b-2")?.waitingOn).toEqual([{ id: api.id, identifier: "API-7" }]);
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **API-7**");
+		expect(t.runner.calls[0]?.prompt).toContain("US-001: Add priority field (depends on API-7)");
+
+		// The webhook was missed; the periodic reconcile notices the blocker closed.
+		await t.manager.reconcileParked();
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003"]);
+		t.linear.issues.get(api.id)!.stateType = "canceled";
+		await t.manager.reconcileParked();
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003", "US-001", "US-002"]);
+		expect(t.store.get("b-2")?.status).toBe("completed");
+		expect(t.store.get("b-2")?.waitingOn).toEqual([]);
+	});
+
+	it("honours blocked-by on a plain issue, and 'start anyway' overrides it", async () => {
+		const t = setup();
+		const issue = t.linear.add({ title: "Fix login bug", identifier: "ENG-70", description: "- [ ] login works" });
+		const blocker = t.linear.add({ title: "Upgrade auth lib", identifier: "ENG-71" });
+		t.linear.blocks.set(issue.id, [blocker.id]);
+
+		await t.manager.handle({ kind: "created", sessionId: "b-3", issueId: issue.id });
+		await t.manager.idle();
+		expect(t.store.get("b-3")?.status).toBe("blocked");
+		expect(t.runner.calls).toHaveLength(0);
+
+		await t.manager.handle({ kind: "prompted", sessionId: "b-3", issueId: issue.id, body: "Start anyway, the upgrade isn't needed" });
+		await t.manager.idle();
+		expect(t.runner.calls).toHaveLength(1);
+		expect(t.store.get("b-3")?.status).toBe("completed");
+		expect(t.store.get("b-3")?.guidance).toEqual([]);
+	});
+
+	it("parks a directly delegated story on its unfinished sibling and wakes when the sibling is done", async () => {
+		const t = setup();
+		const { s1, s2 } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "b-4", issueId: s2.id });
+		await t.manager.idle();
+		expect(t.runner.calls).toHaveLength(0);
+		expect(t.store.get("b-4")?.status).toBe("blocked");
+		expect(t.store.get("b-4")?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
+
+		t.linear.issues.get(s1.id)!.stateType = "completed";
+		// Issue webhooks may omit the state; the manager looks it up.
+		await t.manager.handle({ kind: "issue_state", issueId: s1.id, removed: false });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-002"]);
+		expect(t.store.get("b-4")?.status).toBe("completed");
+	});
+
+	it("ignores a parent epic that lists its own child as a blocker", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		t.linear.blocks.set(epic.id, [s3.id]);
+		await t.manager.handle({ kind: "created", sessionId: "b-5", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("b-5")?.status).toBe("completed");
+	});
+});
+

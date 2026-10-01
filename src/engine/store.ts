@@ -5,7 +5,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type SessionStatus = "queued" | "running" | "awaiting_input" | "completed" | "stopped" | "failed";
+export type SessionStatus = "queued" | "running" | "awaiting_input" | "blocked" | "completed" | "stopped" | "failed";
 
 export interface SessionRecord {
 	sessionId: string;
@@ -26,10 +26,17 @@ export interface SessionRecord {
 	/** Completed story keys for in-memory ("prd" kind) epics that were not materialized. */
 	completedKeys: string[];
 	focusStoryKey?: string;
+	/** Open issues (outside the epic) the run is parked on; resolving any of them wakes the session. */
+	waitingOn: Array<{ id: string; identifier: string }>;
+	/** A human said to start despite open blockers. */
+	ignoreBlockers?: boolean;
 	totalCostUsd: number;
 	createdAt: string;
 	updatedAt: string;
 }
+
+/** Statuses in which a session may be woken by a blocker resolving. */
+export const PARKED = new Set<SessionStatus>(["blocked", "awaiting_input"]);
 
 export function newRecord(sessionId: string, issueId: string, identifier?: string): SessionRecord {
 	const now = new Date().toISOString();
@@ -42,6 +49,7 @@ export function newRecord(sessionId: string, issueId: string, identifier?: strin
 		lastFeedback: {},
 		guidance: [],
 		completedKeys: [],
+		waitingOn: [],
 		totalCostUsd: 0,
 		createdAt: now,
 		updatedAt: now,
@@ -57,7 +65,7 @@ export class SessionStore {
 	async load(): Promise<void> {
 		try {
 			const data = JSON.parse(await readFile(this.file, "utf8")) as { sessions?: SessionRecord[] };
-			for (const r of data.sessions ?? []) this.records.set(r.sessionId, r);
+			for (const r of data.sessions ?? []) this.records.set(r.sessionId, { ...r, waitingOn: r.waitingOn ?? [] });
 		} catch {
 			// first run
 		}
@@ -69,6 +77,11 @@ export class SessionStore {
 
 	all(): SessionRecord[] {
 		return [...this.records.values()];
+	}
+
+	/** Parked sessions waiting on the given blocker issue. */
+	waitingOnIssue(issueId: string): SessionRecord[] {
+		return this.all().filter((r) => PARKED.has(r.status) && r.waitingOn.some((w) => w.id === issueId));
 	}
 
 	/** Most recent session for an issue (a re-delegation creates a new session on the same issue). */

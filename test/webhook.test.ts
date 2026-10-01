@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyWebhook, isStopRequest, signBody, verifyWebhook } from "../src/linear/webhook.js";
+import { classifyWebhook, isStartAnywayRequest, isStopRequest, signBody, verifyWebhook } from "../src/linear/webhook.js";
 
 describe("verifyWebhook", () => {
 	const secret = "s3cret";
@@ -50,4 +50,19 @@ describe("classifyWebhook", () => {
 	it("ignores other events", () => {
 		expect(classifyWebhook({ type: "Issue", action: "update" }).kind).toBe("ignored");
 	});
+
+	it("classifies issue state changes and deletions", () => {
+		expect(
+			classifyWebhook({ type: "Issue", action: "update", data: { id: "i9", identifier: "ENG-9", state: { type: "completed" } }, updatedFrom: { stateId: "old" } }),
+		).toEqual({ kind: "issue_state", issueId: "i9", identifier: "ENG-9", stateType: "completed", removed: false });
+		expect(classifyWebhook({ type: "Issue", action: "remove", data: { id: "i9" } })).toMatchObject({ kind: "issue_state", removed: true });
+		expect(classifyWebhook({ type: "Issue", action: "update", data: { id: "i9" }, updatedFrom: { title: "x" } }).kind).toBe("ignored");
+	});
+
+	it("recognises start-anyway requests", () => {
+		expect(isStartAnywayRequest("Start anyway please")).toBe(true);
+		expect(isStartAnywayRequest("ignore the blocker")).toBe(true);
+		expect(isStartAnywayRequest("please use pnpm")).toBe(false);
+	});
 });
+

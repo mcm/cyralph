@@ -4,7 +4,7 @@
  *
  * Custom templates use a Handlebars-compatible subset: `{{var}}`, `{{#if var}}...{{else}}...{{/if}}`.
  */
-import type { Epic, Story } from "./types.js";
+import { type Epic, type Story, dependencyLabel } from "./types.js";
 
 export const COMPLETE_PATTERN = /<promise>\s*COMPLETE\s*<\/promise>/i;
 
@@ -144,10 +144,9 @@ const STATUS_MARK: Record<Story["status"], string> = {
 };
 
 export function formatStoryList(epic: Epic, current?: Story): string {
-	const byKey = new Map(epic.stories.map((s) => [s.key, s]));
 	return epic.stories
 		.map((s) => {
-			const deps = s.dependsOn.map((d) => byKey.get(d)?.storyId ?? d.replace(/^external:/, ""));
+			const deps = s.dependsOn.map((d) => dependencyLabel(epic, d));
 			const depText = deps.length ? ` (depends on ${deps.join(", ")})` : "";
 			const here = current?.key === s.key ? "  <- current" : "";
 			return `- ${STATUS_MARK[s.status]} ${s.storyId}: ${s.title}${depText}${here}`;

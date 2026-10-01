@@ -58,7 +58,7 @@ export function createWebhookServer(opts: { webhookSecret: string; manager: Sess
 			log.debug(`ignored webhook: ${event.reason}`);
 			return;
 		}
-		log.info(`agent session ${event.kind}: ${event.sessionId}`);
+		log.info(event.kind === "issue_state" ? `issue state change: ${event.identifier ?? event.issueId}` : `agent session ${event.kind}: ${event.sessionId}`);
 		manager.handle(event).catch((err: unknown) => log.error(`webhook handling failed: ${String(err)}`));
 	});
 }

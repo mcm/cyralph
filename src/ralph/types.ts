@@ -48,6 +48,20 @@ export interface Epic {
 	/** Shell commands the PRD requires to pass for every story. */
 	qualityGates: string[];
 	stories: Story[];
+	/** Open issues outside the epic that block one of its stories: Linear id -> identifier (e.g. "ENG-99"). */
+	externalIssues?: Record<string, string>;
 }
 
+/** Story dependency marker for a blocker outside the epic: `external:<linear issue id>`. */
 export const EXTERNAL_DEP_PREFIX = "external:";
+
+export function externalIdOf(dep: string): string | undefined {
+	return dep.startsWith(EXTERNAL_DEP_PREFIX) ? dep.slice(EXTERNAL_DEP_PREFIX.length) : undefined;
+}
+
+/** Human label for a dependency: the story id within the epic, or the external issue identifier. */
+export function dependencyLabel(epic: Epic, dep: string): string {
+	const ext = externalIdOf(dep);
+	if (ext) return epic.externalIssues?.[ext] ?? ext;
+	return epic.stories.find((s) => s.key === dep)?.storyId ?? dep;
+}

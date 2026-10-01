@@ -13,13 +13,13 @@ import type { ActivityReporter } from "../agent/activity.js";
 import type { AgentRunner } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, GitWorkspace } from "../git/workspace.js";
-import { type LoadedEpic, loadEpic } from "../linear/epic-loader.js";
+import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
 import type { LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
 import { COMPLETE_PATTERN, DEFAULT_STORY_TEMPLATE, buildStoryPrompt } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
-import { EXTERNAL_DEP_PREFIX, type Epic, type Story } from "../ralph/types.js";
+import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
 import { selectRepository } from "./routing.js";
 import type { SessionRecord, SessionStatus } from "./store.js";
 
@@ -100,6 +100,16 @@ export class EpicEngine {
 		record.identifier = epic.identifier;
 		record.focusStoryKey ??= loaded.focusStoryKey;
 		for (const s of epic.stories) if (record.completedKeys.includes(s.key)) s.status = "completed";
+
+		if (record.ignoreBlockers) {
+			// A human said to go ahead: outside blockers no longer gate any story.
+			for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d));
+		} else {
+			// Blocked-by on the epic (or plain issue) itself gates the whole run, as in Cyrus.
+			const rootBlockers = await openRootBlockers(linear, epic);
+			if (rootBlockers.length > 0) return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is blocked`);
+		}
+		record.waitingOn = [];
 
 		const issue = await linear.getIssue(epic.issueId);
 		const repo = record.repoId ? (config.repositories.find((r) => r.id === record.repoId) ?? selectRepository(config.repositories, issue)) : selectRepository(config.repositories, issue);
@@ -384,17 +394,54 @@ export class EpicEngine {
 		}
 
 		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
+		const isOpen = (d: string) => {
+			const s = byKey.get(d);
+			return !s || !isStoryDone(s);
+		};
+		// Outside issues that hold up the remaining in-scope stories (directly or via another story).
+		const waitingOn = new Map<string, string>();
+		for (const s of scoped.filter((x) => !isStoryDone(x))) {
+			for (const d of s.dependsOn) {
+				const ext = externalIdOf(d);
+				if (ext) waitingOn.set(ext, dependencyLabel(epic, d));
+			}
+		}
+		const blockerChain = (s: Story, seen = new Set<string>()): void => {
+			for (const d of s.dependsOn) {
+				const dep = byKey.get(d);
+				if (!dep || isStoryDone(dep) || seen.has(d)) continue;
+				seen.add(d);
+				for (const dd of dep.dependsOn) {
+					const ext = externalIdOf(dd);
+					if (ext) waitingOn.set(ext, dependencyLabel(epic, dd));
+				}
+				blockerChain(dep, seen);
+			}
+		};
+		for (const s of scoped.filter((x) => !isStoryDone(x))) blockerChain(s);
+		// A focused (single-story) run can't do its sibling prerequisites itself: wait for them too.
+		if (record.focusStoryKey) {
+			for (const d of byKey.get(record.focusStoryKey)?.dependsOn ?? []) {
+				const dep = byKey.get(d);
+				if (dep?.issueId && !isStoryDone(dep) && !exhausted.has(dep.key)) waitingOn.set(dep.issueId, dep.identifier ?? dep.storyId);
+			}
+		}
+		record.waitingOn = [...waitingOn].map(([id, identifier]) => ({ id, identifier }));
+
+		const stuck = scoped.filter((s) => exhausted.has(s.key));
+		if (!hitCap && stuck.length === 0 && record.waitingOn.length > 0) {
+			const done = scoped.filter(isStoryDone).length;
+			return this.park(ctx, epic, record.waitingOn, `${done}/${scoped.length} stories are done; the rest are waiting`);
+		}
+
 		const lines: string[] = [];
 		if (hitCap) lines.push(`I reached the per-run iteration cap (${config.ralph.maxIterationsPerRun}).`);
-		const stuck = scoped.filter((s) => exhausted.has(s.key));
 		for (const s of stuck) {
 			lines.push(`**${s.storyId}: ${s.title}** failed ${record.attempts[s.key]} attempts. Last problem:\n\n${tail(record.lastFeedback[s.key] ?? "unknown", 1500)}`);
 		}
 		const blocked = blockedStories(scoped, exhausted);
 		for (const s of blocked) {
-			const why = s.dependsOn
-				.filter((d) => !byKey.get(d) || !isStoryDone(byKey.get(d) as Story))
-				.map((d) => (d.startsWith(EXTERNAL_DEP_PREFIX) ? d.slice(EXTERNAL_DEP_PREFIX.length) : (byKey.get(d)?.storyId ?? d)));
+			const why = s.dependsOn.filter(isOpen).map((d) => dependencyLabel(epic, d));
 			lines.push(`**${s.storyId}** is blocked by ${why.join(", ")}.`);
 		}
 		if (record.focusStoryKey && lines.length === 0) {
@@ -406,9 +453,26 @@ export class EpicEngine {
 			[
 				`Paused with ${done}/${scoped.length} stories complete on \`${record.branch}\`${cost}.`,
 				...lines,
+				record.waitingOn.length
+					? `I'll also resume on my own when ${record.waitingOn.map((w) => w.identifier).join(", ")} is done.`
+					: "",
 				"Reply with guidance (it will be added to every story prompt) and I'll retry, or say `stop`.",
-			].join("\n\n"),
+			]
+				.filter(Boolean)
+				.join("\n\n"),
 		);
 		return "awaiting_input";
+	}
+
+	/** Park the session until an outside blocker is resolved (Issue webhook or poll wakes it). */
+	private async park(ctx: EngineRun, epic: Epic, blockers: Array<{ id: string; identifier: string }>, lead: string): Promise<SessionStatus> {
+		ctx.record.waitingOn = blockers;
+		await ctx.persist();
+		await ctx.reporter.plan(planFor(epic));
+		const names = blockers.map((b) => `**${b.identifier}**`).join(", ");
+		await ctx.reporter.elicitation(
+			`${lead} on ${names}. I'll start automatically when ${blockers.length > 1 ? "any of them is" : "it's"} done or canceled.\n\nReply \`start anyway\` to ignore the blockers, or \`stop\` to cancel.`,
+		);
+		return "blocked";
 	}
 }

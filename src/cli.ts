@@ -74,11 +74,16 @@ async function cmdStart(configPath: string) {
 	const manager = new SessionManager(deps(config, gateway), store);
 	const server = createWebhookServer({ webhookSecret: config.linear.webhookSecret, manager, log });
 	server.listen(config.port, () => log.info(`cyralph listening on :${config.port} (POST /linear-webhook)`));
+	// Wake sessions whose blockers resolved while we were down, then keep polling as a webhook fallback.
+	const reconcile = () => manager.reconcileParked().catch((e: unknown) => log.warn(`blocker reconcile failed: ${String(e)}`));
+	void reconcile();
+	const poll = config.blockerPollMinutes > 0 ? setInterval(reconcile, config.blockerPollMinutes * 60_000) : undefined;
 	// Linear OAuth access tokens expire; refresh twice a day.
 	const timer = setInterval(() => void refreshIfPossible(config, gateway), 12 * 60 * 60 * 1000);
 	const shutdown = async () => {
 		log.info("shutting down…");
 		clearInterval(timer);
+		if (poll) clearInterval(poll);
 		server.close();
 		await manager.shutdown();
 		process.exit(0);

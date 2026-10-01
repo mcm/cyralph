@@ -56,6 +56,29 @@ A `> Branch: \`name\`` line in the PRD sets the branch. Otherwise the branch is 
 - **Re-delegation**: re-delegating the same issue creates a new session. It keeps the branch, the PR
   and the guidance, and skips stories that are already done.
 
+## Blocking / blocked-by
+
+Linear **blocks** relations decide what can run. "A blocks B" and "B is blocked by A" are the same
+relation seen from either side, so it doesn't matter which issue you added the link from.
+
+| Relation | Effect |
+| --- | --- |
+| Story blocked by another story **in the epic** | Becomes a story dependency. It is picked only once the blocker is Done or Canceled, and it becomes eligible during the same run as soon as the blocker finishes. |
+| Story blocked by an **open issue outside the epic** | The story is held. Unblocked stories run first. If nothing else can run, the session is **parked** on that issue. |
+| **The epic issue itself** (or a plain delegated issue) blocked by an open issue | Nothing starts: no worktree is created and the issue's state isn't changed. The session is parked. A parent that lists its own child as a blocker is ignored. |
+| A story delegated on its own whose sibling prerequisite isn't done | Parked on that sibling. |
+
+A parked session posts *"…blocked on **ENG-99**. I'll start automatically when it's done or
+canceled."* It wakes when any issue it waits on is completed, canceled or deleted. Every wake
+re-reads the blockers from Linear, so a wake that turns out to be early just parks again. What
+triggers a wake:
+
+- **Issue webhooks.** Enable the *Issues* resource type on the OAuth app's webhook.
+- **A fallback poll** every `blockerPollMinutes` (default 10), plus a check at startup. This covers
+  webhooks missed during downtime.
+- **A reply of `start anyway`** (or "ignore the blockers"), which runs without waiting on outside
+  blockers. Story-to-story dependencies inside the epic still apply.
+
 ## Ralph semantics kept from ralph-tui
 
 - **One story per session.** Each story runs in a fresh context. The PRD, the progress log and the
@@ -86,7 +109,8 @@ What cyralph adds on top:
 1. **Create a Linear OAuth app.** In Linear, go to *Settings → API → OAuth applications*.
    - Callback URL: `http://localhost:3458/oauth/callback`
    - Enable **webhooks**, point them at `https://<public-host>/linear-webhook`, and tick
-     **Agent session events**.
+     **Agent session events** and **Issues**. Issues events are how parked sessions learn that
+     their blockers have resolved.
    - Note the client ID, client secret and webhook signing secret.
 2. **Configure.** Copy `examples/config.example.json` to `~/.cyralph/config.json` and fill it in.
    Each repository needs a local clone at `repositoryPath`. For PRs, install `gh` and authenticate
