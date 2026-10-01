@@ -12,7 +12,7 @@ import { join } from "node:path";
 import type { ActivityReporter } from "../agent/activity.js";
 import { type AgentRunner, REQUEST_SYSTEM_APPEND } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
-import type { CommandResult, GitWorkspace } from "../git/workspace.js";
+import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
 import type { IssueSummary, LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
@@ -84,7 +84,15 @@ export function prBody(epic: Epic): string {
 	return lines.join("\n");
 }
 
+/** "Merge request" for GitLab URLs, "Pull request" otherwise. */
+export function prLabel(url: string): string {
+	return /\/-\/merge_requests\//.test(url) ? "Merge request" : "Pull request";
+}
+
 export class EpicEngine {
+	/** Sessions that already reported why a PR/MR can't be opened (don't repeat it every story). */
+	private readonly forgeProblems = new Set<string>();
+
 	constructor(private readonly deps: EngineDeps) {}
 
 	async run(ctx: EngineRun): Promise<SessionStatus> {
@@ -135,7 +143,7 @@ export class EpicEngine {
 		if (rootBlockers.length > 0) {
 			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
 			if (requestOutput) await reporter.thought(requestOutput);
-			await this.adoptPullRequest(ctx, worktree);
+			await this.adoptPullRequest(ctx, repo, worktree);
 			return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is still blocked`);
 		}
 
@@ -235,8 +243,8 @@ export class EpicEngine {
 			await reporter.response("Stopped.");
 			return "stopped";
 		}
-		await this.adoptPullRequest(ctx, worktree);
-		const link = record.prUrl && output && !output.includes(record.prUrl) ? `\n\nPull request: ${record.prUrl}` : "";
+		await this.adoptPullRequest(ctx, repo, worktree);
+		const link = record.prUrl && output && !output.includes(record.prUrl) ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : "";
 		await reporter.response(`${output ?? "Done."}${link}`);
 		return "completed";
 	}
@@ -250,15 +258,23 @@ export class EpicEngine {
 		if (requests.length === 0) return undefined;
 
 		await reporter.thought(requests.length === 1 ? "Working on your request." : `Working on your ${requests.length} requests.`);
+		const branch = record.branch ?? epic.branchName;
+		const forge = await this.forgeFor(worktree, repo);
 		const prompt = buildRequestPrompt({
 			epic,
 			requests,
-			branch: record.branch ?? epic.branchName,
+			branch,
 			baseBranch: repo.baseBranch,
 			remoteUrl: await git.remoteUrl(worktree),
 			prUrl: record.prUrl,
 			progressFile,
 			qualityGates: [...epic.qualityGates, ...(repo.verifyCommands ?? [])],
+			forgeInstructions: forge?.agentInstructions({
+				branch,
+				baseBranch: repo.baseBranch,
+				title: `${epic.identifier}: ${epic.title.replace(/"/g, "'")}`,
+			}),
+			prTerm: forge?.term,
 		});
 		const runOnce = (resume?: string) =>
 			runner.run({
@@ -291,16 +307,22 @@ export class EpicEngine {
 		return result.output.trim() || "Done.";
 	}
 
-	/** Pick up a PR the agent opened itself (e.g. via a direct request) so the session links it. Never opens one. */
-	private async adoptPullRequest(ctx: EngineRun, worktree: string): Promise<void> {
+	/** GitHub (`gh`) or GitLab (`glab`) for this repo's `origin`; undefined without a remote. */
+	private forgeFor(worktree: string, repo: RepositoryConfig): Promise<Forge | undefined> {
+		return this.deps.git.forge(worktree, { forge: repo.forge, gitlabHost: repo.gitlabHost, gitlabHosts: this.deps.config.gitlabHosts });
+	}
+
+	/** Pick up a PR/MR the agent opened itself (e.g. via a direct request) so the session links it. Never opens one. */
+	private async adoptPullRequest(ctx: EngineRun, repo: RepositoryConfig, worktree: string): Promise<void> {
 		const { record, reporter } = ctx;
-		if (record.prUrl || !record.branch || !(await this.deps.git.remoteUrl(worktree))) return;
-		const pr = await this.deps.git.findPullRequest(worktree, record.branch).catch(() => undefined);
+		if (record.prUrl || !record.branch) return;
+		const forge = await this.forgeFor(worktree, repo);
+		const pr = forge ? await forge.find(worktree, record.branch).catch(() => undefined) : undefined;
 		if (!pr) return;
 		record.prUrl = pr.url;
 		record.prNumber = pr.number;
 		await ctx.persist();
-		await reporter.externalUrl("Pull request", pr.url);
+		await reporter.externalUrl(prLabel(record.prUrl), pr.url);
 	}
 
 	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig): string {
@@ -465,26 +487,37 @@ export class EpicEngine {
 	}
 
 	private async syncPullRequest(ctx: EngineRun, epic: Epic, repo: RepositoryConfig, worktree: string, ready: boolean) {
-		const { config, git } = this.deps;
+		const { config } = this.deps;
 		const { record, reporter } = ctx;
 		if (!config.ralph.createPullRequest || !record.branch) return;
-		if (!(await git.remoteUrl(worktree))) return; // nothing to open a PR against yet
+		const forge = await this.forgeFor(worktree, repo);
+		if (!forge) return; // no remote to open a PR/MR against yet
 		const body = prBody(epic);
 		if (!record.prUrl) {
-			const pr = await git.ensurePullRequest(worktree, {
-				branch: record.branch,
-				baseBranch: repo.baseBranch,
-				title: `${epic.identifier}: ${epic.title}`,
-				body,
-			});
-			if (!pr) return;
+			// Say why there is no PR/MR instead of silently skipping it (once per run).
+			if (!this.forgeProblems.has(record.sessionId)) {
+				const problem = await forge.preflight(worktree);
+				if (problem) {
+					this.forgeProblems.add(record.sessionId);
+					await reporter.thought(`Commits are pushed to \`${record.branch}\`, but I can't open a ${forge.term}: ${problem}`);
+					return;
+				}
+			} else return;
+			let pr: { url: string; number?: number };
+			try {
+				pr = await forge.ensure(worktree, { branch: record.branch, baseBranch: repo.baseBranch, title: `${epic.identifier}: ${epic.title}`, body });
+			} catch (err) {
+				this.forgeProblems.add(record.sessionId);
+				await reporter.error(`Couldn't open a ${forge.term} with \`${forge.cli}\`: ${tail(String(err instanceof Error ? err.message : err), 1500)}`);
+				return;
+			}
 			record.prUrl = pr.url;
 			record.prNumber = pr.number;
 			await ctx.persist();
-			await reporter.externalUrl("Pull request", pr.url);
-			await reporter.thought(`Opened draft PR: ${pr.url}`);
+			await reporter.externalUrl(prLabel(pr.url), pr.url);
+			await reporter.thought(`Opened a draft ${forge.term}: ${pr.url}`);
 		}
-		await git.updatePullRequest(worktree, { url: record.prUrl, number: record.prNumber }, { body, ready });
+		await forge.update(worktree, { url: record.prUrl, number: record.prNumber }, { body, ready });
 	}
 
 	private async finish(args: {
@@ -531,19 +564,19 @@ export class EpicEngine {
 					.catch((e: unknown) => log.warn(String(e)));
 			}
 			if (requestOutput) {
-				const link = record.prUrl && !requestOutput.includes(record.prUrl) ? `\n\nPull request: ${record.prUrl}` : "";
+				const link = record.prUrl && !requestOutput.includes(record.prUrl) ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : "";
 				await reporter.response(`${requestOutput}${link}`);
 				return "completed";
 			}
 			const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
 			await reporter.response(
-				`Finished ${what} on \`${record.branch}\`${cost}.${record.prUrl ? `\n\nPull request: ${record.prUrl}` : ""}`,
+				`Finished ${what} on \`${record.branch}\`${cost}.${record.prUrl ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : ""}`,
 			);
 			return "completed";
 		}
 
 		if (requestOutput) await reporter.thought(requestOutput);
-		await this.adoptPullRequest(ctx, worktree);
+		await this.adoptPullRequest(ctx, repo, worktree);
 
 		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
 		const isOpen = (d: string) => {

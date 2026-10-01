@@ -195,6 +195,10 @@ export interface RequestPromptContext {
 	prUrl?: string;
 	progressFile: string;
 	qualityGates: string[];
+	/** Forge-specific PR/MR instructions (see Forge.agentInstructions); omitted without a remote. */
+	forgeInstructions?: string;
+	/** "pull request" or "merge request". */
+	prTerm?: string;
 }
 
 /**
@@ -215,7 +219,7 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		formatStoryList(epic),
 		"",
 		`- Git remote \`origin\`: ${ctx.remoteUrl ? `\`${ctx.remoteUrl}\`` : "none configured"}`,
-		`- Pull request: ${ctx.prUrl ?? "none opened yet"}`,
+		`- ${capitalize(ctx.prTerm ?? "pull request")}: ${ctx.prUrl ?? "none opened yet"}`,
 		`- Progress log (learnings from earlier sessions): \`${ctx.progressFile}\``,
 		...(ctx.qualityGates.length ? [`- Quality gates: ${ctx.qualityGates.map((g) => `\`${g}\``).join(", ")}`] : []),
 		...(prd ? ["", "<prd-document>", prd.length > 6000 ? `${prd.slice(0, 6000)}\n…` : prd, "</prd-document>"] : []),
@@ -225,10 +229,14 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		"## How to handle it",
 		"- This is a direct request, not a story. Do what it asks, and nothing beyond it.",
 		`- You may commit, and push \`${ctx.branch}\` to \`origin\` (\`git push -u origin ${ctx.branch}\`), when the request calls for it. Never force-push and never push to \`${ctx.baseBranch}\`.`,
-		`- For a pull request: check \`gh pr view ${ctx.branch}\` first; if none exists, \`gh pr create --base ${ctx.baseBranch} --head ${ctx.branch} --title "${epic.identifier}: ${epic.title.replace(/"/g, "'")}"\` with a body summarising the stories. Use \`--draft\` unless all stories are complete.`,
+		...(ctx.forgeInstructions ? [`- ${ctx.forgeInstructions}`] : ["- There is no `origin` remote yet, so pushing or opening a pull/merge request isn't possible until one is added."]),
 		"- If you change code, run the quality gates and commit with a clear message.",
 		"- If the request is ambiguous or can't be done (e.g. missing credentials), say exactly what's missing instead of guessing.",
-		"- Finish with a short summary for the Linear thread of what you did, including any PR URL.",
+		`- Finish with a short summary for the Linear thread of what you did, including any ${ctx.prTerm ?? "pull request"} URL.`,
 	];
 	return lines.join("\n").trim();
+}
+
+function capitalize(s: string): string {
+	return s.charAt(0).toUpperCase() + s.slice(1);
 }

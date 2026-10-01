@@ -1,12 +1,15 @@
 /**
- * Git worktree per epic branch, plus commit/push/PR helpers. PRs are opened with the
- * GitHub CLI (`gh`) when available, like Cyrus' verify-and-ship flow.
+ * Git worktree per epic branch, plus commit/push helpers. PR/MR operations live in forge.ts
+ * (`gh` for GitHub, `glab` for GitLab), like Cyrus' verify-and-ship flow.
  */
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { type Forge, type ForgeKind, createForge, detectForgeKind } from "./forge.js";
+
+export type { Forge, ForgeKind, PullRequestInfo } from "./forge.js";
 
 const execFileP = promisify(execFile);
 
@@ -16,16 +19,28 @@ export interface CommandResult {
 	stderr: string;
 }
 
-export async function run(cmd: string, args: string[], cwd: string, timeoutMs = 10 * 60_000): Promise<CommandResult> {
+export async function run(
+	cmd: string,
+	args: string[],
+	cwd: string,
+	timeoutMs = 10 * 60_000,
+	env?: Record<string, string>,
+): Promise<CommandResult> {
 	try {
-		const { stdout, stderr } = await execFileP(cmd, args, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+		const { stdout, stderr } = await execFileP(cmd, args, {
+			cwd,
+			timeout: timeoutMs,
+			maxBuffer: 32 * 1024 * 1024,
+			...(env && { env: { ...process.env, ...env } }),
+		});
 		return { code: 0, stdout, stderr };
 	} catch (err) {
 		const e = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
 		return {
 			code: typeof e.code === "number" ? e.code : 1,
 			stdout: e.stdout ?? "",
-			stderr: e.stderr ?? e.message ?? String(err),
+			// A missing binary (ENOENT) has empty stderr; keep the message so callers can tell.
+			stderr: e.stderr || e.message || String(err),
 		};
 	}
 }
@@ -64,10 +79,6 @@ export interface PreparedWorkspace {
 	created: boolean;
 }
 
-export interface PullRequestInfo {
-	url: string;
-	number?: number;
-}
 
 export interface GitWorkspace {
 	prepare(opts: { repositoryPath: string; workspaceBaseDir: string; branch: string; baseBranch: string }): Promise<PreparedWorkspace>;
@@ -80,10 +91,8 @@ export interface GitWorkspace {
 	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
 	stashAll(cwd: string, message: string): Promise<boolean>;
 	push(cwd: string, branch: string): Promise<void>;
-	/** An existing PR for the branch, if any (never creates one). */
-	findPullRequest(cwd: string, branch: string): Promise<PullRequestInfo | undefined>;
-	ensurePullRequest(cwd: string, opts: { branch: string; baseBranch: string; title: string; body: string }): Promise<PullRequestInfo | undefined>;
-	updatePullRequest(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void>;
+	/** The PR/MR host for this worktree's `origin` (undefined when there is no remote). */
+	forge(cwd: string, opts?: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string }): Promise<Forge | undefined>;
 }
 
 export class CliGitWorkspace implements GitWorkspace {
@@ -155,31 +164,9 @@ export class CliGitWorkspace implements GitWorkspace {
 		await gitOrThrow(["push", "-u", "origin", branch], cwd);
 	}
 
-	async findPullRequest(cwd: string, branch: string): Promise<PullRequestInfo | undefined> {
-		const existing = await run("gh", ["pr", "view", branch, "--json", "url,number,state"], cwd);
-		if (existing.code !== 0) return undefined;
-		const data = JSON.parse(existing.stdout) as { url: string; number: number; state?: string };
-		return data.state === "CLOSED" ? undefined : { url: data.url, number: data.number };
-	}
-
-	async ensurePullRequest(
-		cwd: string,
-		opts: { branch: string; baseBranch: string; title: string; body: string },
-	): Promise<PullRequestInfo | undefined> {
-		const existing = await this.findPullRequest(cwd, opts.branch);
-		if (existing) return existing;
-		const created = await run(
-			"gh",
-			["pr", "create", "--draft", "--base", opts.baseBranch, "--head", opts.branch, "--title", opts.title, "--body", opts.body],
-			cwd,
-		);
-		if (created.code !== 0) return undefined;
-		const url = created.stdout.trim().split("\n").pop() ?? "";
-		return url ? { url, number: Number(/\/pull\/(\d+)/.exec(url)?.[1]) || undefined } : undefined;
-	}
-
-	async updatePullRequest(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void> {
-		if (opts.body !== undefined) await run("gh", ["pr", "edit", pr.url, "--body", opts.body], cwd);
-		if (opts.ready) await run("gh", ["pr", "ready", pr.url], cwd);
+	async forge(cwd: string, opts: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string } = {}): Promise<Forge | undefined> {
+		const remote = await this.remoteUrl(cwd);
+		if (!remote) return undefined;
+		return createForge(detectForgeKind(remote, opts), { gitlabHost: opts.gitlabHost });
 	}
 }

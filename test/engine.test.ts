@@ -2,12 +2,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentRunner, RunRequest, RunResult } from "../src/agent/runner.js";
 import { parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
 import { SessionStore } from "../src/engine/store.js";
-import { CliGitWorkspace, type PullRequestInfo, runShell } from "../src/git/workspace.js";
+import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
 import { FakeLinear } from "./fakes.js";
@@ -35,14 +35,29 @@ class TestGit extends CliGitWorkspace {
 	prs: string[] = [];
 	/** Simulates a PR opened outside the orchestrator (e.g. by the agent via `gh`). */
 	externalPr = false;
-	override async findPullRequest(): Promise<PullRequestInfo | undefined> {
-		return this.prs.length || this.externalPr ? { url: "https://github.com/acme/app/pull/7", number: 7 } : undefined;
+	/** Simulates the forge CLI being unusable (e.g. `glab` not logged in). */
+	preflightProblem: string | undefined;
+	forgeOpts: Array<Record<string, unknown> | undefined> = [];
+	override async forge(cwd: string, opts?: Parameters<CliGitWorkspace["forge"]>[1]): Promise<Forge | undefined> {
+		this.forgeOpts.push(opts);
+		const real = await super.forge(cwd, opts);
+		if (!real) return undefined;
+		const url = real.kind === "gitlab" ? "https://git.example.com/acme/app/-/merge_requests/7" : "https://github.com/acme/app/pull/7";
+		const found = () => (this.prs.length || this.externalPr ? { url, number: 7 } : undefined);
+		return {
+			kind: real.kind,
+			cli: real.cli,
+			term: real.term,
+			agentInstructions: (o) => real.agentInstructions(o),
+			preflight: async () => this.preflightProblem,
+			find: async () => found(),
+			ensure: async () => {
+				this.prs.push("created");
+				return { url, number: 7 };
+			},
+			update: async () => {},
+		};
 	}
-	override async ensurePullRequest(): Promise<PullRequestInfo> {
-		this.prs.push("created");
-		return { url: "https://github.com/acme/app/pull/7", number: 7 };
-	}
-	override async updatePullRequest(): Promise<void> {}
 }
 
 /** Implements a story by writing `<storyId>.txt`; can be told to fail specific attempts. */
@@ -548,3 +563,71 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		expect(t.linear.bodies("response").at(-1)).toContain("Nothing to do");
 	});
 });
+
+describe("GitHub vs GitLab forges", () => {
+	// Fetching from the fake GitLab host must fail fast rather than try the network.
+	beforeEach(() => {
+		process.env.GIT_SSH_COMMAND = "false";
+	});
+	afterEach(() => {
+		delete process.env.GIT_SSH_COMMAND;
+	});
+	const isRequest = (c: RunRequest) => c.prompt.includes("## Request from your team");
+
+	function gitlabSetup(remote = "git@git.example.com:acme/app.git") {
+		const t = setup();
+		t.config.gitlabHosts = ["git.example.com"];
+		// The fetch URL (what forge detection reads) is the GitLab one; pushes go to the local bare repo.
+		sh(t.repo, "remote", "set-url", "origin", remote);
+		sh(t.repo, "remote", "set-url", "--push", "origin", t.origin);
+		return t;
+	}
+
+	it("opens a merge request (not a PR) for a self-hosted GitLab remote", async () => {
+		const t = gitlabSetup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "f-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("f-1")?.prUrl).toBe("https://git.example.com/acme/app/-/merge_requests/7");
+		expect(t.linear.urls).toEqual([{ label: "Merge request", url: "https://git.example.com/acme/app/-/merge_requests/7" }]);
+		expect(t.linear.bodies("thought")).toContain("Opened a draft merge request: https://git.example.com/acme/app/-/merge_requests/7");
+		expect(t.linear.bodies("response").at(-1)).toContain("Merge request: https://git.example.com/acme/app/-/merge_requests/7");
+		expect(t.git.forgeOpts.at(-1)).toMatchObject({ gitlabHosts: ["git.example.com"] });
+	});
+
+	it("tells a GitLab request agent to use glab", async () => {
+		const t = gitlabSetup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "f-2", issueId: epic.id, commentBody: "@cyralph open an MR" });
+		await t.manager.idle();
+		const req = t.runner.calls.find(isRequest);
+		expect(req?.prompt).toContain("glab mr create --source-branch eng-1-task-priority --target-branch main");
+		expect(req?.prompt).toContain("- Merge request: none opened yet");
+		expect(req?.prompt).not.toContain("gh pr create");
+	});
+
+	it("says why no PR/MR was opened when the CLI isn't usable, once per run", async () => {
+		const t = gitlabSetup();
+		t.git.preflightProblem = "`glab` is not logged in (run `glab auth login --hostname git.example.com`).";
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "f-3", issueId: epic.id });
+		await t.manager.idle();
+		const notes = t.linear.bodies("thought").filter((b) => b.includes("can't open a merge request"));
+		expect(notes).toHaveLength(1);
+		expect(notes[0]).toContain("glab auth login --hostname git.example.com");
+		expect(t.store.get("f-3")?.prUrl).toBeUndefined();
+		expect(t.store.get("f-3")?.status).toBe("completed");
+	});
+
+	it("passes per-repo forge overrides through", async () => {
+		const t = setup();
+		t.config.repositories[0]!.forge = "gitlab";
+		t.config.repositories[0]!.gitlabHost = "https://git.internal:8443";
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "f-4", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.git.forgeOpts.at(-1)).toMatchObject({ forge: "gitlab", gitlabHost: "https://git.internal:8443" });
+		expect(t.store.get("f-4")?.prUrl).toContain("/-/merge_requests/");
+	});
+});
+

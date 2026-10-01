@@ -2,6 +2,9 @@
   "port": 3457,
   "model": "opus",
   "maxConcurrentSessions": 2,
+  "gitlabHosts": [
+    "git.example.com"
+  ],
   "linear": {
     "clientId": "<linear oauth app client id>",
     "clientSecret": "<linear oauth app client secret>",
@@ -22,9 +25,28 @@
       "name": "acme/app",
       "repositoryPath": "/home/me/code/app",
       "baseBranch": "main",
-      "teamKeys": ["ENG"],
+      "teamKeys": [
+        "ENG"
+      ],
       "setupCommand": "pnpm install",
-      "verifyCommands": ["pnpm typecheck", "pnpm lint", "pnpm test"]
+      "verifyCommands": [
+        "pnpm typecheck",
+        "pnpm lint",
+        "pnpm test"
+      ]
+    },
+    {
+      "id": "api",
+      "name": "platform/api",
+      "repositoryPath": "/home/me/code/api",
+      "baseBranch": "main",
+      "teamKeys": [
+        "PLAT"
+      ],
+      "forge": "gitlab",
+      "verifyCommands": [
+        "make test"
+      ]
     }
   ]
 }

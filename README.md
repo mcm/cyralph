@@ -65,7 +65,7 @@ These follow Cyrus:
 - **An @mention** does only what the comment asks, with the epic as context: its stories and
   their status, the branch, `origin`, the PR and the PRD. It doesn't start the story loop, change
   Linear issue states or create story issues, and blockers don't apply. That one agent session may
-  commit, push the epic branch and use `gh`, and its final message becomes the response. For
+  commit, push the epic branch and use the forge CLI (`gh` or `glab`), and its final message becomes the response. For
   example:
   > @cyralph there is now a git remote, git@github.com:me/app.git, can you push and create a PR?
 
@@ -129,7 +129,40 @@ What cyralph adds on top:
   via `runPrdQualityGates`) run after the agent claims completion. A failing command fails the
   attempt, and its output goes into the retry.
 - **Git is also owned by the orchestrator.** The agent is told not to commit. cyralph commits once
-  per story, pushes, and opens or updates the PR with `gh`.
+  per story, pushes, and opens or updates the PR/MR with `gh` or `glab` (see *GitHub and GitLab*).
+
+## GitHub and GitLab
+
+Git itself (worktrees, commits, pushes) works with any host. Pull and merge requests are opened per
+repository with the matching CLI:
+
+| `origin` host | Forge | CLI | Opens |
+| --- | --- | --- | --- |
+| `github.com` (or anything not GitLab) | GitHub | `gh` | draft pull request |
+| `gitlab.com`, a host in `gitlabHosts`, or a host with `gitlab` in its name (e.g. `gitlab.corp.com`) | GitLab | `glab` | draft merge request |
+
+For a **self-hosted GitLab** whose hostname doesn't contain "gitlab", list it in the top-level
+`gitlabHosts`, or set `"forge": "gitlab"` on the repository:
+
+```json
+{
+  "gitlabHosts": ["git.example.com"],
+  "repositories": [
+    { "id": "api", "name": "platform/api", "repositoryPath": "/srv/code/api", "baseBranch": "main" },
+    { "id": "web", "name": "platform/web", "repositoryPath": "/srv/code/web", "forge": "gitlab",
+      "gitlabHost": "https://git.example.com" }
+  ]
+}
+```
+
+`gitlabHost` (it sets `GITLAB_HOST` for `glab`) is only needed when `glab` can't work out the
+instance from the remote, for example an SSH alias from `~/.ssh/config` or a custom SSH port.
+
+On the cyralph host, log the CLI in once: `glab auth login --hostname git.example.com` (or
+`gh auth login`). If the CLI is missing or not logged in, cyralph says so in the session
+(*"Commits are pushed to `…`, but I can't open a merge request: …"*) and doesn't skip the step
+silently. Sessions link the result as **Merge request** or **Pull request**, and the agent in a
+request session is told which CLI to use.
 
 ## Setup
 
@@ -140,7 +173,8 @@ What cyralph adds on top:
      their blockers have resolved.
    - Note the client ID, client secret and webhook signing secret.
 2. **Configure.** Copy `examples/config.example.json` to `~/.cyralph/config.json` and fill it in.
-   Each repository needs a local clone at `repositoryPath`. For PRs, install `gh` and authenticate
+   Each repository needs a local clone at `repositoryPath`. For PRs/MRs, install `gh` (GitHub) or
+   `glab` (GitLab) and authenticate
    it.
 3. **Install and authorize.**
    ```bash
@@ -194,4 +228,4 @@ Layout:
 - `src/engine`: the Ralph loop (`epic-engine.ts`), session routing, concurrency and stop
   (`session-manager.ts`), state (`store.ts`) and routing.
 - `src/agent`: the Claude Agent SDK runner and the Linear activity reporter.
-- `src/git`: the worktree per epic branch, plus commit, stash, push and `gh` PRs.
+- `src/git`: the worktree per epic branch, plus commit, stash and push (`workspace.ts`), and GitHub/GitLab PRs and MRs (`forge.ts`).

@@ -28,6 +28,16 @@ export const RepositoryConfigSchema = z.object({
 	verifyCommands: z.array(z.string()).optional(),
 	/** Also execute the PRD's own Quality Gates commands as verifyCommands. */
 	runPrdQualityGates: z.boolean().default(false),
+	/**
+	 * Where PRs/MRs live. Auto-detected from the `origin` URL: github.com = GitHub; gitlab.com, any
+	 * `gitlabHosts` entry, or a host containing "gitlab" = GitLab. Set this for other self-hosted hosts.
+	 */
+	forge: z.enum(["github", "gitlab"]).optional(),
+	/**
+	 * Self-hosted GitLab URL for `glab` (sets GITLAB_HOST), e.g. "https://git.example.com". Only needed
+	 * when glab can't infer it from the remote (SSH aliases, custom SSH ports).
+	 */
+	gitlabHost: z.string().optional(),
 	/** Shell command run once in a fresh worktree (e.g. "pnpm install"). */
 	setupCommand: z.string().optional(),
 	model: z.string().optional(),
@@ -63,7 +73,7 @@ export const RalphConfigSchema = z.object({
 	commitPerStory: z.boolean().default(true),
 	/** Push after each completed story (and open a draft PR after the first push). */
 	pushPerStory: z.boolean().default(true),
-	/** Open a PR with the GitHub CLI (`gh`). */
+	/** Open a PR/MR with the forge CLI (`gh` for GitHub, `glab` for GitLab). */
 	createPullRequest: z.boolean().default(true),
 	/** Mark the PR ready for review once every story is complete. */
 	markPrReadyWhenComplete: z.boolean().default(true),
@@ -82,6 +92,8 @@ export const ConfigSchema = z.object({
 	model: z.string().default("opus"),
 	fallbackModel: z.string().optional(),
 	maxConcurrentSessions: z.number().int().positive().default(2),
+	/** Hostnames of self-hosted GitLab instances (e.g. ["git.example.com"]), so their remotes use `glab`. */
+	gitlabHosts: z.array(z.string()).default([]),
 	/**
 	 * How often to re-check blockers of parked sessions, as a fallback for missed Issue webhooks.
 	 * 0 disables polling (startup reconciliation still runs).

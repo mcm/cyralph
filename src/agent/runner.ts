@@ -111,9 +111,9 @@ export const RALPH_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer wo
 
 /** System prompt addition for direct requests from the Linear thread (Cyrus-style @mentions). */
 export const REQUEST_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer responding to a request in a Linear agent session about a PRD epic.
-- Do what the request asks. You may use git (commit, push) and the GitHub CLI (gh) when the request calls for it.
+- Do what the request asks. You may use git (commit, push) and the repository's forge CLI (gh for GitHub, glab for GitLab, as named in the prompt) when the request calls for it.
 - Only push the epic branch you are on. Never force-push, rewrite published history, or push to the base branch.
-- Your final message is posted to the Linear thread: summarise what you did, with links (e.g. the PR URL).`;
+- Your final message is posted to the Linear thread: summarise what you did, with links (e.g. the PR/MR URL).`;
 
 function textOfToolResult(content: unknown): string {
 	if (typeof content === "string") return content;
