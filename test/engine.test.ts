@@ -11,6 +11,7 @@ import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
 import type { AttachmentFetcher } from "../src/linear/attachments.js";
+import type { GitHubReview, GitHubReviewClient, ReviewComment, ReviewSubmitted } from "../src/github/reviews.js";
 import { FakeLinear } from "./fakes.js";
 
 const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -91,12 +92,17 @@ class ScriptedRunner implements AgentRunner {
 	}
 }
 
-function setup(overrides: Record<string, unknown> = {}, repoOpts: { remote?: boolean } = {}) {
+function setup(
+	overrides: Record<string, unknown> = {},
+	repoOpts: { remote?: boolean } = {},
+	extra: { repo?: Record<string, unknown>; config?: Record<string, unknown>; github?: GitHubReviewClient } = {},
+) {
 	const { root, repo, origin } = makeRepo(repoOpts);
 	const config = parseConfig(
 		{
-			repositories: [{ id: "app", name: "app", repositoryPath: repo, baseBranch: "main" }],
+			repositories: [{ id: "app", name: "app", repositoryPath: repo, baseBranch: "main", ...extra.repo }],
 			ralph: { maxAttemptsPerStory: 2, ...overrides },
+			...extra.config,
 		},
 		join(root, "config.json"),
 	);
@@ -105,7 +111,7 @@ function setup(overrides: Record<string, unknown> = {}, repoOpts: { remote?: boo
 	const git = new TestGit();
 	const store = new SessionStore(join(root, "sessions.json"));
 	const fetcher = new FakeFetcher();
-	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger, attachments: fetcher }, store);
+	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger, attachments: fetcher, github: extra.github }, store);
 	return { root, repo, origin, config, linear, runner, git, store, manager, fetcher };
 }
 
@@ -853,5 +859,111 @@ describe("restarts (self-update drain and resume)", () => {
 		expect(t.store.get("r-1")?.status).toBe("completed");
 		expect(t.store.get("r-2")?.status).toBe("running");
 		expect(t.linear.activities.some((a) => a.sessionId === "r-1" && "body" in a.content && a.content.body.includes("cyralph restarted"))).toBe(true);
+	});
+});
+
+class FakeReviews implements GitHubReviewClient {
+	open = true;
+	headSha = "head1";
+	list: GitHubReview[] = [];
+	comments = new Map<number, ReviewComment[]>();
+	async pullRequest() {
+		return { open: this.open, headRef: "eng-1-task-priority", headSha: this.headSha, url: PR_URL };
+	}
+	async reviews() {
+		return this.list;
+	}
+	async reviewComments(_repo: string, _n: number, id: number) {
+		return this.comments.get(id) ?? [];
+	}
+}
+
+const PR_URL = "https://github.com/acme/app/pull/7";
+const CUBIC = "cubic-dev-ai[bot]";
+
+function cubicReview(id: number, opts: Partial<GitHubReview> = {}): GitHubReview {
+	return { id, author: CUBIC, state: "commented", body: "cubic found 1 issue", commitId: "head1", submittedAt: `2026-10-03T10:00:0${id % 10}Z`, ...opts };
+}
+
+function reviewEvent(review: GitHubReview, opts: Partial<ReviewSubmitted> = {}): ReviewSubmitted {
+	return { kind: "review_submitted", repo: "acme/app", prNumber: 7, prUrl: PR_URL, prOpen: true, headRef: "eng-1-task-priority", headSha: "head1", review, ...opts };
+}
+
+/** A finished epic with PR #7 open, ready to receive reviews. */
+async function reviewedEpic(extra: { repo?: Record<string, unknown>; config?: Record<string, unknown> } = {}) {
+	const github = new FakeReviews();
+	const t = setup({}, {}, { repo: { githubUrl: "https://github.com/acme/app", ...extra.repo }, config: extra.config, github });
+	const { epic } = ralphEpic(t.linear);
+	await t.manager.handle({ kind: "created", sessionId: "rv-1", issueId: epic.id });
+	await t.manager.idle();
+	expect(t.store.get("rv-1")?.prUrl).toBe(PR_URL);
+	const before = t.runner.calls.length;
+	const requestPrompts = () => t.runner.calls.slice(before).map((c) => c.prompt);
+	return { ...t, github, requestPrompts };
+}
+
+describe("automated PR reviews", () => {
+	it("works through a bot review's inline comments on the epic branch", async () => {
+		const t = await reviewedEpic();
+		t.github.comments.set(11, [{ path: "src/a.ts", line: 3, body: "Possible null dereference" }]);
+		await t.manager.handleReview(reviewEvent(cubicReview(11)));
+		await t.manager.idle();
+		const prompts = t.requestPrompts();
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0]).toContain("cubic-dev-ai[bot] submitted an automated review of pull request #7");
+		expect(prompts[0]).toContain("`src/a.ts:3`");
+		expect(prompts[0]).toContain("Possible null dereference");
+		expect(prompts[0]).toContain("push `eng-1-task-priority`");
+		expect(t.linear.bodies("thought").some((b) => b.includes("reviewed the pull request with 1 comment. Working through it."))).toBe(true);
+		expect(t.store.get("rv-1")?.reviewRounds).toBe(1);
+
+		// The same review again (a redelivery, or the poller) is not acted on twice.
+		await t.manager.handleReview(reviewEvent(cubicReview(11)));
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+	});
+
+	it("ignores other reviewers, other PRs, stale commits, and repositories that opted out", async () => {
+		const t = await reviewedEpic();
+		await t.manager.handleReview(reviewEvent(cubicReview(21, { author: "octocat" })));
+		await t.manager.handleReview(reviewEvent(cubicReview(22), { prUrl: "https://github.com/acme/app/pull/99", prNumber: 99, headRef: "someone-else" }));
+		await t.manager.handleReview(reviewEvent(cubicReview(23), { repo: "acme/other" }));
+		await t.manager.handleReview(reviewEvent(cubicReview(24, { commitId: "old" })));
+		await t.manager.handleReview(reviewEvent(cubicReview(25), { prOpen: false }));
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(0);
+		expect(t.store.get("rv-1")?.prClosed).toBe(true);
+
+		const off = await reviewedEpic({ repo: { respondToReviews: false } });
+		await off.manager.handleReview(reviewEvent(cubicReview(26)));
+		await off.manager.idle();
+		expect(off.requestPrompts()).toHaveLength(0);
+	});
+
+	it("stops after maxReviewRounds and says so in the session", async () => {
+		const t = await reviewedEpic({ config: { github: { maxReviewRounds: 1 } } });
+		await t.manager.handleReview(reviewEvent(cubicReview(31)));
+		await t.manager.idle();
+		t.github.headSha = "head2";
+		await t.manager.handleReview(reviewEvent(cubicReview(32, { commitId: "head2" }), { headSha: "head2" }));
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+		expect(t.linear.bodies("thought").some((b) => b.includes("leaving this one for a person"))).toBe(true);
+	});
+
+	it("polls open PRs for the newest bot review of the head commit when there is no webhook", async () => {
+		const t = await reviewedEpic();
+		t.github.list = [cubicReview(41, { author: "octocat" }), cubicReview(42, { commitId: "old" }), cubicReview(43), cubicReview(44)];
+		await t.manager.pollReviews();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+		expect(t.store.get("rv-1")?.handledReviewIds).toEqual(expect.arrayContaining([43, 44]));
+		await t.manager.pollReviews();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+
+		t.github.open = false;
+		await t.manager.pollReviews();
+		expect(t.store.get("rv-1")?.prClosed).toBe(true);
 	});
 });

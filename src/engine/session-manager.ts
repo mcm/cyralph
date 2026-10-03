@@ -6,6 +6,8 @@
  *                next story iteration; when paused it resets exhausted stories and resumes the loop.
  */
 import { ActivityReporter } from "../agent/activity.js";
+import type { RepositoryConfig } from "../config.js";
+import { type ReviewSubmitted, buildReviewRequest, githubRepoSlug, isReviewBot, parsePullRequestUrl } from "../github/reviews.js";
 import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
@@ -119,6 +121,145 @@ export class SessionManager {
 		}
 	}
 
+	/** A review was submitted on a GitHub pull request (from the webhook or from polling). */
+	handleReview(event: ReviewSubmitted): Promise<void> {
+		const p = this.onReview(event).finally(() => this.handling.delete(p));
+		this.handling.add(p);
+		return p;
+	}
+
+	private async onReview(event: ReviewSubmitted): Promise<void> {
+		const { config, log } = this.deps;
+		const { review } = event;
+		const where = `${event.repo}#${event.prNumber} review ${review.id}`;
+		if (!isReviewBot(review.author, config.github.reviewBots)) return log.debug(`ignoring ${where}: ${review.author} isn't a review bot`);
+		const repo = await this.repoForSlug(event.repo);
+		if (!repo) return log.debug(`ignoring ${where}: no configured repository`);
+		if (repo.respondToReviews === false) return log.debug(`ignoring ${where}: respondToReviews is off for ${repo.id}`);
+		const record = this.recordForPullRequest(repo.id, event);
+		if (!record) return log.debug(`ignoring ${where}: not a pull request cyralph opened`);
+		if (!event.prOpen) {
+			record.prClosed = true;
+			await this.store.save(record);
+			return;
+		}
+		if (record.status === "stopped") return log.info(`ignoring ${where}: session ${record.identifier ?? record.sessionId} was stopped`);
+		if (this.reviewHandled(event.prUrl, review.id)) return;
+		record.handledReviewIds = [...(record.handledReviewIds ?? []), review.id];
+		// A review of an older commit is out of date: cyralph has pushed since.
+		if (review.commitId && event.headSha && review.commitId !== event.headSha) {
+			await this.store.save(record);
+			return log.info(`skipping ${where}: it reviewed ${review.commitId.slice(0, 7)}, not the current head`);
+		}
+
+		const reporter = this.reporter(record.sessionId);
+		const rounds = record.reviewRounds ?? 0;
+		if (rounds >= config.github.maxReviewRounds) {
+			await this.store.save(record);
+			await reporter.thought(
+				`${review.author} reviewed ${event.prUrl} again. I've already worked through ${rounds} of its reviews on this pull request, so I'm leaving this one for a person.`,
+			);
+			return;
+		}
+		const comments = this.deps.github
+			? await this.deps.github.reviewComments(event.repo, event.prNumber, review.id).catch((err: unknown) => {
+					log.warn(`could not read comments of ${where}: ${String(err)}`);
+					return [];
+				})
+			: [];
+		if (comments.length === 0 && !review.body.trim()) {
+			await this.store.save(record);
+			return log.info(`skipping ${where}: nothing to act on`);
+		}
+		record.reviewRounds = rounds + 1;
+		const text = buildReviewRequest({ review, comments, prNumber: event.prNumber, prUrl: event.prUrl, branch: record.branch ?? event.headRef });
+		const what = `${review.author} reviewed the pull request${comments.length ? ` with ${comments.length} comment${comments.length === 1 ? "" : "s"}` : ""}`;
+		log.info(`acting on ${where} for ${record.identifier ?? record.sessionId}`);
+
+		// Delivered like a reply in the Linear thread: into the live agent, after the current step, or as a new run.
+		const inject = this.injectors.get(record.sessionId);
+		if (inject?.(text)) {
+			await this.store.save(record);
+			await reporter.thought(`${what}. Passed it to the agent that's working right now.`);
+			return;
+		}
+		record.pendingRequests.push(text);
+		await this.store.save(record);
+		if (this.active.has(record.sessionId)) {
+			await reporter.thought(`${what}. I'll work through it as soon as the current step finishes.`);
+			return;
+		}
+		await reporter.thought(`${what}. Working through it.`);
+		this.enqueue(record);
+	}
+
+	/**
+	 * Fallback when no GitHub webhook secret is configured: check the open pull requests cyralph opened
+	 * for the newest bot review of their current head commit.
+	 */
+	async pollReviews(): Promise<void> {
+		const { config, github, log } = this.deps;
+		if (!github) return;
+		const latest = new Map<string, SessionRecord>();
+		for (const r of this.store.all()) {
+			if (!r.prUrl || r.prClosed || !parsePullRequestUrl(r.prUrl)) continue;
+			const seen = latest.get(r.prUrl);
+			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
+		}
+		for (const [prUrl, record] of latest) {
+			const repo = config.repositories.find((x) => x.id === record.repoId);
+			if (!repo || repo.respondToReviews === false || record.status === "stopped") continue;
+			const pr = parsePullRequestUrl(prUrl);
+			if (!pr) continue;
+			try {
+				const state = await github.pullRequest(pr.repo, pr.number);
+				if (!state) continue;
+				if (!state.open) {
+					record.prClosed = true;
+					await this.store.save(record);
+					continue;
+				}
+				const fresh = (await github.reviews(pr.repo, pr.number))
+					.filter((rv) => isReviewBot(rv.author, config.github.reviewBots) && rv.commitId === state.headSha && !this.reviewHandled(prUrl, rv.id))
+					.sort((a, b) => (a.submittedAt ?? "").localeCompare(b.submittedAt ?? ""));
+				const review = fresh.pop();
+				if (!review) continue;
+				// Only the newest review of the head commit is acted on; earlier ones on it are superseded.
+				if (fresh.length) {
+					record.handledReviewIds = [...(record.handledReviewIds ?? []), ...fresh.map((rv) => rv.id)];
+					await this.store.save(record);
+				}
+				await this.handleReview({ kind: "review_submitted", repo: pr.repo, prNumber: pr.number, prUrl, prOpen: true, headRef: state.headRef, headSha: state.headSha, review });
+			} catch (err) {
+				log.warn(`review poll of ${prUrl} failed: ${String(err)}`);
+			}
+		}
+	}
+
+	private reviewHandled(prUrl: string, reviewId: number): boolean {
+		const url = prUrl.toLowerCase();
+		return this.store.all().some((r) => r.prUrl?.toLowerCase() === url && r.handledReviewIds?.includes(reviewId));
+	}
+
+	/** The configured repository a webhook's `owner/name` belongs to (its `githubUrl`, else its `origin` remote). */
+	private async repoForSlug(slug: string): Promise<RepositoryConfig | undefined> {
+		for (const repo of this.deps.config.repositories) {
+			if (repo.isActive === false || repo.forge === "gitlab") continue;
+			const remote = githubRepoSlug(repo.githubUrl) ?? githubRepoSlug(await this.deps.git.remoteUrl(repo.repositoryPath).catch(() => undefined));
+			if (remote === slug) return repo;
+		}
+		return undefined;
+	}
+
+	/** The newest session whose pull request (or, before it was recorded, branch) this is. */
+	private recordForPullRequest(repoId: string, event: ReviewSubmitted): SessionRecord | undefined {
+		const url = event.prUrl.toLowerCase();
+		const mine = this.store.all().filter((r) => r.repoId === repoId);
+		const byUrl = mine.filter((r) => r.prUrl?.toLowerCase() === url);
+		const matches = byUrl.length ? byUrl : mine.filter((r) => !r.prUrl && r.branch === event.headRef);
+		return matches.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+	}
+
 	private async onCreated(event: Extract<AgentWebhookEvent, { kind: "created" }>) {
 		const reporter = this.reporter(event.sessionId);
 		void reporter.thought("Picked this up. Reading the epic and its stories…", true);
@@ -134,6 +275,8 @@ export class SessionManager {
 			record.baseBranchOverride ??= previous.baseBranchOverride;
 			record.prUrl ??= previous.prUrl;
 			record.prNumber ??= previous.prNumber;
+			record.handledReviewIds ??= previous.handledReviewIds;
+			record.reviewRounds ??= previous.reviewRounds;
 			record.guidance = [...previous.guidance];
 			record.completedKeys = [...previous.completedKeys];
 		}

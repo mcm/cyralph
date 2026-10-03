@@ -19,6 +19,7 @@ import { EpicEngine, type EngineDeps } from "./engine/epic-engine.js";
 import { SessionManager } from "./engine/session-manager.js";
 import { SessionStore, newRecord } from "./engine/store.js";
 import { CliGitWorkspace, run, runShell } from "./git/workspace.js";
+import { GhReviewClient } from "./github/reviews.js";
 import { loadEpic } from "./linear/epic-loader.js";
 import { ConsoleSessionGateway, type LinearGateway, SdkLinearGateway } from "./linear/gateway.js";
 import { LinearUploadFetcher } from "./linear/attachments.js";
@@ -74,6 +75,7 @@ function deps(config: Config, linear: LinearGateway): EngineDeps {
 		log,
 		// Read lazily: the token is refreshed in place every 12h.
 		attachments: new LinearUploadFetcher(() => config.linear.accessToken),
+		github: new GhReviewClient(),
 	};
 }
 
@@ -90,20 +92,29 @@ async function cmdStart(configPath: string, args: string[]) {
 	const store = new SessionStore(join(config.stateDir, "sessions.json"));
 	await store.load();
 	const manager = new SessionManager(deps(config, gateway), store);
-	const server = createWebhookServer({ webhookSecret: config.linear.webhookSecret, manager, log });
-	server.listen(config.port, () => log.info(`cyralph listening on :${config.port} (POST /linear-webhook)`));
+	const githubWebhookSecret = config.github.webhookSecret;
+	const server = createWebhookServer({ webhookSecret: config.linear.webhookSecret, githubWebhookSecret, manager, log });
+	server.listen(config.port, () =>
+		log.info(`cyralph listening on :${config.port} (POST /linear-webhook${githubWebhookSecret ? ", POST /github-webhook" : ""})`),
+	);
 	// Pick up what a restart (an update or a crash) interrupted.
 	void manager.resumeInterrupted().catch((e: unknown) => log.warn(`resuming interrupted sessions failed: ${String(e)}`));
 	// Wake sessions whose blockers resolved while we were down, then keep polling as a webhook fallback.
 	const reconcile = () => manager.reconcileParked().catch((e: unknown) => log.warn(`blocker reconcile failed: ${String(e)}`));
 	void reconcile();
 	const poll = config.blockerPollMinutes > 0 ? setInterval(reconcile, config.blockerPollMinutes * 60_000) : undefined;
+	// Without a GitHub webhook, poll cyralph's open pull requests for automated reviews.
+	const pollReviews = () => manager.pollReviews().catch((e: unknown) => log.warn(`review poll failed: ${String(e)}`));
+	const pollForReviews = !githubWebhookSecret && config.repositories.some((r) => r.respondToReviews !== false);
+	if (pollForReviews) void pollReviews();
+	const reviewPoll = pollForReviews ? setInterval(pollReviews, config.github.reviewPollMinutes * 60_000) : undefined;
 	// Linear OAuth access tokens expire; refresh twice a day.
 	const timer = setInterval(() => void refreshIfPossible(config, gateway), 12 * 60 * 60 * 1000);
 	let updateTimer: NodeJS.Timeout | undefined;
 	const stopTimers = () => {
 		clearInterval(timer);
 		if (poll) clearInterval(poll);
+		if (reviewPoll) clearInterval(reviewPoll);
 		clearInterval(updateTimer);
 	};
 	let stopping = false;

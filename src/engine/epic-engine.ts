@@ -13,6 +13,7 @@ import type { ActivityReporter } from "../agent/activity.js";
 import { type AgentRunner, requestSystemAppend } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
+import type { GitHubReviewClient } from "../github/reviews.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
 import {
 	type AttachmentEntry,
@@ -40,6 +41,8 @@ export interface EngineDeps {
 	log: Logger;
 	/** Downloads Linear uploads (screenshots etc.) for prompts; omitted = attachments aren't fetched. */
 	attachments?: AttachmentFetcher;
+	/** Reads automated PR reviews from GitHub; omitted = reviews are acted on without inline comments, and not polled. */
+	github?: GitHubReviewClient;
 }
 
 export interface EngineRun {
