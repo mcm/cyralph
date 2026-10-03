@@ -18,6 +18,7 @@
     "pushPerStory": true,
     "createPullRequest": true,
     "openPullRequestEarly": false,
+    "describePullRequest": true,
     "markPrReadyWhenComplete": true,
     "epicCompletedStateName": "In Review"
   },

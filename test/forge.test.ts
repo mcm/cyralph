@@ -63,6 +63,7 @@ esac`,
 		// Second ensure finds the existing MR instead of creating another.
 		expect(await forge.ensure(cwd, { branch: "b", baseBranch: "main", title: "ENG-1: T", body: "body" })).toEqual(mr);
 		await forge.update(cwd, mr, { body: "new body", ready: true });
+		await forge.update(cwd, mr, { title: "ENG-1: Better", body: "described" });
 
 		const calls = cli.calls();
 		expect(calls.every((c) => c.startsWith("GITLAB_HOST=https://git.example.com "))).toBe(true);
@@ -72,6 +73,7 @@ esac`,
 		]);
 		expect(calls).toContain("GITLAB_HOST=https://git.example.com mr update 12 --description new body --yes");
 		expect(calls).toContain("GITLAB_HOST=https://git.example.com mr update 12 --ready --yes");
+		expect(calls).toContain("GITLAB_HOST=https://git.example.com mr update 12 --title ENG-1: Better --description described --yes");
 	});
 
 	it("reports a failed create with glab's error output", async () => {
@@ -110,5 +112,7 @@ esac`,
 		const pr = await new GitHubForge().ensure(cli.dir, { branch: "b", baseBranch: "main", title: "t", body: "x" });
 		expect(pr).toEqual({ url: "https://github.com/acme/app/pull/9", number: 9 });
 		expect(cli.calls().at(-1)).toBe("GITLAB_HOST= pr create --draft --base main --head b --title t --body x");
+		await new GitHubForge().update(cli.dir, pr, { title: "ENG-1: Better", body: "described", ready: true });
+		expect(cli.calls().slice(-2)).toEqual(["GITLAB_HOST= pr edit https://github.com/acme/app/pull/9 --title ENG-1: Better --body described", "GITLAB_HOST= pr ready https://github.com/acme/app/pull/9"]);
 	});
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractCodebasePatterns, recentProgressEntries } from "../src/ralph/progress.js";
-import { COMPLETE_PATTERN, buildStoryPrompt, renderTemplate } from "../src/ralph/prompt.js";
+import { COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
 import { blockedStories, isEpicComplete, selectNextStory } from "../src/ralph/selection.js";
 import type { Epic, Story } from "../src/ralph/types.js";
 
@@ -96,6 +96,26 @@ describe("prompt", () => {
 	it("detects the completion signal", () => {
 		expect(COMPLETE_PATTERN.test("done\n<promise> COMPLETE </promise>")).toBe(true);
 		expect(COMPLETE_PATTERN.test("not yet")).toBe(false);
+	});
+});
+
+describe("PR/MR description", () => {
+	it("asks for the deliverable from the diff, with the issue as background only", () => {
+		const epic: Epic = { kind: "children", issueId: "e", identifier: "ENG-1", title: "Task Priority", description: "The PRD body", branchName: "b", qualityGates: [], stories: [story("US-001")] };
+		const p = buildPullRequestPrompt({ epic, branch: "b", baseBranch: "main", prTerm: "merge request", progressFile: "/tmp/p.md" });
+		expect(p).toContain("ready for a merge request into `main`");
+		expect(p).toContain("<issue-background>\nThe PRD body\n</issue-background>");
+		expect(p).toContain("git diff origin/main...HEAD");
+		expect(p).toContain("**Breaking changes**");
+		expect(p).toContain("**Decisions**");
+		expect(p).not.toContain("US-001");
+	});
+
+	it("parses the last title and description blocks", () => {
+		const out = 'Draft: <pr-title>x</pr-title>\nFinal:\n<pr-title>\n "Add task  priorities" \n</pr-title>\n<pr-description>\n## Summary\nAdds priorities.\n</pr-description>';
+		expect(parsePullRequestDescription(out)).toEqual({ title: "Add task priorities", body: "## Summary\nAdds priorities." });
+		expect(parsePullRequestDescription("<pr-title>t</pr-title>")).toBeUndefined();
+		expect(parsePullRequestDescription("<pr-title> </pr-title><pr-description>b</pr-description>")).toBeUndefined();
 	});
 });
 
