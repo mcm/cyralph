@@ -1,9 +1,9 @@
 /**
  * Core Ralph domain types.
  *
- * An Epic is a ralph-tui style PRD: a named body of work split into small,
- * independently completable user stories with priorities and dependencies.
- * In Linear an epic is a parent issue; each story is (usually) a child issue.
+ * An Epic is a named body of work split into small, independently completable user stories
+ * with priorities and dependencies. In Linear an epic is a parent issue and each story is a
+ * sub-issue; priority, order, state and dependencies come from Linear's own fields.
  */
 
 export type StoryStatus = "open" | "in_progress" | "completed" | "cancelled";
@@ -11,13 +11,15 @@ export type StoryStatus = "open" | "in_progress" | "completed" | "cancelled";
 export interface Story {
 	/** Stable key used for dependency resolution within an epic (Linear issue id, or story id for in-memory stories). */
 	key: string;
-	/** Ralph story id, e.g. "US-001". Falls back to the Linear identifier for non-ralph children. */
+	/** How the story is referred to: its Linear identifier (e.g. "ENG-12"), or the PRD story id for in-memory stories. */
 	storyId: string;
 	title: string;
 	description: string;
 	acceptanceCriteria: string[];
-	/** Ralph priority: lower = sooner. 1-based. */
+	/** Sort rank, lower = sooner: Linear priority 1 (Urgent) … 4 (Low), 5 for no priority; or the PRD priority. */
 	priority: number;
+	/** Tie-break after priority: the story's position among the epic's sub-issues in Linear (`subIssueSortOrder`). */
+	sortOrder?: number;
 	/** Keys of stories (or `external:<identifier>` markers) that must be completed first. */
 	dependsOn: string[];
 	status: StoryStatus;
@@ -33,7 +35,7 @@ export interface Story {
 }
 
 export type EpicKind =
-	/** Parent issue with child story issues (ralph-tui `convert --to linear` output). */
+	/** Parent issue with sub-issues as stories. */
 	| "children"
 	/** A PRD (markdown or prd.json) embedded in the issue description, not yet split into issues. */
 	| "prd"

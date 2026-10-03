@@ -13,13 +13,13 @@ epic is complete, so CI doesn't run for every half-finished story.
 ```
 Linear: delegate ENG-1 "Task Priority System" to @cyralph
   └─ webhook AgentSessionEvent.created ─► cyralph
-       ├─ load epic: children US-001..US-003 (+ "blocks" relations = dependencies)
+       ├─ load epic: sub-issues ENG-2..ENG-4 (+ "blocks" relations = dependencies)
        ├─ git worktree on the epic branch
        └─ loop:
-            next ready story (in-progress first → priority → story id; deps done)
+            next ready story (in-progress first → Linear priority → sub-issue order; deps done)
             → fresh Claude Agent SDK session with PRD + progress log + one story
             → final message ends with <promise>COMPLETE</promise>?  → run verifyCommands
-            → commit "feat(US-002): …" → push → child issue ► Done
+            → commit "feat(ENG-3): …" → push → sub-issue ► Done
             → otherwise retry with the failure fed back (max N attempts, then set aside)
        └─ all done → open PR (ready for review) → response in the session
           stuck    → elicitation in the session; your reply becomes guidance and resumes the loop
@@ -27,15 +27,29 @@ Linear: delegate ENG-1 "Task Priority System" to @cyralph
 
 ## What counts as a "ralph epic"
 
-cyralph accepts the layouts ralph-tui itself produces. They are interchangeable, so an epic created
-with `ralph-tui convert --to linear` runs as-is, and cyralph's own sub-issues also work with ralph-tui.
+An epic is a parent issue whose sub-issues are its stories. Everything cyralph needs about a story
+comes from Linear's own fields, not from title prefixes or body markup:
+
+| Story property | Linear field |
+| --- | --- |
+| Name in plans, prompts and commits | The issue identifier (`ENG-12`) and title, as-is |
+| Order | **Priority** (Urgent first, *No priority* last), then the sub-issues' manual order in the parent |
+| Dependencies | **Blocks** relations (to siblings, or to issues outside the epic) |
+| Done / in progress | Workflow state type (completed or canceled = done, started = in progress) |
+| Manual step for a person | A label from `ralph.manualLabels` |
+| Acceptance criteria | Checkboxes in the description (an `## Acceptance Criteria` section if present) |
 
 | Delegated issue | Behaviour |
 | --- | --- |
-| **Parent issue with child issues** (ralph-tui `convert --to linear` layout) | Each child is a story. The `## Ralph Metadata` body gives `Story ID` and `Ralph Priority`, and `## Acceptance Criteria` gives the checkboxes. Linear **blocks** relations are the dependencies. Child state is the `passes` flag. |
-| **Issue whose description contains a PRD**: ralph-tui-prd markdown (`### US-001: …`, `**Depends on:**`, `## Quality Gates`) or a `prd.json` (inline or in a ```` ```json ```` block) | cyralph splits it into child story issues in ralph-tui format, with blocks relations, and then runs as above. Set `ralph.materializeStories: false` to run the stories in memory instead. |
-| **A single story issue** of an epic | It loads the parent epic for context, runs only that story on the epic's branch, and then stops. |
+| **Parent issue with sub-issues** | Each sub-issue is a story, as above. |
+| **Issue whose description contains a PRD**: ralph-tui-prd markdown (`### US-001: …`, `**Priority:**`, `**Depends on:**`, `## Quality Gates`) or a `prd.json` (inline or in a ```` ```json ```` block) | cyralph creates a sub-issue per story: the story title as the title, the description and acceptance criteria as the body, the PRD priority as the Linear priority (1 Urgent … 4+ Low), the PRD order as the sub-issue order, and dependencies as blocks relations. Then it runs as above. Set `ralph.materializeStories: false` to run the stories in memory instead. |
+| **A sub-issue** of an epic | It loads the parent epic for context, runs only that story on the epic's branch, and then stops. |
 | **Any other issue** | It is treated as a one-story epic (a plain Cyrus-like run). The issue is not auto-closed. |
+
+Epics created by ralph-tui (`convert --to linear`) or by older cyralph versions still load. Their
+`US-001:` title prefixes are left in the title, and their `## Ralph Metadata` section is dropped from
+the story text. Its `Ralph Priority` is used only for a sub-issue that has no Linear priority; set a
+priority in Linear to override it. cyralph no longer writes either marker.
 
 A `> Branch: \`name\`` line in the PRD sets the branch. Otherwise the branch is Linear's
 `branchName` for the epic issue.
@@ -375,7 +389,7 @@ on Node 22, 24 and 26.
 
 Layout:
 
-- `src/ralph`: PRD parsing (markdown and prd.json), the ralph-tui story body format, selection,
+- `src/ralph`: PRD parsing (markdown and prd.json), story issue bodies, selection,
   the prompt and the progress log.
 - `src/linear`: the gateway (`@linear/sdk`), epic loading and materializing, webhook
   verification and classification, and OAuth.

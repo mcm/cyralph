@@ -2,7 +2,10 @@
  * Parse ralph-tui PRDs from text: either the markdown PRD produced by the
  * `ralph-tui-prd` skill, or a `prd.json` document (optionally inside a fenced code block).
  */
-import { DEFAULT_RALPH_PRIORITY, parseChecklist } from "./story-body.js";
+import { parseChecklist } from "./story-body.js";
+
+/** Priority of a PRD story that doesn't give one (1 = highest). */
+export const DEFAULT_PRD_PRIORITY = 3;
 
 export interface PrdStory {
 	id: string;
@@ -51,7 +54,7 @@ export function parseQualityGates(markdown: string): string[] {
 function parseStorySection(id: string, title: string, lines: string[]): PrdStory {
 	const description: string[] = [];
 	const criteria: string[] = [];
-	let priority = DEFAULT_RALPH_PRIORITY;
+	let priority = DEFAULT_PRD_PRIORITY;
 	let dependsOn: string[] = [];
 	let notes: string | undefined;
 	let mode: "description" | "criteria" | "other" = "description";
@@ -169,7 +172,7 @@ export function parsePrdJson(input: string | unknown): ParsedPrd | null {
 			title: s.title,
 			description: typeof s.description === "string" ? s.description : "",
 			acceptanceCriteria: Array.isArray(s.acceptanceCriteria) ? s.acceptanceCriteria.map(String) : [],
-			priority: typeof s.priority === "number" ? s.priority : DEFAULT_RALPH_PRIORITY,
+			priority: typeof s.priority === "number" ? s.priority : DEFAULT_PRD_PRIORITY,
 			dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.map(String) : [],
 			passes: s.passes === true,
 			notes: typeof s.notes === "string" && s.notes ? s.notes : undefined,

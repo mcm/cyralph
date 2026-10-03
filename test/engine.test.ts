@@ -122,24 +122,30 @@ function setup(
 function ralphEpic(linear: FakeLinear) {
 	const epic = linear.add({ title: "Task Priority System", identifier: "ENG-1", branchName: "eng-1-task-priority", description: "PRD overview" });
 	const s1 = linear.add({
-		title: "US-001: Add priority field",
+		title: "Add priority field",
 		identifier: "ENG-2",
 		parentId: epic.id,
-		description: buildStoryIssueBody({ storyId: "US-001", ralphPriority: 1, description: "store priority", acceptanceCriteria: ["column exists"] }),
+		priority: 2,
+		subIssueSortOrder: 0,
+		description: buildStoryIssueBody({ description: "store priority", acceptanceCriteria: ["column exists"] }),
 	});
 	const s2 = linear.add({
-		title: "US-002: Show badge",
+		title: "Show badge",
 		identifier: "ENG-3",
 		parentId: epic.id,
-		description: buildStoryIssueBody({ storyId: "US-002", ralphPriority: 1, description: "badge", acceptanceCriteria: ["badge"] }),
+		priority: 2,
+		subIssueSortOrder: 1,
+		description: buildStoryIssueBody({ description: "badge", acceptanceCriteria: ["badge"] }),
 	});
 	const s3 = linear.add({
-		title: "US-003: Sort by priority",
+		title: "Sort by priority",
 		identifier: "ENG-4",
 		parentId: epic.id,
-		description: buildStoryIssueBody({ storyId: "US-003", ralphPriority: 3, description: "sort", acceptanceCriteria: ["sorted"] }),
+		priority: 3,
+		subIssueSortOrder: 2,
+		description: buildStoryIssueBody({ description: "sort", acceptanceCriteria: ["sorted"] }),
 	});
-	// US-002 depends on US-001, so despite equal priority order is 001, 002, then 003.
+	// ENG-3 is blocked by ENG-2, so despite equal priority order is ENG-2, ENG-3, then ENG-4.
 	linear.blocks.set(s2.id, [s1.id]);
 	return { epic, s1, s2, s3 };
 }
@@ -160,7 +166,7 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		await t.manager.idle();
 
 		const order = t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
-		expect(order).toEqual(["US-001", "US-002", "US-003"]);
+		expect(order).toEqual(["ENG-2", "ENG-3", "ENG-4"]);
 		for (const s of [s1, s2, s3]) expect(t.linear.issues.get(s.id)?.stateType).toBe("completed");
 		expect(t.linear.issues.get(epic.id)?.stateType).toBe("started");
 
@@ -171,12 +177,12 @@ describe("epic engine (end to end with fakes + real git)", () => {
 
 		const wt = record?.worktreePath ?? "";
 		const log = sh(wt, "log", "--format=%s", "main..HEAD").trim().split("\n");
-		expect(log).toEqual(["feat(US-003): Sort by priority [ENG-4]", "feat(US-002): Show badge [ENG-3]", "feat(US-001): Add priority field [ENG-2]"]);
+		expect(log).toEqual(["feat(ENG-4): Sort by priority", "feat(ENG-3): Show badge", "feat(ENG-2): Add priority field"]);
 		// Pushed to origin.
 		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(sh(wt, "rev-parse", "HEAD").trim());
 
 		// Prompts carry PRD context and progress file.
-		expect(t.runner.calls[1]?.prompt).toContain("- [x] US-001: Add priority field");
+		expect(t.runner.calls[1]?.prompt).toContain("- [x] ENG-2: Add priority field");
 		expect(t.runner.calls[0]?.additionalDirectories?.[0]).toContain(join("epics", "ENG-1"));
 
 		const final = t.linear.bodies("response").at(-1);
@@ -189,25 +195,25 @@ describe("epic engine (end to end with fakes + real git)", () => {
 	it("retries with feedback, sets aside exhausted stories, and resumes on guidance", async () => {
 		const t = setup();
 		const { epic, s2 } = ralphEpic(t.linear);
-		t.runner.failFirst.add("US-003");
-		t.runner.neverComplete.add("US-001");
+		t.runner.failFirst.add("ENG-4");
+		t.runner.neverComplete.add("ENG-2");
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-2", issueId: epic.id });
 		await t.manager.idle();
 
 		const ids = t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
-		// US-001 twice (exhausted), US-002 blocked by it, US-003 fails once then succeeds.
-		expect(ids).toEqual(["US-001", "US-001", "US-003", "US-003"]);
+		// ENG-2 twice (exhausted), ENG-3 blocked by it, ENG-4 fails once then succeeds.
+		expect(ids).toEqual(["ENG-2", "ENG-2", "ENG-4", "ENG-4"]);
 		expect(t.runner.calls[1]?.prompt).toContain("I got stuck on the migration.");
 		expect(t.store.get("sess-2")?.status).toBe("awaiting_input");
 		const ask = t.linear.bodies("elicitation").at(-1) ?? "";
-		expect(ask).toContain("US-001: Add priority field** failed 2 attempts");
-		expect(ask).toContain("**US-002** is blocked by US-001");
-		// Partial work of the exhausted story was stashed, so it doesn't leak into US-003's commit
-		// (US-003's own partial work from its failed first attempt is kept for the retry).
+		expect(ask).toContain("ENG-2: Add priority field** failed 2 attempts");
+		expect(ask).toContain("**ENG-3** is blocked by ENG-2");
+		// Partial work of the exhausted story was stashed, so it doesn't leak into ENG-4's commit
+		// (ENG-4's own partial work from its failed first attempt is kept for the retry).
 		const wt = t.store.get("sess-2")?.worktreePath ?? "";
-		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("US-001");
-		expect(sh(wt, "stash", "list")).toContain("cyralph: incomplete US-001 (ENG-1)");
+		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("ENG-2");
+		expect(sh(wt, "stash", "list")).toContain("cyralph: incomplete ENG-2 (ENG-1)");
 
 		// Human replies with guidance; the loop resumes with a fresh attempt budget.
 		t.runner.neverComplete.clear();
@@ -215,23 +221,27 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		await t.manager.idle();
 		expect(t.store.get("sess-2")?.status).toBe("completed");
 		const resumed = t.runner.calls.slice(4);
-		expect(resumed.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["US-001", "US-002"]);
+		expect(resumed.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["ENG-2", "ENG-3"]);
 		expect(resumed[0]?.prompt).toContain("- The column should be nullable.");
 		expect(t.linear.issues.get(s2.id)?.stateType).toBe("completed");
 	});
 
-	it("materializes a PRD in the description into ralph-format child issues", async () => {
+	it("materializes a PRD in the description into sub-issues with Linear metadata", async () => {
 		const t = setup();
 		const epic = t.linear.add({
 			title: "Dark mode",
 			identifier: "ENG-50",
-			description: `# PRD: Dark Mode\n\n## Quality Gates\n- \`true\` - always passes\n\n## User Stories\n\n### US-001: Theme tokens\n**Description:** tokens\n\n**Acceptance Criteria:**\n- [ ] tokens exist\n\n### US-002: Toggle\n**Depends on:** US-001\n\n**Acceptance Criteria:**\n- [ ] toggle works\n`,
+			description: `# PRD: Dark Mode\n\n## Quality Gates\n- \`true\` - always passes\n\n## User Stories\n\n### US-001: Theme tokens\n**Description:** tokens\n\n**Acceptance Criteria:**\n- [ ] tokens exist\n\n### US-002: Toggle\n**Priority:** 2\n\n**Depends on:** US-001\n\n**Acceptance Criteria:**\n- [ ] toggle works\n`,
 		});
 		await t.manager.handle({ kind: "created", sessionId: "sess-3", issueId: epic.id });
 		await t.manager.idle();
 		const children = await t.linear.getChildren(epic.id);
-		expect(children.map((c) => c.title)).toEqual(["US-001: Theme tokens", "US-002: Toggle"]);
-		expect(children[0]?.description).toContain("## Ralph Metadata");
+		expect(children.map((c) => c.title)).toEqual(["Theme tokens", "Toggle"]);
+		expect(children.map((c) => c.description).join("\n")).not.toMatch(/Ralph|US-00/);
+		expect(children.map((c) => [c.priority, c.subIssueSortOrder])).toEqual([
+			[3, 0],
+			[2, 1],
+		]);
 		expect(t.linear.blocks.get(children[1]?.id ?? "")).toEqual([children[0]?.id]);
 		expect(children.every((c) => c.stateType === "completed")).toBe(true);
 		expect(t.runner.calls[0]?.prompt).toContain("- `true`");
@@ -255,9 +265,9 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		const { s3 } = ralphEpic(t.linear);
 		await t.manager.handle({ kind: "created", sessionId: "sess-5", issueId: s3.id });
 		await t.manager.idle();
-		expect(t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["US-003"]);
+		expect(t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["ENG-4"]);
 		expect(t.store.get("sess-5")?.status).toBe("completed");
-		expect(existsSync(join(t.store.get("sess-5")?.worktreePath ?? "", "US-003.txt"))).toBe(true);
+		expect(existsSync(join(t.store.get("sess-5")?.worktreePath ?? "", "ENG-4.txt"))).toBe(true);
 	});
 
 	it("opens the PR only once every story of the epic is complete, not after the first push", async () => {
@@ -342,7 +352,7 @@ describe("blocking / blocked-by relations", () => {
 		t.linear.issues.get(blocker.id)!.stateType = "completed";
 		await t.manager.handle({ kind: "issue_state", issueId: blocker.id, identifier: "ENG-99", stateType: "completed", removed: false });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(taskOrder(t)).toEqual(["ENG-2", "ENG-3", "ENG-4"]);
 		expect(t.store.get("b-1")?.status).toBe("completed");
 		expect(t.linear.bodies("thought")).toContain("ENG-99 is done. Re-checking blockers and resuming.");
 	});
@@ -351,25 +361,25 @@ describe("blocking / blocked-by relations", () => {
 		const t = setup();
 		const { epic, s1 } = ralphEpic(t.linear);
 		const api = t.linear.add({ title: "Ship API v2", identifier: "API-7", stateType: "started" });
-		// US-001 waits on another team's issue; US-002 depends on US-001; US-003 is free.
+		// ENG-2 waits on another team's issue; ENG-3 depends on ENG-2; ENG-4 is free.
 		t.linear.blocks.set(s1.id, [api.id]);
 
 		await t.manager.handle({ kind: "created", sessionId: "b-2", issueId: epic.id });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(taskOrder(t)).toEqual(["ENG-4"]);
 		expect(t.store.get("b-2")?.status).toBe("blocked");
 		expect(t.store.get("b-2")?.waitingOn).toEqual([{ id: api.id, identifier: "API-7" }]);
 		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **API-7**");
-		expect(t.runner.calls[0]?.prompt).toContain("US-001: Add priority field (depends on API-7)");
+		expect(t.runner.calls[0]?.prompt).toContain("ENG-2: Add priority field (depends on API-7)");
 
 		// The webhook was missed; the periodic reconcile notices the blocker closed.
 		await t.manager.reconcileParked();
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(taskOrder(t)).toEqual(["ENG-4"]);
 		t.linear.issues.get(api.id)!.stateType = "canceled";
 		await t.manager.reconcileParked();
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003", "US-001", "US-002"]);
+		expect(taskOrder(t)).toEqual(["ENG-4", "ENG-2", "ENG-3"]);
 		expect(t.store.get("b-2")?.status).toBe("completed");
 		expect(t.store.get("b-2")?.waitingOn).toEqual([]);
 	});
@@ -405,31 +415,31 @@ describe("blocking / blocked-by relations", () => {
 		// Issue webhooks may omit the state; the manager looks it up.
 		await t.manager.handle({ kind: "issue_state", issueId: s1.id, removed: false });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-002"]);
+		expect(taskOrder(t)).toEqual(["ENG-3"]);
 		expect(t.store.get("b-4")?.status).toBe("completed");
 	});
 
 	it("skips a story labelled manual, parks on it, and resumes its dependents once a person completes it", async () => {
 		const t = setup();
 		const { epic, s1 } = ralphEpic(t.linear);
-		// US-001 is a manual step (label matched case-insensitively); US-002 depends on it; US-003 is free.
+		// ENG-2 is a manual step (label matched case-insensitively); ENG-3 depends on it; ENG-4 is free.
 		t.linear.issues.get(s1.id)!.labels = ["Manual"];
 
 		await t.manager.handle({ kind: "created", sessionId: "man-1", issueId: epic.id });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(taskOrder(t)).toEqual(["ENG-4"]);
 		expect(t.store.get("man-1")?.status).toBe("blocked");
 		expect(t.store.get("man-1")?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
 		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**");
-		expect(t.linear.bodies("thought").join("\n")).toContain("**US-001** is a manual step for a person");
-		expect(t.runner.calls[0]?.prompt).toContain("US-001: Add priority field (manual step for a person, not for you)");
-		expect(t.linear.plans.at(-1)?.[0]?.content).toBe("US-001: Add priority field (manual)");
+		expect(t.linear.bodies("thought").join("\n")).toContain("**ENG-2** is a manual step for a person");
+		expect(t.runner.calls[0]?.prompt).toContain("ENG-2: Add priority field (manual step for a person, not for you)");
+		expect(t.linear.plans.at(-1)?.[0]?.content).toBe("ENG-2: Add priority field (manual)");
 
 		// The person finishes the manual step in Linear.
 		t.linear.issues.get(s1.id)!.stateType = "completed";
 		await t.manager.handle({ kind: "issue_state", issueId: s1.id, identifier: "ENG-2", stateType: "completed", removed: false });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003", "US-002"]);
+		expect(taskOrder(t)).toEqual(["ENG-4", "ENG-3"]);
 		expect(t.store.get("man-1")?.status).toBe("completed");
 	});
 
@@ -441,12 +451,12 @@ describe("blocking / blocked-by relations", () => {
 
 		await t.manager.handle({ kind: "created", sessionId: "man-2", issueId: epic.id });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(taskOrder(t)).toEqual(["ENG-4"]);
 		expect(t.store.get("man-2")?.status).toBe("blocked");
 
 		await t.manager.handle({ kind: "prompted", sessionId: "man-2", issueId: epic.id, body: "start anyway" });
 		await t.manager.idle();
-		expect(taskOrder(t)).toEqual(["US-003", "US-002"]);
+		expect(taskOrder(t)).toEqual(["ENG-4", "ENG-3"]);
 		// The manual step itself is still left to a person.
 		expect(t.store.get("man-2")?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
 	});
@@ -484,7 +494,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		const { epic } = ralphEpic(t.linear);
 		await t.manager.handle({ kind: "created", sessionId: "m-1", issueId: epic.id, commentBody: DELEGATION_BODY });
 		await t.manager.idle();
-		expect(storyIds(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(storyIds(t)).toEqual(["ENG-2", "ENG-3", "ENG-4"]);
 		expect(t.runner.calls.some(isRequest)).toBe(false);
 		expect(t.store.get("m-1")?.guidance).toEqual([]);
 		expect(t.runner.calls[0]?.prompt).not.toContain("This thread is for an agent session");
@@ -493,7 +503,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 	it("a mention only does what it asks, even with stories left (no story loop, no Linear changes)", async () => {
 		const t = setup();
 		const { epic, s1 } = ralphEpic(t.linear);
-		answerRequests(t, "The epic has 3 open stories; US-001 is next.");
+		answerRequests(t, "The epic has 3 open stories; ENG-2 is next.");
 		await t.manager.handle({ kind: "created", sessionId: "m-2", issueId: epic.id, commentBody: "@cyralph what's left on this epic?" });
 		await t.manager.idle();
 		expect(storyIds(t)).toEqual([]);
@@ -504,7 +514,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		expect(t.linear.issues.get(s1.id)?.stateType).toBe("unstarted");
 		expect(t.store.get("m-2")?.mode).toBe("request");
 		expect(t.git.prs).toEqual([]); // a question never opens a PR
-		expect(t.linear.bodies("response").at(-1)).toBe("The epic has 3 open stories; US-001 is next.");
+		expect(t.linear.bodies("response").at(-1)).toBe("The epic has 3 open stories; ENG-2 is next.");
 	});
 
 	it("`/ralph` in a mention opts into the story loop, with the rest of the comment as guidance", async () => {
@@ -512,7 +522,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		const { epic } = ralphEpic(t.linear);
 		await t.manager.handle({ kind: "created", sessionId: "m-3", issueId: epic.id, commentBody: "@cyralph /ralph use the existing Priority enum" });
 		await t.manager.idle();
-		expect(storyIds(t)).toEqual(["US-001", "US-002", "US-003"]);
+		expect(storyIds(t)).toEqual(["ENG-2", "ENG-3", "ENG-4"]);
 		expect(t.runner.calls[0]?.prompt).toContain("- use the existing Priority enum");
 		// The first story consumed it, so no extra request session runs.
 		expect(t.runner.calls.some(isRequest)).toBe(false);
@@ -610,7 +620,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		const blocker = t.linear.add({ title: "Design review", identifier: "ENG-98" });
 		t.linear.blocks.set(epic.id, [blocker.id]);
 		answerRequests(t);
-		await t.manager.handle({ kind: "created", sessionId: "m-11", issueId: epic.id, commentBody: "@cyralph what does US-002 need?" });
+		await t.manager.handle({ kind: "created", sessionId: "m-11", issueId: epic.id, commentBody: "@cyralph what does ENG-3 need?" });
 		await t.manager.idle();
 		expect(t.runner.calls.map(isRequest)).toEqual([true]);
 		expect(t.store.get("m-11")?.status).toBe("completed");
@@ -623,7 +633,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		let release: () => void = () => {};
 		const original = t.runner.run.bind(t.runner);
 		t.runner.run = async (req) => {
-			if (/## Your Task: US-001/.test(req.prompt) && injected.length === 0) {
+			if (/## Your Task: ENG-2/.test(req.prompt) && injected.length === 0) {
 				req.onInjector?.((text) => {
 					injected.push(text);
 					return true;
@@ -646,7 +656,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		await t.manager.idle();
 		// Delivered live, so it is not re-run as a request; later stories still see it as guidance.
 		expect(t.runner.calls.some(isRequest)).toBe(false);
-		expect(t.runner.calls.find((c) => /## Your Task: US-002/.test(c.prompt))?.prompt).toContain("- Use a smallint column");
+		expect(t.runner.calls.find((c) => /## Your Task: ENG-3/.test(c.prompt))?.prompt).toContain("- Use a smallint column");
 	});
 
 	it("a bare mention with no instruction does nothing", async () => {
@@ -864,14 +874,14 @@ describe("Linear attachments (images in issues)", () => {
 		await t.manager.handle({ kind: "created", sessionId: "a-3", issueId: epic.id, commentBody: DELEGATION_BODY });
 		await t.manager.idle();
 		const byStory = (id: string) => t.runner.calls.find((c) => c.prompt.includes(`## Your Task: ${id}`))?.prompt ?? "";
-		for (const id of ["US-001", "US-002", "US-003"]) {
+		for (const id of ["ENG-2", "ENG-3", "ENG-4"]) {
 			expect(byStory(id)).toContain("architecture.png");
 			expect(byStory(id)).toContain("(from comment on ENG-1 by Ana)");
 		}
-		expect(byStory("US-002")).toContain("**badge mockup** (from US-002)");
-		expect(byStory("US-002")).toContain("badge mockup.png");
-		expect(byStory("US-001")).not.toContain("badge mockup");
-		expect(byStory("US-003")).not.toContain("badge mockup");
+		expect(byStory("ENG-3")).toContain("**badge mockup** (from ENG-3)");
+		expect(byStory("ENG-3")).toContain("badge mockup.png");
+		expect(byStory("ENG-2")).not.toContain("badge mockup");
+		expect(byStory("ENG-4")).not.toContain("badge mockup");
 	});
 
 	it("includes images from an @mention and reports failed downloads instead of guessing", async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parsePrdFromText, parsePrdJson, parsePrdMarkdown, parseQualityGates } from "../src/ralph/prd.js";
-import { buildStoryIssueBody, parseStoryIssueBody, parseStoryTitle } from "../src/ralph/story-body.js";
+import { buildStoryIssueBody, linearPriorityFor, parseStoryIssueBody, storyRank, stripLegacyMetadata } from "../src/ralph/story-body.js";
 
 const PRD = `[PRD]
 # PRD: Task Priority System
@@ -99,22 +99,31 @@ describe("parsePrdJson / parsePrdFromText", () => {
 	});
 });
 
-describe("story issue body (ralph-tui Linear format)", () => {
-	it("round-trips", () => {
-		const body = buildStoryIssueBody({ storyId: "US-003", ralphPriority: 2, description: "Do it", acceptanceCriteria: ["x", "y"] });
-		const parsed = parseStoryIssueBody(body);
-		expect(parsed).toMatchObject({ storyId: "US-003", ralphPriority: 2, description: "Do it", acceptanceCriteria: ["x", "y"], hasRalphMetadata: true });
+describe("story issue body", () => {
+	it("round-trips without ralph markers", () => {
+		const body = buildStoryIssueBody({ description: "Do it", acceptanceCriteria: ["x", "y"] });
+		expect(body).not.toMatch(/Ralph|US-/);
+		expect(parseStoryIssueBody(body)).toEqual({ description: "Do it", acceptanceCriteria: ["x", "y"] });
 	});
 
 	it("treats plain descriptions as description + checklist", () => {
 		const parsed = parseStoryIssueBody("Fix the thing\n\n- [ ] it works\n- [x] tests");
-		expect(parsed.hasRalphMetadata).toBe(false);
 		expect(parsed.description).toContain("Fix the thing");
 		expect(parsed.acceptanceCriteria).toEqual(["it works", "tests"]);
+		expect(parsed.legacyRalphPriority).toBeUndefined();
 	});
 
-	it("parses story titles", () => {
-		expect(parseStoryTitle("US-001: Add field")).toEqual({ storyId: "US-001", title: "Add field" });
-		expect(parseStoryTitle("Plain title")).toEqual({ title: "Plain title" });
+	it("strips a legacy Ralph Metadata section, keeping its priority only as a fallback", () => {
+		const legacy = "## Ralph Metadata\n- **Story ID:** US-001\n- **Ralph Priority:** 2\n\n## Description\nDo it\n\n## Acceptance Criteria\n- [ ] x";
+		expect(parseStoryIssueBody(legacy)).toEqual({ description: "Do it", acceptanceCriteria: ["x"], legacyRalphPriority: 2 });
+		expect(stripLegacyMetadata(legacy)).toBe("## Description\nDo it\n\n## Acceptance Criteria\n- [ ] x");
+	});
+
+	it("ranks by Linear priority, then legacy priority, then last", () => {
+		expect(storyRank(1)).toBe(1);
+		expect(storyRank(4, 1)).toBe(4);
+		expect(storyRank(0, 2)).toBe(2);
+		expect(storyRank(0)).toBe(5);
+		expect([1, 2, 3, 4, 9].map(linearPriorityFor)).toEqual([1, 2, 3, 4, 4]);
 	});
 });

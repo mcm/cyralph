@@ -30,6 +30,15 @@ describe("selectNextStory", () => {
 		expect(selectNextStory(stories, new Set(["US-002"]))?.key).toBe("US-001");
 	});
 
+	it("breaks priority ties by Linear sub-issue order before the id", () => {
+		const stories = [story("ENG-2", { sortOrder: 3 }), story("ENG-3", { sortOrder: -1 }), story("ENG-4"), story("ENG-5", { priority: 2 })];
+		expect(selectNextStory(stories)?.key).toBe("ENG-5");
+		stories[3]!.status = "completed";
+		expect(selectNextStory(stories)?.key).toBe("ENG-3");
+		stories[1]!.status = "completed";
+		expect(selectNextStory(stories)?.key).toBe("ENG-2");
+	});
+
 	it("treats external blockers as unsatisfied", () => {
 		expect(selectNextStory([story("A", { dependsOn: ["external:ENG-9"] })])).toBeUndefined();
 	});

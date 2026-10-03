@@ -2,15 +2,18 @@
  * Turn a Linear issue into a Ralph Epic.
  *
  * Detection order:
- *  1. Issue has child issues          -> "children" epic (ralph-tui `convert --to linear` layout).
- *  2. Description contains a PRD       -> "prd" epic; optionally materialized into child issues
- *     (markdown user stories or prd.json)  using ralph-tui's story body format + "blocks" relations.
+ *  1. Issue has sub-issues             -> "children" epic: each sub-issue is a story.
+ *  2. Description contains a PRD       -> "prd" epic; optionally materialized into sub-issues
+ *     (markdown user stories or prd.json)  with Linear priority, sub-issue order and "blocks" relations.
  *  3. Otherwise                        -> "single" epic: the issue itself is the only story.
  *
- * Delegating a *story* issue (child of an epic) yields that epic, focused on the one story.
+ * Delegating a *story* issue (sub-issue of an epic) yields that epic, focused on the one story.
+ *
+ * Stories are described by Linear's own fields only: identifier, title, priority, sub-issue order,
+ * state, labels and "blocks" relations. Title prefixes (`US-001: …`) and body metadata are not parsed.
  */
 import { type ParsedPrd, parsePrdFromText, parseQualityGates } from "../ralph/prd.js";
-import { buildStoryIssueBody, parseStoryIssueBody, parseStoryTitle } from "../ralph/story-body.js";
+import { buildStoryIssueBody, linearPriorityFor, parseStoryIssueBody, storyRank, stripLegacyMetadata } from "../ralph/story-body.js";
 import { EXTERNAL_DEP_PREFIX, type Epic, type Story, type StoryStatus } from "../ralph/types.js";
 import type { IssueSummary, LinearGateway } from "./gateway.js";
 
@@ -48,6 +51,23 @@ export function isManualIssue(issue: Pick<IssueSummary, "labels">, manualLabels:
 	return issue.labels.some((l) => wanted.has(l.toLowerCase()));
 }
 
+/** The fields of a story that come straight from its Linear issue. */
+function linearStory(issue: IssueSummary, body = parseStoryIssueBody(issue.description)) {
+	return {
+		key: issue.id,
+		storyId: issue.identifier,
+		title: issue.title.trim(),
+		description: body.description,
+		acceptanceCriteria: body.acceptanceCriteria,
+		priority: storyRank(issue.priority, body.legacyRalphPriority),
+		...(issue.subIssueSortOrder !== undefined && { sortOrder: issue.subIssueSortOrder }),
+		issueId: issue.id,
+		identifier: issue.identifier,
+		url: issue.url,
+		sourceText: stripLegacyMetadata(issue.description),
+	};
+}
+
 async function storyFromIssue(
 	linear: LinearGateway,
 	issue: IssueSummary,
@@ -56,7 +76,6 @@ async function storyFromIssue(
 	manualLabels: readonly string[],
 ): Promise<Story> {
 	const body = parseStoryIssueBody(issue.description);
-	const titled = parseStoryTitle(issue.title);
 	const blockers = await linear.getBlockers(issue.id);
 	const dependsOn: string[] = [];
 	for (const b of blockers) {
@@ -68,18 +87,9 @@ async function storyFromIssue(
 		}
 	}
 	return {
-		key: issue.id,
-		storyId: body.storyId ?? titled.storyId ?? issue.identifier,
-		title: titled.title,
-		description: body.description,
-		acceptanceCriteria: body.acceptanceCriteria,
-		priority: body.ralphPriority,
+		...linearStory(issue, body),
 		dependsOn,
 		status: statusFromStateType(issue.stateType),
-		issueId: issue.id,
-		identifier: issue.identifier,
-		url: issue.url,
-		sourceText: issue.description,
 		...(isManualIssue(issue, manualLabels) && { manual: true }),
 	};
 }
@@ -120,21 +130,20 @@ function inMemoryStories(prd: ParsedPrd): Story[] {
 	}));
 }
 
-/** Create one child issue per PRD story plus blocking relations, mirroring `ralph-tui convert --to linear`. */
+/**
+ * Create one sub-issue per PRD story. The PRD's ids, priorities and order become Linear metadata:
+ * priority, sub-issue order and "blocks" relations. Titles and bodies carry no ralph markers.
+ */
 export async function materializePrd(linear: LinearGateway, parent: IssueSummary, prd: ParsedPrd): Promise<IssueSummary[]> {
 	const created = new Map<string, IssueSummary>();
-	for (const s of prd.stories) {
+	for (const [i, s] of prd.stories.entries()) {
 		const issue = await linear.createIssue({
 			teamId: parent.teamId,
 			parentId: parent.id,
-			title: `${s.id}: ${s.title}`,
-			description: buildStoryIssueBody({
-				storyId: s.id,
-				ralphPriority: s.priority,
-				description: s.description,
-				acceptanceCriteria: s.acceptanceCriteria,
-			}),
-			priority: Math.min(4, Math.max(0, s.priority - 1)),
+			title: s.title,
+			description: buildStoryIssueBody({ description: s.description, acceptanceCriteria: s.acceptanceCriteria }),
+			priority: linearPriorityFor(s.priority),
+			subIssueSortOrder: i,
 			projectName: parent.projectName,
 		});
 		created.set(s.id, issue);
@@ -151,28 +160,11 @@ export async function materializePrd(linear: LinearGateway, parent: IssueSummary
 }
 
 function singleStoryEpic(issue: IssueSummary): Epic {
-	const body = parseStoryIssueBody(issue.description);
-	const titled = parseStoryTitle(issue.title);
 	return {
 		...epicBase(issue, null),
 		kind: "single",
-		stories: [
-			{
-				key: issue.id,
-				storyId: body.storyId ?? titled.storyId ?? issue.identifier,
-				title: titled.title,
-				description: body.description,
-				acceptanceCriteria: body.acceptanceCriteria,
-				priority: body.ralphPriority,
-				dependsOn: [],
-				// The delegated issue is the work item; never treat it as already done.
-				status: "open",
-				issueId: issue.id,
-				identifier: issue.identifier,
-				url: issue.url,
-				sourceText: issue.description,
-			},
-		],
+		// The delegated issue is the work item; never treat it as already done.
+		stories: [{ ...linearStory(issue), dependsOn: [], status: "open" }],
 	};
 }
 
@@ -194,15 +186,11 @@ export async function loadEpic(linear: LinearGateway, issueId: string, opts: Loa
 		return { epic: await loadChildrenEpic(linear, issue, children, opts.manualLabels), materialized: 0 };
 	}
 
-	// A story delegated on its own: load its parent epic and focus on it.
+	// A sub-issue delegated on its own is one story of its parent's epic: load the epic and focus on it.
 	if (issue.parentId) {
 		const parent = await linear.getIssue(issue.parentId);
 		const siblings = await linear.getChildren(parent.id);
-		const parentPrd = parsePrdFromText(parent.description);
-		const isRalphStory = parseStoryIssueBody(issue.description).hasRalphMetadata || parseStoryTitle(issue.title).storyId;
-		if (isRalphStory || parentPrd) {
-			return { epic: await loadChildrenEpic(linear, parent, siblings, opts.manualLabels), focusStoryKey: issue.id, materialized: 0 };
-		}
+		return { epic: await loadChildrenEpic(linear, parent, siblings, opts.manualLabels), focusStoryKey: issue.id, materialized: 0 };
 	}
 
 	const prd = parsePrdFromText(issue.description);
