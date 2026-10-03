@@ -35,6 +35,8 @@ function makeRepo(opts: { remote?: boolean } = {}) {
 
 class TestGit extends CliGitWorkspace {
 	prs: string[] = [];
+	/** Commits on the branch each time a PR/MR was opened (to check when it happened). */
+	prOpenedAtCommits: number[] = [];
 	/** Simulates a PR opened outside the orchestrator (e.g. by the agent via `gh`). */
 	externalPr = false;
 	/** Simulates the forge CLI being unusable (e.g. `glab` not logged in). */
@@ -53,8 +55,9 @@ class TestGit extends CliGitWorkspace {
 			agentInstructions: (o) => real.agentInstructions(o),
 			preflight: async () => this.preflightProblem,
 			find: async () => found(),
-			ensure: async () => {
+			ensure: async (dir, o) => {
 				this.prs.push("created");
+				this.prOpenedAtCommits.push(Number(sh(dir, "rev-list", "--count", `origin/${o.baseBranch}..HEAD`).trim()));
 				return { url, number: 7 };
 			},
 			update: async () => {},
@@ -254,6 +257,36 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["US-003"]);
 		expect(t.store.get("sess-5")?.status).toBe("completed");
 		expect(existsSync(join(t.store.get("sess-5")?.worktreePath ?? "", "US-003.txt"))).toBe(true);
+	});
+
+	it("opens the PR only once every story of the epic is complete, not after the first push", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pr-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.git.prs).toEqual(["created"]);
+		expect(t.git.prOpenedAtCommits).toEqual([3]);
+		expect(t.linear.bodies("thought")).toContain("Opened a pull request: https://github.com/acme/app/pull/7");
+	});
+
+	it("doesn't open a PR for a delegated story that leaves the epic unfinished", async () => {
+		const t = setup();
+		const { s3 } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pr-2", issueId: s3.id });
+		await t.manager.idle();
+		expect(t.store.get("pr-2")?.status).toBe("completed");
+		expect(t.git.prs).toEqual([]);
+		expect(t.store.get("pr-2")?.prUrl).toBeUndefined();
+		expect(t.linear.bodies("response").at(-1)).toContain("will be opened once every story of the epic is complete");
+	});
+
+	it("opens a draft PR after the first push with openPullRequestEarly", async () => {
+		const t = setup({ openPullRequestEarly: true });
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pr-3", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.git.prOpenedAtCommits).toEqual([1]);
+		expect(t.linear.bodies("thought")).toContain("Opened a draft pull request: https://github.com/acme/app/pull/7");
 	});
 
 	it("stops a running session on a stop signal", async () => {
@@ -651,7 +684,7 @@ describe("GitHub vs GitLab forges", () => {
 		await t.manager.idle();
 		expect(t.store.get("f-1")?.prUrl).toBe("https://git.example.com/acme/app/-/merge_requests/7");
 		expect(t.linear.urls).toEqual([{ label: "Merge request", url: "https://git.example.com/acme/app/-/merge_requests/7" }]);
-		expect(t.linear.bodies("thought")).toContain("Opened a draft merge request: https://git.example.com/acme/app/-/merge_requests/7");
+		expect(t.linear.bodies("thought")).toContain("Opened a merge request: https://git.example.com/acme/app/-/merge_requests/7");
 		expect(t.linear.bodies("response").at(-1)).toContain("Merge request: https://git.example.com/acme/app/-/merge_requests/7");
 		expect(t.git.forgeOpts.at(-1)).toMatchObject({ gitlabHosts: ["git.example.com"] });
 	});

@@ -17,6 +17,7 @@
     "manualLabels": ["manual"],
     "pushPerStory": true,
     "createPullRequest": true,
+    "openPullRequestEarly": false,
     "markPrReadyWhenComplete": true,
     "epicCompletedStateName": "In Review"
   },

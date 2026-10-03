@@ -582,7 +582,7 @@ export class EpicEngine {
 		if (sha && config.ralph.pushPerStory && record.branch && (await git.remoteUrl(worktree))) {
 			try {
 				await git.push(worktree, record.branch);
-				await this.syncPullRequest(ctx, epic, repo, worktree, false);
+				await this.syncPullRequest(ctx, epic, repo, worktree, { ready: false, open: config.ralph.openPullRequestEarly });
 			} catch (err) {
 				await reporter.error(`Push failed: ${String(err)}`);
 			}
@@ -591,7 +591,17 @@ export class EpicEngine {
 		await reporter.thought(`✅ **${story.storyId}** complete${sha ? ` (\`${sha.slice(0, 10)}\`)` : ""}. ${done}/${epic.stories.length} stories done.`);
 	}
 
-	private async syncPullRequest(ctx: EngineRun, epic: Epic, repo: RepositoryConfig, worktree: string, ready: boolean) {
+	/**
+	 * Keep the epic's PR/MR in step with the branch. `open` allows opening a new one; without it only an
+	 * existing PR/MR is updated, so a half-finished epic doesn't burn CI on every pushed story.
+	 */
+	private async syncPullRequest(
+		ctx: EngineRun,
+		epic: Epic,
+		repo: RepositoryConfig,
+		worktree: string,
+		opts: { ready: boolean; open: boolean },
+	) {
 		const { config } = this.deps;
 		const { record, reporter } = ctx;
 		if (!config.ralph.createPullRequest || !record.branch) return;
@@ -599,6 +609,7 @@ export class EpicEngine {
 		if (!forge) return; // no remote to open a PR/MR against yet
 		const body = prBody(epic);
 		if (!record.prUrl) {
+			if (!opts.open) return;
 			// Say why there is no PR/MR instead of silently skipping it (once per run).
 			if (!this.forgeProblems.has(record.sessionId)) {
 				const problem = await forge.preflight(worktree);
@@ -620,9 +631,9 @@ export class EpicEngine {
 			record.prNumber = pr.number;
 			await ctx.persist();
 			await reporter.externalUrl(prLabel(pr.url), pr.url);
-			await reporter.thought(`Opened a draft ${forge.term}: ${pr.url}`);
+			await reporter.thought(`Opened a ${opts.ready ? "" : "draft "}${forge.term}: ${pr.url}`);
 		}
-		await forge.update(worktree, { url: record.prUrl, number: record.prNumber }, { body, ready });
+		await forge.update(worktree, { url: record.prUrl, number: record.prNumber }, { body, ready: opts.ready });
 	}
 
 	private async finish(args: {
@@ -659,7 +670,11 @@ export class EpicEngine {
 				}
 			}
 			try {
-				await this.syncPullRequest(ctx, epic, repo, worktree, all && config.ralph.markPrReadyWhenComplete);
+				// A PR/MR is only opened for a finished epic; a delegated story that leaves others open just pushes.
+				await this.syncPullRequest(ctx, epic, repo, worktree, {
+					ready: all && config.ralph.markPrReadyWhenComplete,
+					open: all || config.ralph.openPullRequestEarly,
+				});
 			} catch (err) {
 				log.warn(`PR sync failed: ${String(err)}`);
 			}
@@ -674,8 +689,12 @@ export class EpicEngine {
 				return "completed";
 			}
 			const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
+			const deferred =
+				!record.prUrl && !all && config.ralph.createPullRequest && !config.ralph.openPullRequestEarly
+					? " The pull/merge request will be opened once every story of the epic is complete."
+					: "";
 			await reporter.response(
-				`Finished ${what} on \`${record.branch}\`${cost}.${record.prUrl ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : ""}`,
+				`Finished ${what} on \`${record.branch}\`${cost}.${deferred}${record.prUrl ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : ""}`,
 			);
 			return "completed";
 		}
