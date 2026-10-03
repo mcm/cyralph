@@ -8,6 +8,7 @@ import { parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
 import { SessionStore, newRecord } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
+import { PR_DESCRIPTION_HEADING } from "../src/ralph/prompt.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
 import type { AttachmentFetcher } from "../src/linear/attachments.js";
@@ -43,6 +44,9 @@ class TestGit extends CliGitWorkspace {
 	/** Simulates the forge CLI being unusable (e.g. `glab` not logged in). */
 	preflightProblem: string | undefined;
 	forgeOpts: Array<Record<string, unknown> | undefined> = [];
+	/** Title and body each PR/MR was opened with. */
+	opened: Array<{ title: string; body: string }> = [];
+	updates: Array<{ title?: string; body?: string; ready?: boolean }> = [];
 	override async forge(cwd: string, opts?: Parameters<CliGitWorkspace["forge"]>[1]): Promise<Forge | undefined> {
 		this.forgeOpts.push(opts);
 		const real = await super.forge(cwd, opts);
@@ -58,10 +62,13 @@ class TestGit extends CliGitWorkspace {
 			find: async () => found(),
 			ensure: async (dir, o) => {
 				this.prs.push("created");
+				this.opened.push({ title: o.title, body: o.body });
 				this.prOpenedAtCommits.push(Number(sh(dir, "rev-list", "--count", `origin/${o.baseBranch}..HEAD`).trim()));
 				return { url, number: 7 };
 			},
-			update: async () => {},
+			update: async (_dir, _pr, o) => {
+				this.updates.push(o);
+			},
 		};
 	}
 }
@@ -80,9 +87,19 @@ class FakeFetcher implements AttachmentFetcher {
 /** Implements a story by writing `<storyId>.txt`; can be told to fail specific attempts. */
 class ScriptedRunner implements AgentRunner {
 	calls: RunRequest[] = [];
+	/** Sessions that wrote a PR/MR title and description (kept out of `calls`). */
+	describeCalls: RunRequest[] = [];
+	/** Final message of a describe session; undefined = it fails. */
+	description: string | undefined =
+		"Looked at the diff.\n<pr-title>Add task priorities with badges and sorting</pr-title>\n<pr-description>\nTasks get a priority.\n\n**Breaking changes**: none.\n</pr-description>";
 	failFirst = new Set<string>();
 	neverComplete = new Set<string>();
 	async run(req: RunRequest): Promise<RunResult> {
+		if (req.prompt.includes(PR_DESCRIPTION_HEADING)) {
+			this.describeCalls.push(req);
+			if (this.description === undefined) return { output: "", isError: true, aborted: false, errorMessage: "error_during_execution" };
+			return { output: this.description, isError: false, aborted: false, costUsd: 0.05 };
+		}
 		this.calls.push(req);
 		const id = /## Your Task: (\S+)/.exec(req.prompt)?.[1] ?? "unknown";
 		req.onEvent?.({ type: "tool", name: "Write", input: { file_path: `${id}.txt` } });
@@ -298,6 +315,60 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		await t.manager.idle();
 		expect(t.git.prOpenedAtCommits).toEqual([1]);
 		expect(t.linear.bodies("thought")).toContain("Opened a draft pull request: https://github.com/acme/app/pull/7");
+	});
+
+	it("titles and describes the PR from the branch's changes, without the story list", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		t.linear.issues.get(epic.id)!.url = "https://linear.app/acme/issue/ENG-1";
+		await t.manager.handle({ kind: "created", sessionId: "pr-4", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.describeCalls).toHaveLength(1);
+		const describe = t.runner.describeCalls[0]!;
+		expect(describe.prompt).toContain("git diff origin/main...HEAD");
+		expect(describe.prompt).toContain("Do NOT list the user stories");
+		expect(describe.prompt).not.toContain("US-001");
+		expect(describe.disallowedTools).toEqual(expect.arrayContaining(["Write", "Edit"]));
+		expect(t.git.opened).toEqual([
+			{
+				title: "ENG-1: Add task priorities with badges and sorting",
+				body: "Tasks get a priority.\n\n**Breaking changes**: none.\n\n---\nLinear: [ENG-1](https://linear.app/acme/issue/ENG-1) · _Opened by cyralph._",
+			},
+		]);
+		// Opened by this run already: only marked ready, not described a second time.
+		expect(t.git.updates).toEqual([{ ready: true }]);
+		expect(t.store.get("pr-4")?.totalCostUsd).toBeCloseTo(0.8);
+	});
+
+	it("falls back to a plain title and description when the describe session fails", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		t.runner.description = undefined;
+		await t.manager.handle({ kind: "created", sessionId: "pr-5", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.git.opened).toEqual([{ title: "ENG-1: Task Priority System", body: expect.stringMatching(/^Implements Task Priority System\.\n/) }]);
+		expect(t.git.opened[0]?.body).not.toContain("US-00");
+		expect(t.linear.bodies("error")).toEqual([]);
+	});
+
+	it("rewrites an early PR's title and description once the epic is complete", async () => {
+		const t = setup({ openPullRequestEarly: true });
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pr-6", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.git.opened).toHaveLength(1);
+		// Opened after the first story, then left alone until the last one, then rewritten from the whole branch.
+		expect(t.runner.describeCalls).toHaveLength(2);
+		expect(t.git.updates).toEqual([{ title: "ENG-1: Add task priorities with badges and sorting", body: t.git.opened[0]?.body, ready: true }]);
+	});
+
+	it("can be told not to run a describe session", async () => {
+		const t = setup({ describePullRequest: false });
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pr-7", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.describeCalls).toHaveLength(0);
+		expect(t.git.opened[0]?.title).toBe("ENG-1: Task Priority System");
 	});
 
 	it("stops a running session on a stop signal", async () => {

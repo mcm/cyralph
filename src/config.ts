@@ -100,6 +100,12 @@ export const RalphConfigSchema = z.object({
 	 * An existing PR/MR (e.g. one opened by a direct request) is kept up to date either way.
 	 */
 	openPullRequestEarly: z.boolean().default(false),
+	/**
+	 * Have a short read-only agent session write the PR/MR title and description from the branch's changes
+	 * (summary, breaking changes, judgement calls) instead of a generic one. Runs when the PR/MR is opened
+	 * and again once the epic is complete.
+	 */
+	describePullRequest: z.boolean().default(true),
 	/** Mark the PR ready for review once every story is complete. */
 	markPrReadyWhenComplete: z.boolean().default(true),
 	/**

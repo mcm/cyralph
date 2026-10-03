@@ -23,9 +23,9 @@ export interface Forge {
 	find(cwd: string, branch: string): Promise<PullRequestInfo | undefined>;
 	/** Find or create a draft PR/MR. Throws with the CLI's error output if creation fails. */
 	ensure(cwd: string, opts: { branch: string; baseBranch: string; title: string; body: string }): Promise<PullRequestInfo>;
-	update(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void>;
+	update(cwd: string, pr: PullRequestInfo, opts: { title?: string; body?: string; ready?: boolean }): Promise<void>;
 	/** Instructions for an agent handling a "open a PR/MR" request. */
-	agentInstructions(opts: { branch: string; baseBranch: string; title: string }): string;
+	agentInstructions(opts: { branch: string; baseBranch: string; titlePrefix: string }): string;
 }
 
 /** Host of a git remote URL: `git@host:g/p.git`, `ssh://git@host:2222/g/p.git`, `https://host/g/p.git`. */
@@ -66,6 +66,11 @@ function lastUrl(text: string, pattern: RegExp): string | undefined {
 	return [...text.matchAll(pattern)].map((m) => m[0]).pop();
 }
 
+/** How an agent should write a PR/MR it opens itself (the orchestrator's own PRs/MRs follow the same rules). */
+function describeChange(titlePrefix: string): string {
+	return `a title of the form "${titlePrefix}<summary of the change itself>" and a description of the deliverable written for reviewers who can't see Linear: what it does and why, notable changes, and any breaking changes or judgement calls. Don't list the user stories.`;
+}
+
 export class GitHubForge implements Forge {
 	kind = "github" as const;
 	cli = "gh";
@@ -95,13 +100,14 @@ export class GitHubForge implements Forge {
 		return { url, number: Number(/\/pull\/(\d+)/.exec(url)?.[1]) || undefined };
 	}
 
-	async update(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void> {
-		if (opts.body !== undefined) await run("gh", ["pr", "edit", pr.url, "--body", opts.body], cwd);
+	async update(cwd: string, pr: PullRequestInfo, opts: { title?: string; body?: string; ready?: boolean }): Promise<void> {
+		const edits = [...(opts.title !== undefined ? ["--title", opts.title] : []), ...(opts.body !== undefined ? ["--body", opts.body] : [])];
+		if (edits.length) await run("gh", ["pr", "edit", pr.url, ...edits], cwd);
 		if (opts.ready) await run("gh", ["pr", "ready", pr.url], cwd);
 	}
 
-	agentInstructions(o: { branch: string; baseBranch: string; title: string }): string {
-		return `For a pull request (GitHub, \`gh\`): check \`gh pr view ${o.branch}\` first; if none exists, \`gh pr create --base ${o.baseBranch} --head ${o.branch} --title "${o.title}"\` with a body summarising the stories. Use \`--draft\` unless all stories are complete.`;
+	agentInstructions(o: { branch: string; baseBranch: string; titlePrefix: string }): string {
+		return `For a pull request (GitHub, \`gh\`): check \`gh pr view ${o.branch}\` first; if none exists, \`gh pr create --base ${o.baseBranch} --head ${o.branch} --title "<title>"\` with ${describeChange(o.titlePrefix)} Use \`--draft\` unless all stories are complete.`;
 	}
 }
 
@@ -160,15 +166,16 @@ export class GitLabForge implements Forge {
 		return { url, number: Number(/merge_requests\/(\d+)/.exec(url)?.[1]) || undefined };
 	}
 
-	async update(cwd: string, pr: PullRequestInfo, opts: { body?: string; ready?: boolean }): Promise<void> {
+	async update(cwd: string, pr: PullRequestInfo, opts: { title?: string; body?: string; ready?: boolean }): Promise<void> {
 		const ref = pr.number !== undefined ? String(pr.number) : pr.url;
-		if (opts.body !== undefined) await this.glab(["mr", "update", ref, "--description", opts.body, "--yes"], cwd);
+		const edits = [...(opts.title !== undefined ? ["--title", opts.title] : []), ...(opts.body !== undefined ? ["--description", opts.body] : [])];
+		if (edits.length) await this.glab(["mr", "update", ref, ...edits, "--yes"], cwd);
 		if (opts.ready) await this.glab(["mr", "update", ref, "--ready", "--yes"], cwd);
 	}
 
-	agentInstructions(o: { branch: string; baseBranch: string; title: string }): string {
+	agentInstructions(o: { branch: string; baseBranch: string; titlePrefix: string }): string {
 		const env = this.host ? `GITLAB_HOST=${this.host} ` : "";
-		return `For a merge request (GitLab, \`glab\`): check \`${env}glab mr view ${o.branch}\` first; if none exists, \`${env}glab mr create --source-branch ${o.branch} --target-branch ${o.baseBranch} --title "${o.title}" --description "<summary of the stories>" --yes\`. Add \`--draft\` unless all stories are complete.`;
+		return `For a merge request (GitLab, \`glab\`): check \`${env}glab mr view ${o.branch}\` first; if none exists, \`${env}glab mr create --source-branch ${o.branch} --target-branch ${o.baseBranch} --title "<title>" --description "<description>" --yes\`, with ${describeChange(o.titlePrefix)} Add \`--draft\` unless all stories are complete.`;
 	}
 }
 

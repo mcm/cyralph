@@ -260,3 +260,69 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 function capitalize(s: string): string {
 	return s.charAt(0).toUpperCase() + s.slice(1);
 }
+
+export interface PullRequestPromptContext {
+	epic: Epic;
+	branch: string;
+	baseBranch: string;
+	/** "pull request" or "merge request". */
+	prTerm: string;
+	progressFile: string;
+}
+
+/** Marks a describe-the-PR session (tests and logs tell it apart from story/request sessions by this). */
+export const PR_DESCRIPTION_HEADING = "## Write the title and description";
+
+/** System prompt addition for the read-only session that writes a PR/MR title and description. */
+export const PR_DESCRIPTION_SYSTEM_APPEND = `You are "cyralph", writing the title and description of a pull/merge request for work that is already committed.
+- Only read: inspect the repository and git history. Don't edit files, commit, push, or run gh/glab.
+- Your final message must contain the <pr-title> and <pr-description> blocks the prompt asks for.`;
+
+/**
+ * Prompt for a short session that reads the branch's changes and writes the PR/MR title and
+ * description. Readers of the PR/MR may not have access to Linear, and the story breakdown is
+ * workflow structure, so the agent describes the deliverable itself.
+ */
+export function buildPullRequestPrompt(ctx: PullRequestPromptContext): string {
+	const { epic, baseBranch, prTerm } = ctx;
+	const background = epic.description.trim();
+	return [
+		`The branch \`${ctx.branch}\` in this git worktree is ready for a ${prTerm} into \`${baseBranch}\`. It implements "${epic.title}".`,
+		"",
+		...(background
+			? [
+					`Background from the issue tracker (for context only; readers of the ${prTerm} can't see it):`,
+					"<issue-background>",
+					background.length > 6000 ? `${background.slice(0, 6000)}\n…` : background,
+					"</issue-background>",
+					"",
+				]
+			: []),
+		`Notes from the sessions that did the work (decisions, gotchas) are in \`${ctx.progressFile}\`, if it exists.`,
+		"",
+		PR_DESCRIPTION_HEADING,
+		`1. Study what actually changed: \`git log --reverse --format='%s%n%b' origin/${baseBranch}..HEAD\` and \`git diff origin/${baseBranch}...HEAD\` (use \`${baseBranch}\` instead of \`origin/${baseBranch}\` if that ref doesn't exist), reading files where the diff alone isn't clear.`,
+		`2. Write a title and description for the ${prTerm} that a reviewer with no access to the issue tracker can follow:`,
+		"   - Title: one line, imperative mood, at most ~70 characters, summarising the change itself. No issue identifiers or prefixes.",
+		"   - Description (markdown): open with a short summary of what the change delivers and why. Then the notable changes, grouped by area, in a few bullets.",
+		"   - Add a **Breaking changes** section if behaviour, configuration, APIs or data formats change incompatibly, saying what users must do. Omit it otherwise.",
+		"   - Add a **Decisions** section for judgement calls, trade-offs or deviations from the request that a reviewer should know about. Omit it if there were none.",
+		"   - Do NOT list the user stories, story IDs, progress or the development process. They are workflow structure, not part of the deliverable. Don't link the issue tracker; that is added for you.",
+		"   - Be concrete and concise; don't pad with generic statements or restate the diff line by line.",
+		"3. Don't change any files.",
+		"",
+		"End your final message with exactly these two blocks:",
+		"<pr-title>The title</pr-title>",
+		"<pr-description>",
+		"The markdown description",
+		"</pr-description>",
+	].join("\n");
+}
+
+/** The title and description from a describe session's final message, if it produced both. */
+export function parsePullRequestDescription(output: string): { title: string; body: string } | undefined {
+	const title = [...output.matchAll(/<pr-title>([\s\S]*?)<\/pr-title>/gi)].pop()?.[1]?.replace(/\s+/g, " ").trim();
+	const body = [...output.matchAll(/<pr-description>([\s\S]*?)<\/pr-description>/gi)].pop()?.[1]?.trim();
+	if (!title || !body) return undefined;
+	return { title: title.replace(/^["'`]+|["'`]+$/g, "").slice(0, 200), body };
+}

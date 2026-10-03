@@ -184,8 +184,17 @@ repository with the matching CLI:
 The PR/MR is opened only when every story of the epic is complete (and marked ready right away when
 `ralph.markPrReadyWhenComplete` is on). Stories are still pushed as they finish, but no PR/MR exists
 yet to trigger CI on each push. Delegating one story of an unfinished epic pushes it without opening a
-PR/MR. A PR/MR that already exists, such as one a direct request opened, is updated after every story.
+PR/MR. A PR/MR that already exists, such as one a direct request opened, gets the epic's later pushes.
 Set `ralph.openPullRequestEarly: true` to get the old behaviour: a draft opens after the first pushed story.
+
+The PR/MR title and description describe the change itself, for reviewers who can't open Linear (a
+public repository, say). A short read-only agent session reads the branch's commits and diff and writes
+a title (`ENG-42: <summary of the change>`), a summary of the deliverable, and sections for breaking
+changes and judgement calls when there are any. The user stories are left out: they are how the work
+was split up, not part of the result. The Linear issue is linked in a footer. This runs when the PR/MR is
+opened and again when the epic completes (so an early draft ends up describing the whole branch). If the
+session fails, the issue title and a plain description are used. Set `ralph.describePullRequest: false`
+to skip the session.
 
 For a **self-hosted GitLab** whose hostname doesn't contain "gitlab", list it in the top-level
 `gitlabHosts`, or set `"forge": "gitlab"` on the repository:
