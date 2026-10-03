@@ -60,6 +60,11 @@ export const RepositoryConfigSchema = z.object({
 	 * repository: fix the findings and push to the PR branch. Defaults to true.
 	 */
 	respondToReviews: z.boolean().optional(),
+	/**
+	 * Fix failed CI (GitHub Actions, GitLab CI) on pull/merge requests cyralph opened for this repository:
+	 * read the failed jobs' logs, fix the cause and push. Defaults to true.
+	 */
+	respondToCiFailures: z.boolean().optional(),
 });
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 
@@ -128,6 +133,16 @@ export const GitHubConfigSchema = z.object({
 	maxReviewRounds: z.number().int().nonnegative().default(3),
 });
 
+export const CiConfigSchema = z.object({
+	/**
+	 * How often to check the CI of cyralph's open pull/merge requests (GitHub Actions via `gh`, GitLab
+	 * pipelines via `glab`). 0 disables reacting to CI failures.
+	 */
+	pollMinutes: z.number().nonnegative().default(5),
+	/** Failed pipelines acted on per PR/MR before cyralph leaves further ones to a person. */
+	maxFixRounds: z.number().int().nonnegative().default(3),
+});
+
 export const AutoUpdateConfigSchema = z.object({
 	/**
 	 * Follow new commits on the branch cyralph was installed from: build and test them off to the side,
@@ -165,6 +180,7 @@ export const ConfigSchema = z.object({
 	ralph: RalphConfigSchema.prefault({}),
 	autoUpdate: AutoUpdateConfigSchema.prefault({}),
 	github: GitHubConfigSchema.prefault({}),
+	ci: CiConfigSchema.prefault({}),
 	repositories: z.array(RepositoryConfigSchema).min(1),
 });
 export type Config = z.infer<typeof ConfigSchema> & { stateDir: string; configPath: string };

@@ -12,6 +12,7 @@ import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
 import type { AttachmentFetcher } from "../src/linear/attachments.js";
 import type { GitHubReview, GitHubReviewClient, ReviewComment, ReviewSubmitted } from "../src/github/reviews.js";
+import type { ChangeRequestRef, CiClient, CiFailedJob, CiStatus } from "../src/git/ci.js";
 import { FakeLinear } from "./fakes.js";
 
 const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -98,7 +99,7 @@ class ScriptedRunner implements AgentRunner {
 function setup(
 	overrides: Record<string, unknown> = {},
 	repoOpts: { remote?: boolean } = {},
-	extra: { repo?: Record<string, unknown>; config?: Record<string, unknown>; github?: GitHubReviewClient } = {},
+	extra: { repo?: Record<string, unknown>; config?: Record<string, unknown>; github?: GitHubReviewClient; ci?: CiClient } = {},
 ) {
 	const { root, repo, origin } = makeRepo(repoOpts);
 	const config = parseConfig(
@@ -114,7 +115,7 @@ function setup(
 	const git = new TestGit();
 	const store = new SessionStore(join(root, "sessions.json"));
 	const fetcher = new FakeFetcher();
-	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger, attachments: fetcher, github: extra.github }, store);
+	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger, attachments: fetcher, github: extra.github, ci: extra.ci }, store);
 	return { root, repo, origin, config, linear, runner, git, store, manager, fetcher };
 }
 
@@ -1040,5 +1041,117 @@ describe("automated PR reviews", () => {
 		t.github.open = false;
 		await t.manager.pollReviews();
 		expect(t.store.get("rv-1")?.prClosed).toBe(true);
+	});
+});
+
+class FakeCi implements CiClient {
+	statusCalls: string[] = [];
+	result: CiStatus = { open: true, headSha: "head1", state: "pending", failedJobs: [] };
+	logs = new Map<number, string>();
+	async status(ref: ChangeRequestRef) {
+		this.statusCalls.push(ref.url);
+		return { ...this.result };
+	}
+	async jobLog(_ref: ChangeRequestRef, job: CiFailedJob) {
+		const log = this.logs.get(job.id);
+		if (log === undefined) throw new Error("log expired");
+		return log;
+	}
+}
+
+function failed(headSha: string, jobs: CiFailedJob[] = [{ id: 1, name: "CI / test", url: "https://github.com/acme/app/actions/runs/5/job/1" }]): CiStatus {
+	return { open: true, headSha, state: "failed", pipelineUrl: "https://github.com/acme/app/actions/runs/5", failedJobs: jobs };
+}
+
+/** A finished epic with PR #7 open, whose CI is polled. */
+async function ciEpic(extra: { repo?: Record<string, unknown>; config?: Record<string, unknown> } = {}) {
+	const ci = new FakeCi();
+	const t = setup({}, {}, { repo: extra.repo, config: extra.config, ci });
+	const { epic } = ralphEpic(t.linear);
+	await t.manager.handle({ kind: "created", sessionId: "ci-1", issueId: epic.id });
+	await t.manager.idle();
+	expect(t.store.get("ci-1")?.prUrl).toBe(PR_URL);
+	const before = t.runner.calls.length;
+	const requestPrompts = () => t.runner.calls.slice(before).map((c) => c.prompt);
+	return { ...t, ci, requestPrompts };
+}
+
+describe("CI failures", () => {
+	it("hands a failed pipeline's jobs and logs to the epic's session, once per head commit", async () => {
+		const t = await ciEpic();
+		// Still running or green: nothing to do.
+		await t.manager.pollCi();
+		t.ci.result = { open: true, headSha: "head1", state: "success", failedJobs: [] };
+		await t.manager.pollCi();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(0);
+
+		t.ci.result = failed("head1");
+		t.ci.logs.set(1, "FAIL test/a.test.ts\nExpected 2, got 3");
+		await t.manager.pollCi();
+		await t.manager.idle();
+		const prompts = t.requestPrompts();
+		expect(prompts).toHaveLength(1);
+		expect(prompts[0]).toContain("The GitHub Actions checks for pull request #7 (https://github.com/acme/app/pull/7) failed on `head1`");
+		expect(prompts[0]).toContain("### CI / test");
+		expect(prompts[0]).toContain("Expected 2, got 3");
+		expect(prompts[0]).toContain("push `eng-1-task-priority`");
+		expect(t.linear.bodies("thought").some((b) => b.includes("CI failed on the pull request (`head1`: `CI / test`). Working on a fix."))).toBe(true);
+		const record = t.store.get("ci-1");
+		expect(record?.ciFixRounds).toBe(1);
+		expect(record?.handledCiShas).toEqual(["head1"]);
+		expect(record?.pendingRequests).toEqual([]);
+
+		// The same failed commit on the next poll is not acted on again.
+		await t.manager.pollCi();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+
+		// A new push that fails again is; a job whose log can't be read is still reported.
+		t.ci.result = failed("head2", [{ id: 2, name: "CI / build" }]);
+		await t.manager.pollCi();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(2);
+		expect(t.requestPrompts()[1]).toContain("(no log available)");
+	});
+
+	it("stops after maxFixRounds and says so in the session", async () => {
+		const t = await ciEpic({ config: { ci: { maxFixRounds: 1 } } });
+		t.ci.result = failed("head1");
+		await t.manager.pollCi();
+		await t.manager.idle();
+		t.ci.result = failed("head2");
+		await t.manager.pollCi();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(1);
+		expect(t.linear.bodies("thought").some((b) => b.includes("leaving this one for a person"))).toBe(true);
+		// Said once, not on every poll.
+		await t.manager.pollCi();
+		expect(t.linear.bodies("thought").filter((b) => b.includes("leaving this one for a person"))).toHaveLength(1);
+	});
+
+	it("skips repositories that opted out, stopped sessions, and closed PRs", async () => {
+		const off = await ciEpic({ repo: { respondToCiFailures: false } });
+		off.ci.result = failed("head1");
+		await off.manager.pollCi();
+		await off.manager.idle();
+		expect(off.ci.statusCalls).toHaveLength(0);
+		expect(off.requestPrompts()).toHaveLength(0);
+
+		const t = await ciEpic();
+		await t.manager.handle({ kind: "prompted", sessionId: "ci-1", body: "stop" });
+		t.ci.result = failed("head1");
+		await t.manager.pollCi();
+		await t.manager.idle();
+		expect(t.requestPrompts()).toHaveLength(0);
+
+		const closed = await ciEpic();
+		closed.ci.result = { ...failed("head1"), open: false };
+		await closed.manager.pollCi();
+		await closed.manager.idle();
+		expect(closed.requestPrompts()).toHaveLength(0);
+		expect(closed.store.get("ci-1")?.prClosed).toBe(true);
+		await closed.manager.pollCi();
+		expect(closed.ci.statusCalls).toHaveLength(1);
 	});
 });
