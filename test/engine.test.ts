@@ -375,6 +375,48 @@ describe("blocking / blocked-by relations", () => {
 		expect(t.store.get("b-4")?.status).toBe("completed");
 	});
 
+	it("skips a story labelled manual, parks on it, and resumes its dependents once a person completes it", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		// US-001 is a manual step (label matched case-insensitively); US-002 depends on it; US-003 is free.
+		t.linear.issues.get(s1.id)!.labels = ["Manual"];
+
+		await t.manager.handle({ kind: "created", sessionId: "man-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(t.store.get("man-1")?.status).toBe("blocked");
+		expect(t.store.get("man-1")?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**");
+		expect(t.linear.bodies("thought").join("\n")).toContain("**US-001** is a manual step for a person");
+		expect(t.runner.calls[0]?.prompt).toContain("US-001: Add priority field (manual step for a person, not for you)");
+		expect(t.linear.plans.at(-1)?.[0]?.content).toBe("US-001: Add priority field (manual)");
+
+		// The person finishes the manual step in Linear.
+		t.linear.issues.get(s1.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "issue_state", issueId: s1.id, identifier: "ENG-2", stateType: "completed", removed: false });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003", "US-002"]);
+		expect(t.store.get("man-1")?.status).toBe("completed");
+	});
+
+	it("uses the configured manual labels, and 'start anyway' runs dependents without doing the manual step", async () => {
+		const t = setup({ manualLabels: ["needs-human"] });
+		const { epic, s1, s3 } = ralphEpic(t.linear);
+		t.linear.issues.get(s1.id)!.labels = ["needs-human"];
+		t.linear.issues.get(s3.id)!.labels = ["manual"]; // not a manual label in this config
+
+		await t.manager.handle({ kind: "created", sessionId: "man-2", issueId: epic.id });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003"]);
+		expect(t.store.get("man-2")?.status).toBe("blocked");
+
+		await t.manager.handle({ kind: "prompted", sessionId: "man-2", issueId: epic.id, body: "start anyway" });
+		await t.manager.idle();
+		expect(taskOrder(t)).toEqual(["US-003", "US-002"]);
+		// The manual step itself is still left to a person.
+		expect(t.store.get("man-2")?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
+	});
+
 	it("ignores a parent epic that lists its own child as a blocker", async () => {
 		const t = setup();
 		const { epic, s3 } = ralphEpic(t.linear);

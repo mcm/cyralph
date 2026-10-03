@@ -39,6 +39,13 @@ export interface LoadedEpic {
 
 export interface LoadOptions {
 	materializeStories: boolean;
+	/** Labels marking a story issue as a manual step (case-insensitive). */
+	manualLabels?: string[];
+}
+
+export function isManualIssue(issue: Pick<IssueSummary, "labels">, manualLabels: readonly string[] = []): boolean {
+	const wanted = new Set(manualLabels.map((l) => l.toLowerCase()));
+	return issue.labels.some((l) => wanted.has(l.toLowerCase()));
 }
 
 async function storyFromIssue(
@@ -46,6 +53,7 @@ async function storyFromIssue(
 	issue: IssueSummary,
 	epicKeys: Set<string>,
 	external: Record<string, string>,
+	manualLabels: readonly string[],
 ): Promise<Story> {
 	const body = parseStoryIssueBody(issue.description);
 	const titled = parseStoryTitle(issue.title);
@@ -72,6 +80,7 @@ async function storyFromIssue(
 		identifier: issue.identifier,
 		url: issue.url,
 		sourceText: issue.description,
+		...(isManualIssue(issue, manualLabels) && { manual: true }),
 	};
 }
 
@@ -89,10 +98,10 @@ function epicBase(issue: IssueSummary, prd: ParsedPrd | null): Omit<Epic, "kind"
 	};
 }
 
-async function loadChildrenEpic(linear: LinearGateway, parent: IssueSummary, children: IssueSummary[]): Promise<Epic> {
+async function loadChildrenEpic(linear: LinearGateway, parent: IssueSummary, children: IssueSummary[], manualLabels: readonly string[] = []): Promise<Epic> {
 	const keys = new Set(children.map((c) => c.id));
 	const externalIssues: Record<string, string> = {};
-	const stories = await Promise.all(children.map((c) => storyFromIssue(linear, c, keys, externalIssues)));
+	const stories = await Promise.all(children.map((c) => storyFromIssue(linear, c, keys, externalIssues, manualLabels)));
 	const prd = parsePrdFromText(parent.description);
 	return { ...epicBase(parent, prd), kind: "children", stories, externalIssues };
 }
@@ -182,7 +191,7 @@ export async function loadEpic(linear: LinearGateway, issueId: string, opts: Loa
 
 	const children = await linear.getChildren(issue.id);
 	if (children.length > 0) {
-		return { epic: await loadChildrenEpic(linear, issue, children), materialized: 0 };
+		return { epic: await loadChildrenEpic(linear, issue, children, opts.manualLabels), materialized: 0 };
 	}
 
 	// A story delegated on its own: load its parent epic and focus on it.
@@ -192,7 +201,7 @@ export async function loadEpic(linear: LinearGateway, issueId: string, opts: Loa
 		const parentPrd = parsePrdFromText(parent.description);
 		const isRalphStory = parseStoryIssueBody(issue.description).hasRalphMetadata || parseStoryTitle(issue.title).storyId;
 		if (isRalphStory || parentPrd) {
-			return { epic: await loadChildrenEpic(linear, parent, siblings), focusStoryKey: issue.id, materialized: 0 };
+			return { epic: await loadChildrenEpic(linear, parent, siblings, opts.manualLabels), focusStoryKey: issue.id, materialized: 0 };
 		}
 	}
 
@@ -200,7 +209,7 @@ export async function loadEpic(linear: LinearGateway, issueId: string, opts: Loa
 	if (prd) {
 		if (opts.materializeStories) {
 			const created = await materializePrd(linear, issue, prd);
-			const epic = await loadChildrenEpic(linear, issue, await linear.getChildren(issue.id));
+			const epic = await loadChildrenEpic(linear, issue, await linear.getChildren(issue.id), opts.manualLabels);
 			return { epic, materialized: created.length };
 		}
 		return { epic: { ...epicBase(issue, prd), kind: "prd", stories: inMemoryStories(prd) }, materialized: 0 };

@@ -117,6 +117,7 @@ relation seen from either side, so it doesn't matter which issue you added the l
 | Story blocked by an **open issue outside the epic** | The story is held. Unblocked stories run first. If nothing else can run, the session is **parked** on that issue. |
 | **The epic issue itself** (or a plain delegated issue) blocked by an open issue | Nothing starts: no worktree is created and the issue's state isn't changed. The session is parked. A parent that lists its own child as a blocker is ignored. |
 | A story delegated on its own whose sibling prerequisite isn't done | Parked on that sibling. |
+| Story issue labelled **manual** (any label in `ralph.manualLabels`, default `["manual"]`, case-insensitive) | A step for a person. The agent never works it. Stories that depend on it are held as if blocked by an outside issue: other stories run first, then the session is parked on the manual story until someone moves it to Done or Canceled. |
 
 A parked session posts *"…blocked on **ENG-99**. I'll start automatically when it's done or
 canceled."* It wakes when any issue it waits on is completed, canceled or deleted. Every wake
@@ -127,7 +128,8 @@ triggers a wake:
 - **A fallback poll** every `blockerPollMinutes` (default 10), plus a check at startup. This covers
   webhooks missed during downtime.
 - **A reply of `start anyway`** (or "ignore the blockers"), which runs without waiting on outside
-  blockers. Story-to-story dependencies inside the epic still apply.
+  blockers or manual stories. Other story-to-story dependencies inside the epic still apply, and the
+  manual stories themselves are still left to a person.
 
 ## Ralph semantics kept from ralph-tui
 
