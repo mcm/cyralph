@@ -42,6 +42,11 @@ export class FakeLinear implements LinearGateway {
 	async getChildren(id: string) {
 		return [...this.issues.values()].filter((i) => i.parentId === id).map((i) => ({ ...i }));
 	}
+	/** issue id -> comments */
+	commentsByIssue = new Map<string, Array<{ body: string; author?: string }>>();
+	async getComments(id: string) {
+		return this.commentsByIssue.get(id) ?? [];
+	}
 	async getBlockers(id: string): Promise<Blocker[]> {
 		return (this.blocks.get(id) ?? []).map((b) => {
 			const i = this.find(b);

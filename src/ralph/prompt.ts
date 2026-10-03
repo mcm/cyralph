@@ -22,6 +22,8 @@ export interface PromptContext {
 	maxAttempts: number;
 	/** Extra instructions from repository config. */
 	appendInstruction?: string;
+	/** Markdown list of downloaded Linear attachments (see formatAttachments). */
+	attachments?: string;
 }
 
 export const DEFAULT_STORY_TEMPLATE = `You are working through a PRD epic from Linear, one user story per session.
@@ -60,6 +62,12 @@ Each session starts with a fresh context: the PRD, the progress log and the repo
 {{#if notes}}
 ### Notes
 {{notes}}
+
+{{/if}}
+{{#if attachments}}
+### Attachments
+Files attached in Linear (screenshots, mockups, documents). Open each one with the Read tool (it shows images) before you start, and treat them as part of the spec:
+{{attachments}}
 
 {{/if}}
 {{#if qualityGates}}
@@ -182,6 +190,7 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 		progressFile: ctx.progressFile,
 		currentDate: new Date().toISOString().slice(0, 10),
 		appendInstruction: ctx.appendInstruction,
+		attachments: ctx.attachments,
 	};
 	return renderTemplate(template, vars).trim();
 }
@@ -201,6 +210,8 @@ export interface RequestPromptContext {
 	prTerm?: string;
 	/** May an explicit request rewrite the epic branch's history? Default "when-asked". */
 	historyRewrite?: "when-asked" | "never";
+	/** Markdown list of downloaded Linear attachments. */
+	attachments?: string;
 }
 
 /**
@@ -225,6 +236,9 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		`- Progress log (learnings from earlier sessions): \`${ctx.progressFile}\``,
 		...(ctx.qualityGates.length ? [`- Quality gates: ${ctx.qualityGates.map((g) => `\`${g}\``).join(", ")}`] : []),
 		...(prd ? ["", "<prd-document>", prd.length > 6000 ? `${prd.slice(0, 6000)}\n…` : prd, "</prd-document>"] : []),
+		...(ctx.attachments
+			? ["", "## Attachments", "Files attached in Linear. Open the ones relevant to the request with the Read tool (it shows images):", ctx.attachments]
+			: []),
 		"",
 		"## Request from your team",
 		...ctx.requests.map((r) => `> ${r.trim().replace(/\n/g, "\n> ")}\n`),

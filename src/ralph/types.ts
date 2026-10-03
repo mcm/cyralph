@@ -22,6 +22,8 @@ export interface Story {
 	dependsOn: string[];
 	status: StoryStatus;
 	notes?: string;
+	/** The full Linear issue body (for finding uploaded files outside the Description section). */
+	sourceText?: string;
 	/** Present when the story is backed by a Linear issue. */
 	issueId?: string;
 	identifier?: string;

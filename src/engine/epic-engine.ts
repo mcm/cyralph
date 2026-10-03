@@ -14,6 +14,14 @@ import { type AgentRunner, requestSystemAppend } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
+import {
+	type AttachmentEntry,
+	type AttachmentFetcher,
+	type AttachmentSource,
+	attachmentsForStory,
+	collectAttachments,
+	formatAttachments,
+} from "../linear/attachments.js";
 import type { IssueSummary, LinearGateway, PlanStep } from "../linear/gateway.js";
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
@@ -30,6 +38,8 @@ export interface EngineDeps {
 	git: GitWorkspace;
 	shell: (command: string, cwd: string) => Promise<CommandResult>;
 	log: Logger;
+	/** Downloads Linear uploads (screenshots etc.) for prompts; omitted = attachments aren't fetched. */
+	attachments?: AttachmentFetcher;
 }
 
 export interface EngineRun {
@@ -40,6 +50,8 @@ export interface EngineRun {
 	persist: () => Promise<void>;
 	/** Reserve the worktree for this run; false if another live session is using it. */
 	claimWorktree?: (path: string) => boolean;
+	/** Linear uploads gathered for this run (set by the engine). */
+	attachments?: AttachmentEntry[];
 	/** Receives the live session's message injector while an agent session runs. */
 	setInjector?: (inject: ((text: string) => boolean) | undefined) => void;
 }
@@ -140,6 +152,7 @@ export class EpicEngine {
 
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
+		await this.gatherAttachments(ctx, epic);
 
 		if (rootBlockers.length > 0) {
 			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
@@ -263,6 +276,7 @@ export class EpicEngine {
 		if (typeof worktree !== "string") return worktree.status;
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
+		await this.gatherAttachments(ctx, epic);
 
 		const output = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
 		if (ctx.abortSignal.aborted) {
@@ -303,12 +317,13 @@ export class EpicEngine {
 				title: `${epic.identifier}: ${epic.title.replace(/"/g, "'")}`,
 			}),
 			prTerm: forge?.term,
+			attachments: formatAttachments(ctx.attachments ?? []),
 		});
 		const runOnce = (resume?: string) =>
 			runner.run({
 				prompt,
 				cwd: worktree,
-				additionalDirectories: [join(progressFile, "..")],
+				additionalDirectories: this.agentDirs(progressFile, epic),
 				model: repo.model ?? config.model,
 				fallbackModel: config.fallbackModel,
 				allowedTools: repo.allowedTools,
@@ -333,6 +348,52 @@ export class EpicEngine {
 		await ctx.persist();
 		if (result.isError) return `I ran into an error working on your request (${result.errorMessage ?? "unknown error"}).\n\n${tail(result.output, 2000)}`.trim();
 		return result.output.trim() || "Done.";
+	}
+
+	private attachmentsDir(epic: Epic): string {
+		return join(this.deps.config.stateDir, "attachments", epic.identifier);
+	}
+
+	/** Extra directories the agent may read: the progress log and downloaded attachments. */
+	private agentDirs(progressFile: string, epic: Epic): string[] {
+		return [join(progressFile, ".."), ...(this.deps.attachments ? [this.attachmentsDir(epic)] : [])];
+	}
+
+	/**
+	 * Download files uploaded to Linear (pasted screenshots, mockups, PDFs) referenced by the epic, its
+	 * stories, their comments, and the session thread, so prompts can point the agent at local copies.
+	 */
+	private async gatherAttachments(ctx: EngineRun, epic: Epic): Promise<void> {
+		const fetcher = this.deps.attachments;
+		if (!fetcher) return;
+		const { linear, log } = this.deps;
+		const { record, reporter } = ctx;
+		const sources: AttachmentSource[] = [{ label: `${epic.identifier} description`, text: epic.description }];
+		const comments = async (issueId: string) => linear.getComments(issueId).catch((e: unknown) => (log.warn(`comments for ${issueId}: ${String(e)}`), []));
+		for (const c of await comments(epic.issueId)) sources.push({ label: `comment on ${epic.identifier}${c.author ? ` by ${c.author}` : ""}`, text: c.body });
+		for (const s of epic.stories) {
+			if (!s.issueId || s.issueId === epic.issueId) continue;
+			sources.push({ label: s.storyId, text: s.sourceText ?? s.description, storyKey: s.key });
+			if (s.status === "completed" || s.status === "cancelled") continue;
+			for (const c of await comments(s.issueId)) sources.push({ label: `comment on ${s.storyId}${c.author ? ` by ${c.author}` : ""}`, text: c.body, storyKey: s.key });
+		}
+		for (const t of [...record.guidance, ...record.pendingRequests]) sources.push({ label: "Linear thread", text: t });
+
+		const entries = await collectAttachments({ sources, dir: this.attachmentsDir(epic), fetcher }).catch((e: unknown) => {
+			log.warn(`attachment download failed: ${String(e)}`);
+			return [] as AttachmentEntry[];
+		});
+		ctx.attachments = entries;
+		const failed = entries.filter((e) => !e.path);
+		if (failed.length > 0) {
+			await reporter.thought(
+				`I couldn't download ${failed.length} of ${entries.length} attachment(s) from Linear, so I can't see them:\n\n${failed
+					.map((e) => `- ${e.title ?? e.url} (${e.sources.join(", ")}): ${e.error}`)
+					.join("\n")}`,
+			);
+		} else if (entries.length > 0) {
+			log.info(`${epic.identifier}: ${entries.length} attachment(s) available`);
+		}
 	}
 
 	/** GitHub (`gh`) or GitLab (`glab`) for this repo's `origin`; undefined without a remote. */
@@ -410,6 +471,7 @@ export class EpicEngine {
 				attempt,
 				maxAttempts: max,
 				appendInstruction: repo.appendInstruction,
+				attachments: formatAttachments(attachmentsForStory(ctx.attachments ?? [], story.key)),
 			},
 			template,
 		);
@@ -417,7 +479,7 @@ export class EpicEngine {
 		const result = await runner.run({
 			prompt,
 			cwd: worktree,
-			additionalDirectories: [join(progressFile, "..")],
+			additionalDirectories: this.agentDirs(progressFile, epic),
 			model: repo.model ?? config.model,
 			fallbackModel: config.fallbackModel,
 			allowedTools: repo.allowedTools,

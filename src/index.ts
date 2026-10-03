@@ -16,3 +16,4 @@ export * from "./engine/session-manager.js";
 export * from "./engine/store.js";
 export * from "./engine/routing.js";
 export { createWebhookServer } from "./server.js";
+export * from "./linear/attachments.js";

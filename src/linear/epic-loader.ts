@@ -71,6 +71,7 @@ async function storyFromIssue(
 		issueId: issue.id,
 		identifier: issue.identifier,
 		url: issue.url,
+		sourceText: issue.description,
 	};
 }
 
@@ -160,6 +161,7 @@ function singleStoryEpic(issue: IssueSummary): Epic {
 				issueId: issue.id,
 				identifier: issue.identifier,
 				url: issue.url,
+				sourceText: issue.description,
 			},
 		],
 	};

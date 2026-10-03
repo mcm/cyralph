@@ -90,6 +90,22 @@ These follow Cyrus:
   `origin` doesn't have yet, and opens or links the PR. With no remote, stories are committed
   locally without push errors.
 
+## Images and other attachments
+
+Files uploaded to Linear (pasted screenshots, mockups, PDFs) are downloaded with cyralph's Linear
+token, as Cyrus does, into `<stateDir>/attachments/<EPIC-ID>/`, and listed in the prompt so the
+agent opens them with the Read tool, which shows images to Claude. They are collected from:
+
+- the epic's description and comments (shared with every story);
+- each story issue's body and comments (only in that story's prompt);
+- @mention and reply text in the session.
+
+Linear's expiring `?signature=` is stripped, and the plain upload URL is fetched with the token.
+Files are named after the title Linear stores with them (e.g. `pavilion_contact_sheet.png`), or
+get an extension from their content type. They are cached by URL across runs, with at most 20 new
+downloads per run. If a download fails, the session says so, and the prompt tells the agent not to
+guess what the file shows.
+
 ## Blocking / blocked-by
 
 Linear **blocks** relations decide what can run. "A blocks B" and "B is blocked by A" are the same

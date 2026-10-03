@@ -20,6 +20,7 @@ import { SessionStore, newRecord } from "./engine/store.js";
 import { CliGitWorkspace, runShell } from "./git/workspace.js";
 import { loadEpic } from "./linear/epic-loader.js";
 import { ConsoleSessionGateway, type LinearGateway, SdkLinearGateway } from "./linear/gateway.js";
+import { LinearUploadFetcher } from "./linear/attachments.js";
 import { authorizeUrl, exchangeCode, refreshToken } from "./linear/oauth.js";
 import { createLogger } from "./logger.js";
 import { parsePrdFromText } from "./ralph/prd.js";
@@ -60,7 +61,16 @@ function requireToken(config: Config): string {
 }
 
 function deps(config: Config, linear: LinearGateway): EngineDeps {
-	return { config, linear, runner: new ClaudeAgentRunner(), git: new CliGitWorkspace(), shell: runShell, log };
+	return {
+		config,
+		linear,
+		runner: new ClaudeAgentRunner(),
+		git: new CliGitWorkspace(),
+		shell: runShell,
+		log,
+		// Read lazily: the token is refreshed in place every 12h.
+		attachments: new LinearUploadFetcher(() => config.linear.accessToken),
+	};
 }
 
 async function cmdStart(configPath: string) {

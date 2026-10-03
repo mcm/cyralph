@@ -10,6 +10,7 @@ import { SessionStore } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
+import type { AttachmentFetcher } from "../src/linear/attachments.js";
 import { FakeLinear } from "./fakes.js";
 
 const sh = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -60,6 +61,17 @@ class TestGit extends CliGitWorkspace {
 	}
 }
 
+/** Serves fake PNGs for upload URLs; `fail` makes specific URLs return 401. */
+class FakeFetcher implements AttachmentFetcher {
+	calls: string[] = [];
+	fail = new Set<string>();
+	async download(url: string) {
+		this.calls.push(url);
+		if (this.fail.has(url)) return { ok: false, status: 401, contentType: "", error: "HTTP 401" };
+		return { ok: true, status: 200, contentType: "image/png", data: Buffer.from(`PNG:${url}`) };
+	}
+}
+
 /** Implements a story by writing `<storyId>.txt`; can be told to fail specific attempts. */
 class ScriptedRunner implements AgentRunner {
 	calls: RunRequest[] = [];
@@ -92,8 +104,9 @@ function setup(overrides: Record<string, unknown> = {}, repoOpts: { remote?: boo
 	const runner = new ScriptedRunner();
 	const git = new TestGit();
 	const store = new SessionStore(join(root, "sessions.json"));
-	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger }, store);
-	return { root, repo, origin, config, linear, runner, git, store, manager };
+	const fetcher = new FakeFetcher();
+	const manager = new SessionManager({ config, linear, runner, git, shell: runShell, log: silentLogger, attachments: fetcher }, store);
+	return { root, repo, origin, config, linear, runner, git, store, manager, fetcher };
 }
 
 function ralphEpic(linear: FakeLinear) {
@@ -732,6 +745,69 @@ describe("history rewrites on request (rebase)", () => {
 		await t.manager.idle();
 		expect(t.runner.calls.every((c) => c.systemAppend === undefined)).toBe(true); // story runs use RALPH_SYSTEM_APPEND
 		expect(t.runner.calls[0]?.prompt).toContain("Do NOT create git commits or push");
+	});
+});
+
+describe("Linear attachments (images in issues)", () => {
+	const UP = "https://uploads.linear.app/9aa27def/d172798b";
+	/** SCHEM-32's description, as Linear returns it: an image-only body with a signed src. */
+	const schem32 = `\n<linear-image>{"type":"image","attrs":{"src":"${UP}/365d683b?signature=eyJhbGciOi.abc.def","title":"pavilion_contact_sheet.png","width":1440,"height":1894}}</linear-image>`;
+
+	it("downloads an image-only issue's upload (signature stripped) and points the agent at it", async () => {
+		const t = setup();
+		const issue = t.linear.add({ title: "Static renders from multiple angles", identifier: "SCHEM-32", description: schem32 });
+		await t.manager.handle({ kind: "created", sessionId: "a-1", issueId: issue.id });
+		await t.manager.idle();
+		expect(t.fetcher.calls).toEqual([`${UP}/365d683b`]);
+		const file = join(t.config.stateDir, "attachments", "SCHEM-32", "pavilion_contact_sheet.png");
+		expect(readFileSync(file, "utf8")).toBe(`PNG:${UP}/365d683b`);
+		const prompt = t.runner.calls[0]?.prompt ?? "";
+		expect(prompt).toContain("### Attachments");
+		expect(prompt).toContain(`- **pavilion_contact_sheet.png** (from SCHEM-32 description): \`${file}\``);
+		expect(prompt).toContain("Open each one with the Read tool");
+		expect(t.runner.calls[0]?.additionalDirectories).toContain(join(t.config.stateDir, "attachments", "SCHEM-32"));
+
+		// A later run reuses the cached file instead of downloading again.
+		await t.manager.handle({ kind: "created", sessionId: "a-2", issueId: issue.id });
+		await t.manager.idle();
+		expect(t.fetcher.calls).toHaveLength(1);
+	});
+
+	it("scopes story images to their story, shares epic/thread images, and reads comments", async () => {
+		const t = setup();
+		const { epic, s2 } = ralphEpic(t.linear);
+		t.linear.issues.get(epic.id)!.description = `PRD overview\n\n![architecture.png](${UP}/arch)`;
+		t.linear.issues.get(s2.id)!.description += `\n\n![badge mockup](${UP}/badge?signature=x)`;
+		t.linear.commentsByIssue.set(epic.id, [{ body: `Colour reference: ${UP}/palette`, author: "Ana" }]);
+		await t.manager.handle({ kind: "created", sessionId: "a-3", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await t.manager.idle();
+		const byStory = (id: string) => t.runner.calls.find((c) => c.prompt.includes(`## Your Task: ${id}`))?.prompt ?? "";
+		for (const id of ["US-001", "US-002", "US-003"]) {
+			expect(byStory(id)).toContain("architecture.png");
+			expect(byStory(id)).toContain("(from comment on ENG-1 by Ana)");
+		}
+		expect(byStory("US-002")).toContain("**badge mockup** (from US-002)");
+		expect(byStory("US-002")).toContain("badge mockup.png");
+		expect(byStory("US-001")).not.toContain("badge mockup");
+		expect(byStory("US-003")).not.toContain("badge mockup");
+	});
+
+	it("includes images from an @mention and reports failed downloads instead of guessing", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		t.fetcher.fail.add(`${UP}/broken`);
+		await t.manager.handle({
+			kind: "created",
+			sessionId: "a-4",
+			issueId: epic.id,
+			commentBody: `@cyralph does this screenshot match? ![screenshot.png](${UP}/shot) ![old.png](${UP}/broken)`,
+		});
+		await t.manager.idle();
+		const req = t.runner.calls.find((c) => c.prompt.includes("## Request from your team"))?.prompt ?? "";
+		expect(req).toContain("## Attachments");
+		expect(req).toContain("**screenshot.png** (from Linear thread)");
+		expect(req).toContain("**old.png** (from Linear thread): could not be downloaded (HTTP 401). Don't guess");
+		expect(t.linear.bodies("thought").some((b) => b.includes("I couldn't download 1 of 2 attachment(s)") && b.includes("old.png"))).toBe(true);
 	});
 });
 

@@ -21,6 +21,12 @@ export interface IssueSummary {
 	assigneeId?: string;
 }
 
+export interface IssueComment {
+	body: string;
+	author?: string;
+	createdAt?: string;
+}
+
 export interface Blocker {
 	id: string;
 	identifier: string;
@@ -49,6 +55,8 @@ export interface PlanStep {
 export interface LinearGateway {
 	getIssue(idOrIdentifier: string): Promise<IssueSummary>;
 	getChildren(issueId: string): Promise<IssueSummary[]>;
+	/** Comments on an issue (oldest first), for context such as uploaded screenshots. */
+	getComments(issueId: string): Promise<IssueComment[]>;
 	/** Issues that block the given issue ("X blocks this"). */
 	getBlockers(issueId: string): Promise<Blocker[]>;
 	createIssue(input: {
@@ -118,6 +126,17 @@ export class SdkLinearGateway implements LinearGateway {
 		while (conn.pageInfo.hasNextPage) await conn.fetchNext();
 		const unique = [...new Map(conn.nodes.map((n) => [n.id, n])).values()];
 		return Promise.all(unique.map((n) => this.summarize(n)));
+	}
+
+	async getComments(issueId: string): Promise<IssueComment[]> {
+		const issue = await this.client.issue(issueId);
+		const conn = await issue.comments({ first: 100 });
+		const out: IssueComment[] = [];
+		for (const c of conn.nodes) {
+			const user = await c.user;
+			out.push({ body: c.body, author: user?.name, createdAt: c.createdAt.toISOString() });
+		}
+		return out.sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""));
 	}
 
 	async getBlockers(issueId: string): Promise<Blocker[]> {
@@ -222,6 +241,7 @@ export class ConsoleSessionGateway implements LinearGateway {
 	getIssue = (id: string) => this.inner.getIssue(id);
 	getChildren = (id: string) => this.inner.getChildren(id);
 	getBlockers = (id: string) => this.inner.getBlockers(id);
+	getComments = (id: string) => this.inner.getComments(id);
 	createIssue = (input: Parameters<LinearGateway["createIssue"]>[0]) => this.inner.createIssue(input);
 	createBlocksRelation = (a: string, b: string) => this.inner.createBlocksRelation(a, b);
 	setIssueState = (id: string, t: { type?: string; name?: string }) => this.inner.setIssueState(id, t);
