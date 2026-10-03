@@ -14,6 +14,7 @@ import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
 import { EpicEngine } from "./epic-engine.js";
+import { asksForPushOrPullRequest } from "../ralph/prompt.js";
 import { matchSelection, selectionValue } from "./routing.js";
 import { PARKED, type SessionRecord, type SessionStore, newRecord } from "./store.js";
 
@@ -445,7 +446,8 @@ export class SessionManager {
 			record.handledCiShas ??= previous.handledCiShas;
 			record.ciFixRounds ??= previous.ciFixRounds;
 			record.guidance = [...previous.guidance];
-			record.completedKeys = [...previous.completedKeys];
+			// A re-delegated plain issue is new work, so its own earlier completion doesn't carry over.
+			record.completedKeys = previous.completedKeys.filter((k) => k !== event.issueId);
 		}
 		const isMention = !!event.commentBody?.trim() && !event.commentBody.includes(AGENT_SESSION_MARKER);
 		if (isMention) {
@@ -513,15 +515,18 @@ export class SessionManager {
 			record.ignoreBlockers = true;
 			record.waitingOn = [];
 		} else if (text) {
+			// "Push" / "open the MR" is orchestrator work, not story guidance: a story agent may not push, so
+			// it would only refuse. Keep it as a direct request, run once the stories are done.
+			const orchestratorWork = record.mode === "epic" && asksForPushOrPullRequest(text);
 			// Running: deliver into the live agent session, as Cyrus streams follow-ups.
-			const inject = this.injectors.get(record.sessionId);
+			const inject = orchestratorWork ? undefined : this.injectors.get(record.sessionId);
 			if (inject?.(text)) {
 				if (record.mode === "epic") record.guidance.push(text); // later stories should know too
 				await this.store.save(record);
 				await reporter.thought("Passed this to the agent that's working right now.");
 				return;
 			}
-			if (record.mode === "epic") record.guidance.push(text);
+			if (record.mode === "epic" && !orchestratorWork) record.guidance.push(text);
 			record.pendingRequests.push(text);
 		}
 		if (wantsLoop && record.mode === "request") {
@@ -616,6 +621,7 @@ export class SessionManager {
 		const reporter = this.reporter(record.sessionId);
 		record.status = "running";
 		this.busyIssues.set(record.issueId, record.sessionId);
+		const pendingAtStart = new Set(record.pendingRequests);
 		const done = (async () => {
 			try {
 				await this.store.save(record);
@@ -648,6 +654,10 @@ export class SessionManager {
 				this.toldQueued.delete(record.sessionId);
 				this.injectors.delete(record.sessionId);
 				for (const [path, owner] of this.busyWorktrees) if (owner === record.sessionId) this.busyWorktrees.delete(path);
+				// Requests that arrived after this run's request step ("I'll handle this as soon as the current
+				// step finishes") get a run of their own instead of waiting for the next message.
+				const arrived = record.pendingRequests.some((r) => !pendingAtStart.has(r));
+				if (arrived && !abort.signal.aborted && record.status !== "failed" && record.status !== "stopped") this.enqueue(record);
 				this.pump();
 			}
 		})();
