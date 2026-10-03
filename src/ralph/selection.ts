@@ -11,7 +11,8 @@ export function isStoryDone(story: Story): boolean {
 }
 
 export function isStoryReady(story: Story, stories: Story[]): boolean {
-	if (isStoryDone(story)) return false;
+	// Manual stories are done by a person, never selected for the agent.
+	if (isStoryDone(story) || story.manual) return false;
 	const byKey = new Map(stories.map((s) => [s.key, s]));
 	return story.dependsOn.every((dep) => {
 		const s = byKey.get(dep);

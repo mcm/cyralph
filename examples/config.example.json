@@ -14,6 +14,7 @@
     "maxAttemptsPerStory": 3,
     "maxIterationsPerRun": 50,
     "materializeStories": true,
+    "manualLabels": ["manual"],
     "pushPerStory": true,
     "createPullRequest": true,
     "markPrReadyWhenComplete": true,

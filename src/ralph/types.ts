@@ -22,6 +22,8 @@ export interface Story {
 	dependsOn: string[];
 	status: StoryStatus;
 	notes?: string;
+	/** A manual step done by a person (labelled with `ralph.manualLabels`): never given to the agent. */
+	manual?: boolean;
 	/** The full Linear issue body (for finding uploaded files outside the Description section). */
 	sourceText?: string;
 	/** Present when the story is backed by a Linear issue. */

@@ -157,7 +157,8 @@ export function formatStoryList(epic: Epic, current?: Story): string {
 			const deps = s.dependsOn.map((d) => dependencyLabel(epic, d));
 			const depText = deps.length ? ` (depends on ${deps.join(", ")})` : "";
 			const here = current?.key === s.key ? "  <- current" : "";
-			return `- ${STATUS_MARK[s.status]} ${s.storyId}: ${s.title}${depText}${here}`;
+			const manual = s.manual ? " (manual step for a person, not for you)" : "";
+			return `- ${STATUS_MARK[s.status]} ${s.storyId}: ${s.title}${manual}${depText}${here}`;
 		})
 		.join("\n");
 }

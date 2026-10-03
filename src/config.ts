@@ -97,6 +97,11 @@ export const RalphConfigSchema = z.object({
 	 * agent merges instead and explains. The base branch and other branches are never force-pushed.
 	 */
 	historyRewrite: z.enum(["when-asked", "never"]).default("when-asked"),
+	/**
+	 * Story issues carrying any of these labels (case-insensitive) are manual steps for a person: cyralph
+	 * never works them, and stories that depend on them wait until they are done, like an outside blocker.
+	 */
+	manualLabels: z.array(z.string()).default(["manual"]),
 	/** Workflow state type to move the epic issue to when every story is complete (null = leave it). */
 	epicCompletedStateType: z.enum(["started", "completed"]).nullable().default(null),
 	/** Name of a specific workflow state for the epic on completion (e.g. "In Review"); overrides the type. */

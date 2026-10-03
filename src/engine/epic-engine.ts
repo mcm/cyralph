@@ -75,7 +75,7 @@ function quote(text: string): string {
 
 export function planFor(epic: Epic, current?: Story, exhausted: ReadonlySet<string> = new Set()): PlanStep[] {
 	return epic.stories.map((s) => ({
-		content: `${s.storyId}: ${s.title}`,
+		content: `${s.storyId}: ${s.title}${s.manual ? " (manual)" : ""}`,
 		status:
 			s.status === "completed"
 				? "completed"
@@ -118,7 +118,7 @@ export class EpicEngine {
 		try {
 			// A mention only reads the epic for context; it never creates story issues.
 			const materializeStories = record.mode === "epic" && config.ralph.materializeStories;
-			loaded = await loadEpic(linear, record.issueId, { materializeStories });
+			loaded = await loadEpic(linear, record.issueId, { materializeStories, manualLabels: config.ralph.manualLabels });
 		} catch (err) {
 			await reporter.error(`Could not load the issue from Linear: ${String(err)}`);
 			return "failed";
@@ -132,8 +132,9 @@ export class EpicEngine {
 
 		let rootBlockers: Array<{ id: string; identifier: string }> = [];
 		if (record.ignoreBlockers) {
-			// A human said to go ahead: outside blockers no longer gate any story.
-			for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d));
+			// A human said to go ahead: outside blockers and manual steps no longer gate any story.
+			const manual = new Set(epic.stories.filter((s) => s.manual).map((s) => s.key));
+			for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d) && !manual.has(d));
 		} else {
 			// Blocked-by on the epic (or plain issue) itself gates the story work, as in Cyrus.
 			rootBlockers = await openRootBlockers(linear, epic);
@@ -434,6 +435,12 @@ export class EpicEngine {
 			const s = epic.stories.find((x) => x.key === loaded.focusStoryKey);
 			lines.push(`This issue is one story of the epic, so I'll only work on ${s?.storyId ?? "it"}.`);
 		}
+		const manual = epic.stories.filter((s) => s.manual && !isStoryDone(s));
+		if (manual.length) {
+			lines.push(
+				`${manual.map((s) => `**${s.storyId}**`).join(", ")} ${manual.length === 1 ? "is a manual step" : "are manual steps"} for a person: I won't work ${manual.length === 1 ? "it" : "them"}, and stories that depend on ${manual.length === 1 ? "it" : "them"} wait until ${manual.length === 1 ? "it's" : "they're"} done.`,
+			);
+		}
 		if (epic.qualityGates.length) lines.push(`Quality gates: ${epic.qualityGates.map((g) => `\`${g}\``).join(", ")}`);
 		return lines.join("\n\n");
 	}
@@ -681,12 +688,17 @@ export class EpicEngine {
 			const s = byKey.get(d);
 			return !s || !isStoryDone(s);
 		};
-		// Outside issues that hold up the remaining in-scope stories (directly or via another story).
+		// Outside issues and manual steps that hold up the remaining in-scope stories (directly or via another story).
 		const waitingOn = new Map<string, string>();
+		const waitForManual = (s: Story | undefined) => {
+			if (s?.manual && s.issueId && !isStoryDone(s)) waitingOn.set(s.issueId, s.identifier ?? s.storyId);
+		};
 		for (const s of scoped.filter((x) => !isStoryDone(x))) {
+			waitForManual(s);
 			for (const d of s.dependsOn) {
 				const ext = externalIdOf(d);
 				if (ext) waitingOn.set(ext, dependencyLabel(epic, d));
+				waitForManual(byKey.get(d));
 			}
 		}
 		const blockerChain = (s: Story, seen = new Set<string>()): void => {
@@ -697,6 +709,7 @@ export class EpicEngine {
 				for (const dd of dep.dependsOn) {
 					const ext = externalIdOf(dd);
 					if (ext) waitingOn.set(ext, dependencyLabel(epic, dd));
+					waitForManual(byKey.get(dd));
 				}
 				blockerChain(dep, seen);
 			}

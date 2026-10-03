@@ -34,6 +34,15 @@ describe("selectNextStory", () => {
 		expect(selectNextStory([story("A", { dependsOn: ["external:ENG-9"] })])).toBeUndefined();
 	});
 
+	it("never selects manual stories, and their dependents wait for them", () => {
+		const stories = [story("US-001", { priority: 1, manual: true }), story("US-002", { priority: 1, dependsOn: ["US-001"] }), story("US-003", { priority: 5 })];
+		expect(selectNextStory(stories)?.key).toBe("US-003");
+		stories[2]!.status = "completed";
+		expect(selectNextStory(stories)).toBeUndefined();
+		stories[0]!.status = "completed";
+		expect(selectNextStory(stories)?.key).toBe("US-002");
+	});
+
 	it("orders story ids naturally", () => {
 		expect(selectNextStory([story("US-010"), story("US-002")])?.key).toBe("US-002");
 	});
