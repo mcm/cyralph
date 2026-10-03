@@ -85,10 +85,16 @@ export const RalphConfigSchema = z.object({
 	materializeStories: z.boolean().default(true),
 	/** Commit after each completed story. */
 	commitPerStory: z.boolean().default(true),
-	/** Push after each completed story (and open a draft PR after the first push). */
+	/** Push after each completed story. */
 	pushPerStory: z.boolean().default(true),
 	/** Open a PR/MR with the forge CLI (`gh` for GitHub, `glab` for GitLab). */
 	createPullRequest: z.boolean().default(true),
+	/**
+	 * Open the PR/MR as a draft after the first story is pushed instead of once every story of the epic is
+	 * complete. Off by default: each PR/MR update can trigger CI, which is wasted on a half-finished epic.
+	 * An existing PR/MR (e.g. one opened by a direct request) is kept up to date either way.
+	 */
+	openPullRequestEarly: z.boolean().default(false),
 	/** Mark the PR ready for review once every story is complete. */
 	markPrReadyWhenComplete: z.boolean().default(true),
 	/**

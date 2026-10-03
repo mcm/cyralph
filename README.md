@@ -7,7 +7,8 @@ You delegate a Linear issue to it, the same way you would with Cyrus. If the iss
 cyralph runs the **Ralph loop** on it. It picks the next ready user story and gives it to a fresh
 Claude session. It verifies the result and commits it, marks the story's Linear issue Done, and moves
 on until the epic is finished. Progress streams into the Linear agent session. The session plan shows
-the story checklist, and a draft PR grows one commit per story.
+the story checklist, and the epic branch grows one commit per story. The PR is opened once the whole
+epic is complete, so CI doesn't run for every half-finished story.
 
 ```
 Linear: delegate ENG-1 "Task Priority System" to @cyralph
@@ -18,9 +19,9 @@ Linear: delegate ENG-1 "Task Priority System" to @cyralph
             next ready story (in-progress first → priority → story id; deps done)
             → fresh Claude Agent SDK session with PRD + progress log + one story
             → final message ends with <promise>COMPLETE</promise>?  → run verifyCommands
-            → commit "feat(US-002): …" → push → draft PR → child issue ► Done
+            → commit "feat(US-002): …" → push → child issue ► Done
             → otherwise retry with the failure fed back (max N attempts, then set aside)
-       └─ all done → PR ready for review → response in the session
+       └─ all done → open PR (ready for review) → response in the session
           stuck    → elicitation in the session; your reply becomes guidance and resumes the loop
 ```
 
@@ -165,6 +166,12 @@ repository with the matching CLI:
 | --- | --- | --- | --- |
 | `github.com` (or anything not GitLab) | GitHub | `gh` | draft pull request |
 | `gitlab.com`, a host in `gitlabHosts`, or a host with `gitlab` in its name (e.g. `gitlab.corp.com`) | GitLab | `glab` | draft merge request |
+
+The PR/MR is opened only when every story of the epic is complete (and marked ready right away when
+`ralph.markPrReadyWhenComplete` is on). Stories are still pushed as they finish, but no PR/MR exists
+yet to trigger CI on each push. Delegating one story of an unfinished epic pushes it without opening a
+PR/MR. A PR/MR that already exists, such as one a direct request opened, is updated after every story.
+Set `ralph.openPullRequestEarly: true` to get the old behaviour: a draft opens after the first pushed story.
 
 For a **self-hosted GitLab** whose hostname doesn't contain "gitlab", list it in the top-level
 `gitlabHosts`, or set `"forge": "gitlab"` on the repository:
