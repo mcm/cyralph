@@ -5,6 +5,7 @@
  * - `prompted` : "stop" aborts the run; anything else is guidance. While running it is picked up by the
  *                next story iteration; when paused it resets exhausted stories and resumes the loop.
  */
+import { join, resolve, sep } from "node:path";
 import { ActivityReporter } from "../agent/activity.js";
 import type { RepositoryConfig } from "../config.js";
 import { type ChangeRequestRef, type CiStatus, buildCiFailureRequest, parseChangeRequestUrl } from "../git/ci.js";
@@ -78,13 +79,17 @@ export class SessionManager {
 		if (event.kind === "created") return this.onCreated(event);
 		if (event.kind === "prompted") return this.onPrompted(event);
 		if (event.kind === "issue_state") {
-			if (this.store.waitingOnIssue(event.issueId).length === 0) return;
+			const waiters = this.store.waitingOnIssue(event.issueId).length > 0;
+			const merging = this.mergeCandidates(event.issueId).length > 0;
+			if (!waiters && !merging) return;
 			// Issue webhooks don't always carry the state type; ask Linear when missing.
 			let stateType = event.stateType;
 			if (!event.removed && !stateType) stateType = (await this.deps.linear.getIssue(event.issueId)).stateType;
-			if (event.removed || (stateType && RESOLVED_STATE_TYPES.has(stateType))) {
+			if (waiters && (event.removed || (stateType && RESOLVED_STATE_TYPES.has(stateType)))) {
 				await this.onIssueResolved(event.issueId, event.removed ? "was deleted" : stateType === "canceled" ? "was canceled" : "is done");
 			}
+			// Done after its PR/MR merged: the worktree and branch aren't needed anymore.
+			if (merging && stateType === "completed") await this.cleanupMerged(event.issueId);
 		}
 	}
 
@@ -122,6 +127,83 @@ export class SessionManager {
 		}
 	}
 
+	/**
+	 * Newest session per PR/MR whose worktree is still on disk and whose PR/MR may have been merged
+	 * (PRs/MRs known to be closed without merging are left alone).
+	 */
+	private mergeCandidates(issueId?: string): SessionRecord[] {
+		const latest = new Map<string, SessionRecord>();
+		for (const r of this.store.all()) {
+			if (!r.prUrl || (issueId && r.issueId !== issueId)) continue;
+			const seen = latest.get(r.prUrl);
+			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
+		}
+		return [...latest.values()].filter((r) => {
+			const repo = this.deps.config.repositories.find((x) => x.id === r.repoId);
+			return r.worktreePath && r.branch && r.prMerged !== false && repo && repo.cleanupMergedWorktrees !== false;
+		});
+	}
+
+	/**
+	 * Remove the worktree and local branch of each epic whose PR/MR was merged (for one issue, or all).
+	 * Runs when the issue is marked done, when a PR/MR is seen closed, and periodically as a fallback.
+	 * Work in progress is never lost: a busy session is checked again later, and a worktree with
+	 * uncommitted changes or unmerged commits is kept.
+	 */
+	async cleanupMerged(issueId?: string): Promise<void> {
+		const { ci, config, git, log } = this.deps;
+		if (!ci) return;
+		for (const record of this.mergeCandidates(issueId)) {
+			const ref = parseChangeRequestUrl(record.prUrl);
+			const repo = config.repositories.find((x) => x.id === record.repoId);
+			const path = record.worktreePath;
+			const branch = record.branch;
+			if (!ref || !repo || !path || !branch) continue;
+			// Work on the issue may still use the worktree; check again on a later pass.
+			const sessions = this.store.all().filter((r) => r.issueId === record.issueId || r.worktreePath === path);
+			if (sessions.some((r) => this.active.has(r.sessionId) || this.queue.includes(r.sessionId) || this.busyIssues.has(r.issueId))) continue;
+			if ([...this.busyWorktrees.keys()].includes(path)) continue;
+			try {
+				const state = await ci.state(ref);
+				if (!state || state.open) continue;
+				record.prClosed = true;
+				record.prMerged = state.merged;
+				await this.store.save(record);
+				if (!state.merged) continue;
+				const term = ref.forge === "gitlab" ? "merge request" : "pull request";
+				// Only worktrees cyralph made: one the branch was already checked out in belongs to someone else.
+				const baseDir = resolve(repo.workspaceBaseDir ?? join(config.stateDir, "worktrees", repo.id));
+				const owned = resolve(path).startsWith(`${baseDir}${sep}`);
+				if (!owned || branch === repo.baseBranch) {
+					log.info(`not cleaning up ${path} (${branch}) after ${ref.url} merged: cyralph didn't create it`);
+					await this.forgetWorktree(path);
+					continue;
+				}
+				const kept = await git.removeWorkspace({ repositoryPath: repo.repositoryPath, path, branch, mergedSha: state.headSha });
+				const reporter = this.reporter(record.sessionId);
+				if (kept) {
+					log.warn(`kept ${path} after ${ref.url} merged: ${kept}`);
+					await reporter.thought(`The ${term} ${ref.url} was merged, but I kept the worktree \`${path}\` and the branch \`${branch}\`: ${kept}.`);
+				} else {
+					log.info(`removed ${path} and branch ${branch}: ${ref.url} was merged`);
+					await reporter.thought(`The ${term} ${ref.url} was merged, so I removed its worktree and the local branch \`${branch}\`.`);
+				}
+				await this.forgetWorktree(path);
+			} catch (err) {
+				log.warn(`cleanup after ${ref.url} merged failed: ${String(err)}`);
+			}
+		}
+	}
+
+	/** Stop tracking a worktree that was removed (or isn't cyralph's to remove). */
+	private async forgetWorktree(path: string): Promise<void> {
+		for (const r of this.store.all()) {
+			if (r.worktreePath !== path) continue;
+			r.worktreePath = undefined;
+			await this.store.save(r);
+		}
+	}
+
 	/** A review was submitted on a GitHub pull request (from the webhook or from polling). */
 	handleReview(event: ReviewSubmitted): Promise<void> {
 		const p = this.onReview(event).finally(() => this.handling.delete(p));
@@ -142,6 +224,7 @@ export class SessionManager {
 		if (!event.prOpen) {
 			record.prClosed = true;
 			await this.store.save(record);
+			await this.cleanupMerged(record.issueId);
 			return;
 		}
 		if (record.status === "stopped") return log.info(`ignoring ${where}: session ${record.identifier ?? record.sessionId} was stopped`);
@@ -213,6 +296,7 @@ export class SessionManager {
 				if (!state.open) {
 					record.prClosed = true;
 					await this.store.save(record);
+					await this.cleanupMerged(record.issueId);
 					continue;
 				}
 				const fresh = (await github.reviews(pr.repo, pr.number))
@@ -263,6 +347,7 @@ export class SessionManager {
 				if (!status.open) {
 					record.prClosed = true;
 					await this.store.save(record);
+					await this.cleanupMerged(record.issueId);
 					continue;
 				}
 				if (status.state !== "failed" || this.ciHandled(prUrl, status.headSha)) continue;

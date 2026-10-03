@@ -27,6 +27,13 @@ export interface CiFailedJob {
 	noLog?: boolean;
 }
 
+/** Whether a PR/MR is still open, and whether it was merged (at `headSha`). */
+export interface ChangeRequestState {
+	open: boolean;
+	merged: boolean;
+	headSha: string;
+}
+
 export interface CiStatus {
 	open: boolean;
 	headSha: string;
@@ -41,6 +48,8 @@ export interface CiClient {
 	status(ref: ChangeRequestRef): Promise<CiStatus | undefined>;
 	/** Log of a failed job (plain text, may be long). */
 	jobLog(ref: ChangeRequestRef, job: CiFailedJob): Promise<string>;
+	/** Open/merged state of the PR/MR, without its CI; undefined when it can't be read. */
+	state(ref: ChangeRequestRef): Promise<ChangeRequestState | undefined>;
 }
 
 /** GitHub `.../owner/name/pull/7` or GitLab `.../group/project/-/merge_requests/7`. */
@@ -100,6 +109,17 @@ export class CliCiClient implements CiClient {
 
 	async status(ref: ChangeRequestRef): Promise<CiStatus | undefined> {
 		return ref.forge === "gitlab" ? this.gitlabStatus(ref) : this.githubStatus(ref);
+	}
+
+	async state(ref: ChangeRequestRef): Promise<ChangeRequestState | undefined> {
+		if (ref.forge === "gitlab") {
+			const mr = obj(await this.cli(ref, ["api", `projects/${encodeURIComponent(ref.project)}/merge_requests/${ref.number}`]));
+			const headSha = str(mr.sha);
+			return headSha ? { open: mr.state === "opened", merged: mr.state === "merged", headSha } : undefined;
+		}
+		const pr = obj(await this.cli(ref, ["api", `repos/${ref.project}/pulls/${ref.number}`]));
+		const headSha = str(obj(pr.head).sha);
+		return headSha ? { open: pr.state === "open", merged: pr.merged === true || !!str(pr.merged_at), headSha } : undefined;
 	}
 
 	async jobLog(ref: ChangeRequestRef, job: CiFailedJob): Promise<string> {

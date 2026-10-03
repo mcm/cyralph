@@ -91,6 +91,12 @@ export interface GitWorkspace {
 	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
 	stashAll(cwd: string, message: string): Promise<boolean>;
 	push(cwd: string, branch: string): Promise<void>;
+	/**
+	 * Remove a worktree and its local branch once their work was merged. Nothing is removed while the
+	 * worktree has uncommitted changes or the branch has commits `mergedSha` doesn't contain; the
+	 * reason is returned instead.
+	 */
+	removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string }): Promise<string | undefined>;
 	/** The PR/MR host for this worktree's `origin` (undefined when there is no remote). */
 	forge(cwd: string, opts?: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string }): Promise<Forge | undefined>;
 }
@@ -162,6 +168,33 @@ export class CliGitWorkspace implements GitWorkspace {
 
 	async push(cwd: string, branch: string): Promise<void> {
 		await gitOrThrow(["push", "-u", "origin", branch], cwd);
+	}
+
+	async removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string }): Promise<string | undefined> {
+		const repo = opts.repositoryPath;
+		const hasWorktree = existsSync(join(opts.path, ".git"));
+		const tip = await git(["rev-parse", "--verify", "--quiet", `refs/heads/${opts.branch}`], repo);
+		if (!hasWorktree && tip.code !== 0) return undefined;
+		if (hasWorktree) {
+			const status = await git(["status", "--porcelain"], opts.path);
+			if (status.code !== 0) return `\`git status\` failed in ${opts.path}: ${status.stderr.trim()}`;
+			if (status.stdout.trim()) return "the worktree has uncommitted changes";
+		}
+		const heads = [hasWorktree ? (await git(["rev-parse", "HEAD"], opts.path)).stdout.trim() : "", tip.code === 0 ? tip.stdout.trim() : ""].filter(Boolean);
+		if (opts.mergedSha) {
+			const merged = opts.mergedSha;
+			// The merged head may only be on the remote (e.g. pushed by someone else).
+			if ((await git(["cat-file", "-e", `${merged}^{commit}`], repo)).code !== 0) await git(["fetch", "origin"], repo);
+			for (const head of heads) {
+				if (head !== merged && (await git(["merge-base", "--is-ancestor", head, merged], repo)).code !== 0) {
+					return `\`${opts.branch}\` has commits that weren't merged`;
+				}
+			}
+		}
+		if (hasWorktree) await gitOrThrow(["worktree", "remove", "--force", opts.path], repo);
+		await git(["worktree", "prune"], repo);
+		if (tip.code === 0) await gitOrThrow(["branch", "-D", opts.branch], repo);
+		return undefined;
 	}
 
 	async forge(cwd: string, opts: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string } = {}): Promise<Forge | undefined> {

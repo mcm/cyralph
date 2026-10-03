@@ -34,6 +34,8 @@ export interface SessionRecord {
 	prNumber?: number;
 	/** The PR was seen closed or merged; it is no longer polled for reviews. */
 	prClosed?: boolean;
+	/** Whether the closed PR was merged (false: closed without merging); set when cyralph checked. */
+	prMerged?: boolean;
 	/** GitHub review ids already seen (acted on, skipped as stale, or over the round limit). */
 	handledReviewIds?: number[];
 	/** Automated reviews acted on for this PR (capped by `github.maxReviewRounds`). */
