@@ -38,6 +38,10 @@ export interface SessionRecord {
 	handledReviewIds?: number[];
 	/** Automated reviews acted on for this PR (capped by `github.maxReviewRounds`). */
 	reviewRounds?: number;
+	/** PR/MR head commits whose failed CI was seen (acted on, or over the round limit). */
+	handledCiShas?: string[];
+	/** Failed CI pipelines acted on for this PR/MR (capped by `ci.maxFixRounds`). */
+	ciFixRounds?: number;
 	/** Iterations spent per story key. */
 	attempts: Record<string, number>;
 	/** Why the last attempt of a story failed, fed into the next attempt. */

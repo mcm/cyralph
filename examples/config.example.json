@@ -28,6 +28,10 @@
   "github": {
     "reviewBots": ["cubic-dev-ai[bot]"]
   },
+  "ci": {
+    "pollMinutes": 5,
+    "maxFixRounds": 3
+  },
   "repositories": [
     {
       "id": "app",

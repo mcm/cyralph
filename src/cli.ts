@@ -18,6 +18,7 @@ import { type Config, defaultConfigPath, loadConfig, saveLinearCredentials } fro
 import { EpicEngine, type EngineDeps } from "./engine/epic-engine.js";
 import { SessionManager } from "./engine/session-manager.js";
 import { SessionStore, newRecord } from "./engine/store.js";
+import { CliCiClient } from "./git/ci.js";
 import { CliGitWorkspace, run, runShell } from "./git/workspace.js";
 import { GhReviewClient } from "./github/reviews.js";
 import { loadEpic } from "./linear/epic-loader.js";
@@ -76,6 +77,7 @@ function deps(config: Config, linear: LinearGateway): EngineDeps {
 		// Read lazily: the token is refreshed in place every 12h.
 		attachments: new LinearUploadFetcher(() => config.linear.accessToken),
 		github: new GhReviewClient(),
+		ci: new CliCiClient(),
 	};
 }
 
@@ -108,6 +110,11 @@ async function cmdStart(configPath: string, args: string[]) {
 	const pollForReviews = !githubWebhookSecret && config.repositories.some((r) => r.respondToReviews !== false);
 	if (pollForReviews) void pollReviews();
 	const reviewPoll = pollForReviews ? setInterval(pollReviews, config.github.reviewPollMinutes * 60_000) : undefined;
+	// GitHub Actions and GitLab CI: poll cyralph's open PRs/MRs for failed pipelines.
+	const pollCi = () => manager.pollCi().catch((e: unknown) => log.warn(`CI poll failed: ${String(e)}`));
+	const watchCi = config.ci.pollMinutes > 0 && config.repositories.some((r) => r.respondToCiFailures !== false);
+	if (watchCi) void pollCi();
+	const ciPoll = watchCi ? setInterval(pollCi, config.ci.pollMinutes * 60_000) : undefined;
 	// Linear OAuth access tokens expire; refresh twice a day.
 	const timer = setInterval(() => void refreshIfPossible(config, gateway), 12 * 60 * 60 * 1000);
 	let updateTimer: NodeJS.Timeout | undefined;
@@ -115,6 +122,7 @@ async function cmdStart(configPath: string, args: string[]) {
 		clearInterval(timer);
 		if (poll) clearInterval(poll);
 		if (reviewPoll) clearInterval(reviewPoll);
+		if (ciPoll) clearInterval(ciPoll);
 		clearInterval(updateTimer);
 	};
 	let stopping = false;

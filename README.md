@@ -228,6 +228,31 @@ never acted on, and cyralph doesn't post anything on the PR itself.
   re-reviews every push, so after `maxReviewRounds` reviews on one PR cyralph stops and says so in
   the session. Stopped sessions are left alone.
 
+### CI failures (GitHub Actions, GitLab CI)
+
+cyralph watches the CI of the pull/merge requests it opened. Once the pipeline of a PR/MR's current
+head commit has finished and failed, it hands the failed jobs (names, links and the tail of each
+log) to the epic's Linear session, and the agent finds the cause, fixes it, runs the quality gates,
+and pushes to the branch so CI runs again. A failure the agent judges unrelated to the branch (a
+flaky test, an outage) is reported in the session instead of "fixed".
+
+```json
+{
+  "ci": { "pollMinutes": 5, "maxFixRounds": 3 },
+  "repositories": [{ "id": "app", "respondToCiFailures": true, "…": "…" }]
+}
+```
+
+- **Polling only.** Every `pollMinutes` (0 turns it off) cyralph asks the forge, with the same CLI
+  login it uses for PRs/MRs: GitHub Actions workflow runs of the head commit through `gh api` (failed
+  steps' logs via `gh run view --log-failed`), and the MR's head pipeline through `glab api` (job
+  traces; jobs with `allow_failure` are ignored). Pipelines still running are checked again later.
+- Each failed head commit is acted on once. After `maxFixRounds` failed pipelines on one PR/MR,
+  cyralph stops and says so in the session.
+- While a session for the epic is running or queued it may push again, so its CI is checked on a
+  later poll. Stopped sessions and closed or merged PRs/MRs are left alone.
+- `respondToCiFailures` turns this off per repository (it defaults to on).
+
 ## Setup
 
 1. **Create a Linear OAuth app.** In Linear, go to *Settings → API → OAuth applications*.

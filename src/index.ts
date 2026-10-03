@@ -11,6 +11,7 @@ export * from "./linear/webhook.js";
 export * from "./agent/runner.js";
 export * from "./agent/activity.js";
 export * from "./git/workspace.js";
+export * from "./git/ci.js";
 export * from "./github/reviews.js";
 export * from "./engine/epic-engine.js";
 export * from "./engine/session-manager.js";

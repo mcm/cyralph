@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { ActivityReporter } from "../agent/activity.js";
 import { type AgentRunner, requestSystemAppend } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
+import type { CiClient } from "../git/ci.js";
 import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
 import type { GitHubReviewClient } from "../github/reviews.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
@@ -43,6 +44,8 @@ export interface EngineDeps {
 	attachments?: AttachmentFetcher;
 	/** Reads automated PR reviews from GitHub; omitted = reviews are acted on without inline comments, and not polled. */
 	github?: GitHubReviewClient;
+	/** Reads CI pipelines of cyralph's PRs/MRs; omitted = CI failures aren't polled. */
+	ci?: CiClient;
 }
 
 export interface EngineRun {

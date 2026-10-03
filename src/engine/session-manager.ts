@@ -7,6 +7,7 @@
  */
 import { ActivityReporter } from "../agent/activity.js";
 import type { RepositoryConfig } from "../config.js";
+import { type ChangeRequestRef, type CiStatus, buildCiFailureRequest, parseChangeRequestUrl } from "../git/ci.js";
 import { type ReviewSubmitted, buildReviewRequest, githubRepoSlug, isReviewBot, parsePullRequestUrl } from "../github/reviews.js";
 import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
@@ -200,13 +201,8 @@ export class SessionManager {
 	async pollReviews(): Promise<void> {
 		const { config, github, log } = this.deps;
 		if (!github) return;
-		const latest = new Map<string, SessionRecord>();
-		for (const r of this.store.all()) {
-			if (!r.prUrl || r.prClosed || !parsePullRequestUrl(r.prUrl)) continue;
-			const seen = latest.get(r.prUrl);
-			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
-		}
-		for (const [prUrl, record] of latest) {
+		for (const [prUrl, record] of this.openPullRequests()) {
+			if (!parsePullRequestUrl(prUrl)) continue;
 			const repo = config.repositories.find((x) => x.id === record.repoId);
 			if (!repo || repo.respondToReviews === false || record.status === "stopped") continue;
 			const pr = parsePullRequestUrl(prUrl);
@@ -234,6 +230,90 @@ export class SessionManager {
 				log.warn(`review poll of ${prUrl} failed: ${String(err)}`);
 			}
 		}
+	}
+
+	/** Pull/merge requests cyralph opened that aren't known to be closed, each with its newest session. */
+	private openPullRequests(): Map<string, SessionRecord> {
+		const latest = new Map<string, SessionRecord>();
+		for (const r of this.store.all()) {
+			if (!r.prUrl || r.prClosed) continue;
+			const seen = latest.get(r.prUrl);
+			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
+		}
+		return latest;
+	}
+
+	/**
+	 * Check the CI (GitHub Actions, GitLab pipelines) of every open PR/MR cyralph opened. When the
+	 * pipeline of the head commit has finished and failed, hand the failed jobs to the session to fix.
+	 */
+	async pollCi(): Promise<void> {
+		const { config, ci, log } = this.deps;
+		if (!ci) return;
+		for (const [prUrl, record] of this.openPullRequests()) {
+			const repo = config.repositories.find((x) => x.id === record.repoId);
+			if (!repo || repo.respondToCiFailures === false || record.status === "stopped") continue;
+			// Work on the issue is running or queued and may push again; check its CI on a later poll.
+			if (this.active.has(record.sessionId) || this.queue.includes(record.sessionId) || this.busyIssues.has(record.issueId)) continue;
+			const ref = parseChangeRequestUrl(prUrl);
+			if (!ref) continue;
+			try {
+				const status = await ci.status(ref);
+				if (!status) continue;
+				if (!status.open) {
+					record.prClosed = true;
+					await this.store.save(record);
+					continue;
+				}
+				if (status.state !== "failed" || this.ciHandled(prUrl, status.headSha)) continue;
+				const p = this.onCiFailure(record, ref, status).finally(() => this.handling.delete(p));
+				this.handling.add(p);
+				await p;
+			} catch (err) {
+				log.warn(`CI poll of ${prUrl} failed: ${String(err)}`);
+			}
+		}
+	}
+
+	private async onCiFailure(record: SessionRecord, ref: ChangeRequestRef, status: CiStatus): Promise<void> {
+		const { config, ci, log } = this.deps;
+		const sha = status.headSha.slice(0, 7);
+		const term = ref.forge === "gitlab" ? "merge request" : "pull request";
+		record.handledCiShas = [...(record.handledCiShas ?? []), status.headSha];
+		const reporter = this.reporter(record.sessionId);
+		const rounds = record.ciFixRounds ?? 0;
+		if (rounds >= config.ci.maxFixRounds) {
+			await this.store.save(record);
+			await reporter.thought(
+				`CI failed again on ${ref.url} (\`${sha}\`). I've already tried to fix CI ${rounds} time${rounds === 1 ? "" : "s"} on this ${term}, so I'm leaving this one for a person.`,
+			);
+			return;
+		}
+		const jobs = await Promise.all(
+			status.failedJobs.map(async (job) => ({
+				...job,
+				log: ci
+					? await ci.jobLog(ref, job).catch((err: unknown) => {
+							log.warn(`could not read the log of ${job.name} on ${ref.url}: ${String(err)}`);
+							return "";
+						})
+					: "",
+			})),
+		);
+		record.ciFixRounds = rounds + 1;
+		const branch = record.branch ?? "the pull request branch";
+		record.pendingRequests.push(buildCiFailureRequest({ ref, headSha: status.headSha, branch, pipelineUrl: status.pipelineUrl, jobs }));
+		await this.store.save(record);
+		const names = jobs.map((j) => `\`${j.name}\``);
+		const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
+		log.info(`acting on failed CI of ${ref.url} at ${sha} for ${record.identifier ?? record.sessionId}`);
+		await reporter.thought(`CI failed on the ${term} (\`${sha}\`: ${shown}). Working on a fix.`);
+		this.enqueue(record);
+	}
+
+	private ciHandled(prUrl: string, sha: string): boolean {
+		const url = prUrl.toLowerCase();
+		return this.store.all().some((r) => r.prUrl?.toLowerCase() === url && r.handledCiShas?.includes(sha));
 	}
 
 	private reviewHandled(prUrl: string, reviewId: number): boolean {
@@ -277,6 +357,8 @@ export class SessionManager {
 			record.prNumber ??= previous.prNumber;
 			record.handledReviewIds ??= previous.handledReviewIds;
 			record.reviewRounds ??= previous.reviewRounds;
+			record.handledCiShas ??= previous.handledCiShas;
+			record.ciFixRounds ??= previous.ciFixRounds;
 			record.guidance = [...previous.guidance];
 			record.completedKeys = [...previous.completedKeys];
 		}
