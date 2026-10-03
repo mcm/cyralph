@@ -187,6 +187,38 @@ On the cyralph host, log the CLI in once: `glab auth login --hostname git.exampl
 silently. Sessions link the result as **Merge request** or **Pull request**, and the agent in a
 request session is told which CLI to use.
 
+### Automated PR reviews (Cubic)
+
+When a review bot such as [Cubic](https://cubic.dev) submits a **review** on a pull request cyralph
+opened, cyralph works through it: it reads the review's summary and inline comments, fixes what's
+right, runs the quality gates, and pushes to the PR branch. Progress shows up in the epic's Linear
+session. Only submitted reviews (`pull_request_review`) count; plain PR and issue comments are
+never acted on, and cyralph doesn't post anything on the PR itself.
+
+```json
+{
+  "github": {
+    "webhookSecret": "…",
+    "reviewBots": ["cubic-dev-ai[bot]"],
+    "reviewPollMinutes": 5,
+    "maxReviewRounds": 3
+  },
+  "repositories": [{ "id": "app", "respondToReviews": true, "…": "…" }]
+}
+```
+
+- **Webhook (one per cyralph instance).** Add a GitHub webhook (on a repository, an organization,
+  or a GitHub App) pointing at `https://<public-host>/github-webhook`, content type
+  `application/json`, with the secret in `github.webhookSecret` (or `GITHUB_WEBHOOK_SECRET`), and
+  select only **Pull request reviews**. The payload's `repository.full_name` picks the configured
+  repository (by `githubUrl`, else the clone's `origin` remote).
+- **Polling.** Without a webhook secret, cyralph checks its own open pull requests every
+  `reviewPollMinutes` with `gh api`, using the same `gh auth login` it uses to open PRs.
+- `respondToReviews` turns this off per repository (it defaults to on).
+- Only the newest bot review of the PR's current head commit is acted on, each review once. The bot
+  re-reviews every push, so after `maxReviewRounds` reviews on one PR cyralph stops and says so in
+  the session. Stopped sessions are left alone.
+
 ## Setup
 
 1. **Create a Linear OAuth app.** In Linear, go to *Settings → API → OAuth applications*.

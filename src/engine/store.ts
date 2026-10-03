@@ -32,6 +32,12 @@ export interface SessionRecord {
 	worktreePath?: string;
 	prUrl?: string;
 	prNumber?: number;
+	/** The PR was seen closed or merged; it is no longer polled for reviews. */
+	prClosed?: boolean;
+	/** GitHub review ids already seen (acted on, skipped as stale, or over the round limit). */
+	handledReviewIds?: number[];
+	/** Automated reviews acted on for this PR (capped by `github.maxReviewRounds`). */
+	reviewRounds?: number;
 	/** Iterations spent per story key. */
 	attempts: Record<string, number>;
 	/** Why the last attempt of a story failed, fed into the next attempt. */

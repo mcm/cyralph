@@ -23,6 +23,9 @@
     "enabled": true,
     "intervalMinutes": 30
   },
+  "github": {
+    "reviewBots": ["cubic-dev-ai[bot]"]
+  },
   "repositories": [
     {
       "id": "app",

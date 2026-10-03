@@ -55,6 +55,11 @@ export const RepositoryConfigSchema = z.object({
 	historyRewrite: z.enum(["when-asked", "never"]).optional(),
 	/** Custom story prompt template (Handlebars subset, see src/ralph/prompt.ts). */
 	promptTemplatePath: z.string().optional(),
+	/**
+	 * Act on automated reviews (`github.reviewBots`) submitted on pull requests cyralph opened for this
+	 * repository: fix the findings and push to the PR branch. Defaults to true.
+	 */
+	respondToReviews: z.boolean().optional(),
 });
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 
@@ -98,6 +103,20 @@ export const RalphConfigSchema = z.object({
 	epicCompletedStateName: z.string().optional(),
 });
 
+export const GitHubConfigSchema = z.object({
+	/**
+	 * Secret of the GitHub webhook pointed at `POST /github-webhook` (one per cyralph instance; send it
+	 * "Pull request reviews" events). Env: GITHUB_WEBHOOK_SECRET. Without it, cyralph polls instead.
+	 */
+	webhookSecret: z.string().optional(),
+	/** Logins whose submitted reviews cyralph acts on. Plain PR/issue comments are never acted on. */
+	reviewBots: z.array(z.string()).default(["cubic-dev-ai[bot]"]),
+	/** How often to poll cyralph's open PRs for new reviews when no webhook secret is configured. */
+	reviewPollMinutes: z.number().positive().default(5),
+	/** Reviews acted on per pull request before cyralph leaves further ones to a person (the bot re-reviews every push). */
+	maxReviewRounds: z.number().int().nonnegative().default(3),
+});
+
 export const AutoUpdateConfigSchema = z.object({
 	/**
 	 * Follow new commits on the branch cyralph was installed from: build and test them off to the side,
@@ -134,6 +153,7 @@ export const ConfigSchema = z.object({
 	linear: LinearConfigSchema.prefault({}),
 	ralph: RalphConfigSchema.prefault({}),
 	autoUpdate: AutoUpdateConfigSchema.prefault({}),
+	github: GitHubConfigSchema.prefault({}),
 	repositories: z.array(RepositoryConfigSchema).min(1),
 });
 export type Config = z.infer<typeof ConfigSchema> & { stateDir: string; configPath: string };
@@ -158,6 +178,7 @@ export function parseConfig(raw: unknown, configPath: string): Config {
 			clientId: env.LINEAR_CLIENT_ID ?? parsed.linear.clientId,
 			clientSecret: env.LINEAR_CLIENT_SECRET ?? parsed.linear.clientSecret,
 		},
+		github: { ...parsed.github, webhookSecret: env.GITHUB_WEBHOOK_SECRET ?? parsed.github.webhookSecret },
 		repositories: parsed.repositories.map((r) => ({
 			...r,
 			repositoryPath: resolve(baseDir, r.repositoryPath),
