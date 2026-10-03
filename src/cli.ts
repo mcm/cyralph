@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { ActivityReporter } from "./agent/activity.js";
 import { ClaudeAgentRunner } from "./agent/runner.js";
 import { type Config, defaultConfigPath, loadConfig, saveLinearCredentials } from "./config.js";
+import { ConfigReloader } from "./config-reload.js";
 import { EpicEngine, type EngineDeps } from "./engine/epic-engine.js";
 import { SessionManager } from "./engine/session-manager.js";
 import { SessionStore, newRecord } from "./engine/store.js";
@@ -66,7 +67,8 @@ function requireToken(config: Config): string {
 	return config.linear.accessToken;
 }
 
-function deps(config: Config, linear: LinearGateway): EngineDeps {
+/** `accessToken` is read lazily: the token is refreshed in place every 12h, and the config can be reloaded. */
+function deps(config: Config, linear: LinearGateway, accessToken = () => config.linear.accessToken): EngineDeps {
 	return {
 		config,
 		linear,
@@ -74,8 +76,7 @@ function deps(config: Config, linear: LinearGateway): EngineDeps {
 		git: new CliGitWorkspace(),
 		shell: runShell,
 		log,
-		// Read lazily: the token is refreshed in place every 12h.
-		attachments: new LinearUploadFetcher(() => config.linear.accessToken),
+		attachments: new LinearUploadFetcher(accessToken),
 		github: new GhReviewClient(),
 		ci: new CliCiClient(),
 	};
@@ -92,23 +93,36 @@ async function checkForges(config: Config): Promise<void> {
 	}
 }
 
+/** Why a config can't run the agent, or undefined when it can. */
+function startProblem(config: Config): string | undefined {
+	if (!config.linear.accessToken) return "No Linear access token. Run `cyralph auth` or set LINEAR_ACCESS_TOKEN.";
+	if (!config.linear.webhookSecret) return "linear.webhookSecret (or LINEAR_WEBHOOK_SECRET) is required.";
+	return undefined;
+}
+
 async function cmdStart(configPath: string, args: string[]) {
-	const config = await loadConfig(configPath);
+	/** The latest valid config. Reloaded from the file when it changes; runs keep the one they started with. */
+	let config = await loadConfig(configPath);
 	// Self-update needs a parent process to restart the agent into the new build.
 	if (config.autoUpdate.enabled && process.env.CYRALPH_SUPERVISED !== "1") {
 		process.exit(await supervise({ stateDir: config.stateDir, sourceDir: packageRoot(), args: ["start", ...args], log }));
 	}
 	await refreshIfPossible(config);
+	const problem = startProblem(config);
+	if (problem) throw new Error(problem);
 	const token = requireToken(config);
-	if (!config.linear.webhookSecret) throw new Error("linear.webhookSecret (or LINEAR_WEBHOOK_SECRET) is required.");
 	const gateway = new SdkLinearGateway(token);
 	const store = new SessionStore(join(config.stateDir, "sessions.json"));
 	await store.load();
-	const manager = new SessionManager(deps(config, gateway), store);
-	const githubWebhookSecret = config.github.webhookSecret;
-	const server = createWebhookServer({ webhookSecret: config.linear.webhookSecret, githubWebhookSecret, manager, log });
+	const manager = new SessionManager(deps(config, gateway, () => config.linear.accessToken), store);
+	const server = createWebhookServer({
+		webhookSecret: () => config.linear.webhookSecret,
+		githubWebhookSecret: () => config.github.webhookSecret,
+		manager,
+		log,
+	});
 	server.listen(config.port, () =>
-		log.info(`cyralph listening on :${config.port} (POST /linear-webhook${githubWebhookSecret ? ", POST /github-webhook" : ""})`),
+		log.info(`cyralph listening on :${config.port} (POST /linear-webhook${config.github.webhookSecret ? ", POST /github-webhook" : ""})`),
 	);
 	// Warn early when a repository's forge CLI (gh/glab) can't open PRs/MRs; each run checks again too.
 	void checkForges(config).catch((e: unknown) => log.warn(`forge check failed: ${String(e)}`));
@@ -122,25 +136,53 @@ async function cmdStart(configPath: string, args: string[]) {
 			manager.cleanupMerged().catch((e: unknown) => log.warn(`merged worktree cleanup failed: ${String(e)}`)),
 		]);
 	void reconcile();
-	const poll = config.blockerPollMinutes > 0 ? setInterval(reconcile, config.blockerPollMinutes * 60_000) : undefined;
 	// Without a GitHub webhook, poll cyralph's open pull requests for automated reviews.
 	const pollReviews = () => manager.pollReviews().catch((e: unknown) => log.warn(`review poll failed: ${String(e)}`));
-	const pollForReviews = !githubWebhookSecret && config.repositories.some((r) => r.respondToReviews !== false);
-	if (pollForReviews) void pollReviews();
-	const reviewPoll = pollForReviews ? setInterval(pollReviews, config.github.reviewPollMinutes * 60_000) : undefined;
+	const pollsReviews = (c: Config) => !c.github.webhookSecret && c.repositories.some((r) => r.respondToReviews !== false);
 	// GitHub Actions and GitLab CI: poll cyralph's open PRs/MRs for failed pipelines.
 	const pollCi = () => manager.pollCi().catch((e: unknown) => log.warn(`CI poll failed: ${String(e)}`));
-	const watchCi = config.ci.pollMinutes > 0 && config.repositories.some((r) => r.respondToCiFailures !== false);
-	if (watchCi) void pollCi();
-	const ciPoll = watchCi ? setInterval(pollCi, config.ci.pollMinutes * 60_000) : undefined;
+	const pollsCi = (c: Config) => c.ci.pollMinutes > 0 && c.repositories.some((r) => r.respondToCiFailures !== false);
+	let polls: NodeJS.Timeout[] = [];
+	/** (Re)start the polling timers for `c`; a poll that was off under `prev` (or at startup) runs right away. */
+	const schedulePolls = (c: Config, prev?: Config) => {
+		for (const t of polls) clearInterval(t);
+		polls = [];
+		if (c.blockerPollMinutes > 0) polls.push(setInterval(reconcile, c.blockerPollMinutes * 60_000));
+		if (pollsReviews(c)) {
+			if (!prev || !pollsReviews(prev)) void pollReviews();
+			polls.push(setInterval(pollReviews, c.github.reviewPollMinutes * 60_000));
+		}
+		if (pollsCi(c)) {
+			if (!prev || !pollsCi(prev)) void pollCi();
+			polls.push(setInterval(pollCi, c.ci.pollMinutes * 60_000));
+		}
+	};
+	schedulePolls(config);
 	// Linear OAuth access tokens expire; refresh twice a day.
 	const timer = setInterval(() => void refreshIfPossible(config, gateway), 12 * 60 * 60 * 1000);
+	// Pick up edits to the config file without a restart.
+	const reloader = new ConfigReloader({
+		path: config.configPath,
+		initial: config,
+		log,
+		validate: startProblem,
+		apply: (next, prev) => {
+			const token = next.linear.accessToken;
+			if (token && token !== prev.linear.accessToken) gateway.setAccessToken(token);
+			config = next;
+			manager.setConfig(next);
+			schedulePolls(next, prev);
+			const forgeKeys = (c: Config) => JSON.stringify([c.repositories, c.gitlabHosts, c.ralph.createPullRequest]);
+			if (forgeKeys(next) !== forgeKeys(prev)) void checkForges(next).catch((e: unknown) => log.warn(`forge check failed: ${String(e)}`));
+		},
+	});
+	await reloader.start();
+	process.on("SIGHUP", () => void reloader.reload({ force: true }));
 	let updateTimer: NodeJS.Timeout | undefined;
 	const stopTimers = () => {
 		clearInterval(timer);
-		if (poll) clearInterval(poll);
-		if (reviewPoll) clearInterval(reviewPoll);
-		if (ciPoll) clearInterval(ciPoll);
+		for (const t of polls) clearInterval(t);
+		reloader.stop();
 		clearInterval(updateTimer);
 	};
 	let stopping = false;

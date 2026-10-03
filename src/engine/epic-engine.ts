@@ -123,10 +123,14 @@ export function prLabel(url: string): string {
 }
 
 export class EpicEngine {
-	/** Sessions that already reported why a PR/MR can't be opened (don't repeat it every story). */
-	private readonly forgeProblems = new Set<string>();
-
-	constructor(private readonly deps: EngineDeps) {}
+	/**
+	 * @param forgeProblems Sessions that already reported why a PR/MR can't be opened (don't repeat it
+	 *   every story). Shared across engines, since a config reload starts a new one.
+	 */
+	constructor(
+		private readonly deps: EngineDeps,
+		private readonly forgeProblems = new Set<string>(),
+	) {}
 
 	async run(ctx: EngineRun): Promise<SessionStatus> {
 		const { config, linear, log } = this.deps;

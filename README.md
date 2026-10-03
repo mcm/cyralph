@@ -326,6 +326,19 @@ Claude authentication works the same way as for Claude Code: `ANTHROPIC_API_KEY`
 `claude`. The default `permissionMode` is `bypassPermissions`, because runs are unattended. Run it
 somewhere you are comfortable giving an agent shell access to, as you would with Cyrus.
 
+### Config changes
+
+`cyralph start` watches its config file and applies edits without a restart. Each save is checked
+first (valid JSON, the config schema, a Linear token and webhook secret). If the new file is
+invalid, cyralph keeps the running config and logs why. `kill -HUP <pid>` reloads on demand.
+
+Sessions that are already running finish on the config they started with. Queued and new sessions,
+webhook secrets, polling intervals, review and CI settings, repositories and the session limit all
+use the new config straight away.
+
+`port`, `stateDir` and `autoUpdate` are read once at startup. A change to them is logged as needing
+a restart and takes effect after the next one.
+
 ### Self-update
 
 `cyralph start` keeps itself up to date with the branch its checkout is on, so you don't have to
