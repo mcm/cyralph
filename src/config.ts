@@ -65,6 +65,11 @@ export const RepositoryConfigSchema = z.object({
 	 * read the failed jobs' logs, fix the cause and push. Defaults to true.
 	 */
 	respondToCiFailures: z.boolean().optional(),
+	/**
+	 * Once an epic's pull/merge request is merged, remove its worktree and local branch (only when
+	 * nothing uncommitted or unmerged would be lost). Defaults to true.
+	 */
+	cleanupMergedWorktrees: z.boolean().optional(),
 });
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 

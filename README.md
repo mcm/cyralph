@@ -267,6 +267,21 @@ flaky test, an outage) is reported in the session instead of "fixed".
   later poll. Stopped sessions and closed or merged PRs/MRs are left alone.
 - `respondToCiFailures` turns this off per repository (it defaults to on).
 
+### Cleanup after a merge
+
+When an epic's pull/merge request is merged (and Linear moves the issue to Done), cyralph removes
+the epic's worktree and its local branch, and says so in the session. The remote branch is left to
+the forge.
+
+- **Triggers.** The issue's *Issues* webhook moving it to a completed state, a review or CI poll
+  seeing the PR/MR closed, and the periodic `blockerPollMinutes` reconcile (also run at startup) as
+  a fallback. Each checks with the forge CLI (`gh api` / `glab api`) that the PR/MR was merged; a
+  PR/MR closed without merging is left alone.
+- **Nothing is lost.** A worktree with uncommitted changes, or a branch with commits the merged head
+  doesn't contain, is kept (the session says why). A session still running or queued for the issue is
+  checked again later. Only worktrees cyralph created under its worktree directory are removed.
+- `cleanupMergedWorktrees` turns this off per repository (it defaults to on).
+
 ## Setup
 
 1. **Create a Linear OAuth app.** In Linear, go to *Settings → API → OAuth applications*.

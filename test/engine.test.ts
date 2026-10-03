@@ -1058,9 +1058,14 @@ class FakeCi implements CiClient {
 	statusCalls: string[] = [];
 	result: CiStatus = { open: true, headSha: "head1", state: "pending", failedJobs: [] };
 	logs = new Map<number, string>();
+	/** Set once the PR/MR is merged, at this head commit. */
+	mergedAt: string | undefined;
 	async status(ref: ChangeRequestRef) {
 		this.statusCalls.push(ref.url);
 		return { ...this.result };
+	}
+	async state() {
+		return this.mergedAt ? { open: false, merged: true, headSha: this.mergedAt } : { open: this.result.open, merged: false, headSha: this.result.headSha };
 	}
 	async jobLog(_ref: ChangeRequestRef, job: CiFailedJob) {
 		const log = this.logs.get(job.id);
@@ -1163,5 +1168,80 @@ describe("CI failures", () => {
 		expect(closed.store.get("ci-1")?.prClosed).toBe(true);
 		await closed.manager.pollCi();
 		expect(closed.ci.statusCalls).toHaveLength(1);
+	});
+});
+
+describe("cleanup after a merge", () => {
+	const branchExists = (repo: string, branch: string) => sh(repo, "branch", "--list", branch).trim() !== "";
+
+	async function mergedEpic(extra: { repo?: Record<string, unknown> } = {}) {
+		const t = await ciEpic(extra);
+		const record = t.store.get("ci-1");
+		const path = record?.worktreePath ?? "";
+		expect(existsSync(path)).toBe(true);
+		const head = sh(path, "rev-parse", "HEAD").trim();
+		return { ...t, path, head, epicId: record?.issueId ?? "" };
+	}
+
+	it("removes the worktree and local branch once the issue is done after its PR merged", async () => {
+		const t = await mergedEpic();
+		// Done while the PR is still open (e.g. moved by hand): nothing is removed.
+		await t.manager.handle({ kind: "issue_state", issueId: t.epicId, stateType: "completed", removed: false });
+		expect(existsSync(t.path)).toBe(true);
+
+		t.ci.mergedAt = t.head;
+		await t.manager.handle({ kind: "issue_state", issueId: t.epicId, stateType: "completed", removed: false });
+		expect(existsSync(t.path)).toBe(false);
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(false);
+		expect(sh(t.repo, "worktree", "list")).not.toContain(t.path);
+		const record = t.store.get("ci-1");
+		expect(record?.worktreePath).toBeUndefined();
+		expect(record?.prMerged).toBe(true);
+		expect(t.linear.bodies("thought").some((b) => b.includes("was merged, so I removed its worktree and the local branch `eng-1-task-priority`"))).toBe(true);
+	});
+
+	it("cleans up when polling sees the PR merged, as a fallback for a missed webhook", async () => {
+		const t = await mergedEpic();
+		t.ci.mergedAt = t.head;
+		t.ci.result = { ...t.ci.result, open: false };
+		await t.manager.pollCi();
+		expect(existsSync(t.path)).toBe(false);
+
+		const later = await mergedEpic();
+		later.ci.mergedAt = later.head;
+		await later.manager.cleanupMerged();
+		expect(existsSync(later.path)).toBe(false);
+		expect(branchExists(later.repo, "eng-1-task-priority")).toBe(false);
+	});
+
+	it("keeps the worktree when the PR was closed unmerged, work would be lost, or the repository opted out", async () => {
+		const closed = await mergedEpic();
+		closed.ci.result = { ...closed.ci.result, open: false };
+		await closed.manager.cleanupMerged();
+		expect(existsSync(closed.path)).toBe(true);
+		expect(closed.store.get("ci-1")?.prMerged).toBe(false);
+
+		const dirty = await mergedEpic();
+		dirty.ci.mergedAt = dirty.head;
+		writeFileSync(join(dirty.path, "notes.txt"), "wip\n");
+		await dirty.manager.cleanupMerged(dirty.epicId);
+		expect(existsSync(join(dirty.path, "notes.txt"))).toBe(true);
+		expect(dirty.linear.bodies("thought").some((b) => b.includes("I kept the worktree") && b.includes("uncommitted changes"))).toBe(true);
+		expect(dirty.store.get("ci-1")?.worktreePath).toBeUndefined(); // said once, not on every pass
+
+		const ahead = await mergedEpic();
+		ahead.ci.mergedAt = ahead.head;
+		writeFileSync(join(ahead.path, "more.txt"), "more\n");
+		sh(ahead.path, "add", ".");
+		sh(ahead.path, "-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-m", "after merge");
+		await ahead.manager.cleanupMerged();
+		expect(existsSync(ahead.path)).toBe(true);
+		expect(branchExists(ahead.repo, "eng-1-task-priority")).toBe(true);
+		expect(ahead.linear.bodies("thought").some((b) => b.includes("has commits that weren't merged"))).toBe(true);
+
+		const off = await mergedEpic({ repo: { cleanupMergedWorktrees: false } });
+		off.ci.mergedAt = off.head;
+		await off.manager.cleanupMerged();
+		expect(existsSync(off.path)).toBe(true);
 	});
 });

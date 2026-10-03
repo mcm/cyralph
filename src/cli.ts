@@ -102,7 +102,12 @@ async function cmdStart(configPath: string, args: string[]) {
 	// Pick up what a restart (an update or a crash) interrupted.
 	void manager.resumeInterrupted().catch((e: unknown) => log.warn(`resuming interrupted sessions failed: ${String(e)}`));
 	// Wake sessions whose blockers resolved while we were down, then keep polling as a webhook fallback.
-	const reconcile = () => manager.reconcileParked().catch((e: unknown) => log.warn(`blocker reconcile failed: ${String(e)}`));
+	// Also removes the worktrees and branches of merged PRs/MRs whose "issue done" webhook was missed.
+	const reconcile = () =>
+		Promise.all([
+			manager.reconcileParked().catch((e: unknown) => log.warn(`blocker reconcile failed: ${String(e)}`)),
+			manager.cleanupMerged().catch((e: unknown) => log.warn(`merged worktree cleanup failed: ${String(e)}`)),
+		]);
 	void reconcile();
 	const poll = config.blockerPollMinutes > 0 ? setInterval(reconcile, config.blockerPollMinutes * 60_000) : undefined;
 	// Without a GitHub webhook, poll cyralph's open pull requests for automated reviews.
