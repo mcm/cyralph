@@ -19,6 +19,10 @@
     "markPrReadyWhenComplete": true,
     "epicCompletedStateName": "In Review"
   },
+  "autoUpdate": {
+    "enabled": true,
+    "intervalMinutes": 30
+  },
   "repositories": [
     {
       "id": "app",

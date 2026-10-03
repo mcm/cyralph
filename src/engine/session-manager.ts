@@ -49,6 +49,10 @@ export class SessionManager {
 	private readonly toldQueued = new Set<string>();
 	/** Delivers a message into the agent session currently running for a cyralph session. */
 	private readonly injectors = new Map<string, (text: string) => boolean>();
+	/** Webhook handlers still in flight, so a restart doesn't cut one off halfway. */
+	private readonly handling = new Set<Promise<void>>();
+	/** Set while waiting to restart for an update: nothing new starts, new work stays queued. */
+	private draining = false;
 
 	constructor(
 		private readonly deps: EngineDeps,
@@ -61,7 +65,13 @@ export class SessionManager {
 		return new ActivityReporter(this.deps.linear, sessionId, this.deps.log);
 	}
 
-	async handle(event: AgentWebhookEvent): Promise<void> {
+	handle(event: AgentWebhookEvent): Promise<void> {
+		const p = this.dispatch(event).finally(() => this.handling.delete(p));
+		this.handling.add(p);
+		return p;
+	}
+
+	private async dispatch(event: AgentWebhookEvent): Promise<void> {
 		if (event.kind === "created") return this.onCreated(event);
 		if (event.kind === "prompted") return this.onPrompted(event);
 		if (event.kind === "issue_state") {
@@ -239,8 +249,39 @@ export class SessionManager {
 		this.pump();
 	}
 
+	/**
+	 * After a restart (an update, a crash), pick up sessions that were queued or mid-run. Records not
+	 * touched within `maxAgeHours` are left alone, so a long-dead session doesn't wake up unasked.
+	 */
+	async resumeInterrupted(maxAgeHours = 24): Promise<void> {
+		const cutoff = Date.now() - maxAgeHours * 60 * 60 * 1000;
+		for (const record of this.store.all()) {
+			if (record.status !== "queued" && record.status !== "running") continue;
+			if (Date.parse(record.updatedAt) < cutoff) continue;
+			const wasRunning = record.status === "running";
+			this.deps.log.info(`resuming ${wasRunning ? "interrupted" : "queued"} session ${record.identifier ?? record.sessionId}`);
+			if (wasRunning) await this.reporter(record.sessionId).thought("cyralph restarted. Picking this back up where it left off.");
+			this.enqueue(record);
+		}
+	}
+
+	/**
+	 * Stop starting sessions and wait until every running one has finished and no webhook is still
+	 * being handled. Work that arrives meanwhile stays queued in the store for the next process.
+	 */
+	async drain(): Promise<void> {
+		this.draining = true;
+		await this.idle();
+		while (this.handling.size > 0) await Promise.allSettled([...this.handling]);
+		await this.store.flush();
+	}
+
+	isDraining(): boolean {
+		return this.draining;
+	}
+
 	private pump() {
-		while (this.active.size < this.deps.config.maxConcurrentSessions) {
+		while (!this.draining && this.active.size < this.deps.config.maxConcurrentSessions) {
 			const idx = this.queue.findIndex((id) => {
 				const r = this.store.get(id);
 				return r && !this.busyIssues.has(r.issueId);
@@ -253,7 +294,10 @@ export class SessionManager {
 		for (const id of this.queue) {
 			if (this.toldQueued.has(id)) continue;
 			this.toldQueued.add(id);
-			void this.reporter(id).thought("Queued: waiting for a free agent slot.", true);
+			void this.reporter(id).thought(
+				this.draining ? "Queued: cyralph is restarting for an update and will start this right after." : "Queued: waiting for a free agent slot.",
+				true,
+			);
 		}
 	}
 

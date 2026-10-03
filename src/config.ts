@@ -98,6 +98,21 @@ export const RalphConfigSchema = z.object({
 	epicCompletedStateName: z.string().optional(),
 });
 
+export const AutoUpdateConfigSchema = z.object({
+	/**
+	 * Follow new commits on the branch cyralph was installed from: build and test them off to the side,
+	 * then restart into them once no session is running. `cyralph start` supervises the agent for this.
+	 */
+	enabled: z.boolean().default(true),
+	/** How often to check the remote. */
+	intervalMinutes: z.number().positive().default(30),
+	remote: z.string().default("origin"),
+	/** Branch to follow. Defaults to the branch the install checkout is on. */
+	branch: z.string().optional(),
+	/** Run in the new commit's checkout; all must pass before cyralph switches to it. */
+	buildCommands: z.array(z.string()).default(["npm ci", "npm run build", "npm test"]),
+});
+
 export const ConfigSchema = z.object({
 	port: z.number().int().default(3457),
 	/** Public base URL for OAuth callbacks (e.g. an ngrok/cloudflared URL). */
@@ -118,6 +133,7 @@ export const ConfigSchema = z.object({
 	permissionMode: z.enum(["bypassPermissions", "acceptEdits", "dontAsk", "auto"]).default("bypassPermissions"),
 	linear: LinearConfigSchema.prefault({}),
 	ralph: RalphConfigSchema.prefault({}),
+	autoUpdate: AutoUpdateConfigSchema.prefault({}),
 	repositories: z.array(RepositoryConfigSchema).min(1),
 });
 export type Config = z.infer<typeof ConfigSchema> & { stateDir: string; configPath: string };
