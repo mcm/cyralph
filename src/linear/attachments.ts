@@ -106,6 +106,7 @@ const EXT_BY_TYPE: Record<string, string> = {
 /** A safe local filename: the upload's title when it has an extension, else title/fallback + type extension. */
 export function attachmentFileName(ref: UploadRef, contentType: string, fallback: string): string {
 	const base = (ref.title ?? "")
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control characters from file names is the point
 		.replace(/[/\\?%*:|"<>\x00-\x1f]/g, "_")
 		.replace(/^\.+/, "")
 		.trim()

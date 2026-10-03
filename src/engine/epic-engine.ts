@@ -369,7 +369,11 @@ export class EpicEngine {
 		const { linear, log } = this.deps;
 		const { record, reporter } = ctx;
 		const sources: AttachmentSource[] = [{ label: `${epic.identifier} description`, text: epic.description }];
-		const comments = async (issueId: string) => linear.getComments(issueId).catch((e: unknown) => (log.warn(`comments for ${issueId}: ${String(e)}`), []));
+		const comments = async (issueId: string) =>
+			linear.getComments(issueId).catch((e: unknown) => {
+				log.warn(`comments for ${issueId}: ${String(e)}`);
+				return [];
+			});
 		for (const c of await comments(epic.issueId)) sources.push({ label: `comment on ${epic.identifier}${c.author ? ` by ${c.author}` : ""}`, text: c.body });
 		for (const s of epic.stories) {
 			if (!s.issueId || s.issueId === epic.issueId) continue;

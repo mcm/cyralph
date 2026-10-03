@@ -62,7 +62,12 @@ describe("collectAttachments", () => {
 	it("dedupes names, caches by URL, and caps downloads per call", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "cyralph-att-"));
 		const calls: string[] = [];
-		const fetcher = { download: async (url: string) => (calls.push(url), { ok: true, status: 200, contentType: "image/png", data: Buffer.from(url) }) };
+		const fetcher = {
+			download: async (url: string) => {
+				calls.push(url);
+				return { ok: true, status: 200, contentType: "image/png", data: Buffer.from(url) };
+			},
+		};
 		const sources = [{ label: "desc", text: `![shot.png](${U}/1) ![shot.png](${U}/2) ![x](${U}/3)` }];
 		const first = await collectAttachments({ sources, dir, fetcher, max: 2 });
 		expect(first.map((e) => e.path?.split("/").pop() ?? e.error)).toEqual(["shot.png", "shot-2.png", "skipped: more than 2 attachments"]);
