@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentRunner, RunRequest, RunResult } from "../src/agent/runner.js";
 import { parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
-import { SessionStore } from "../src/engine/store.js";
+import { SessionStore, newRecord } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
@@ -811,3 +811,47 @@ describe("Linear attachments (images in issues)", () => {
 	});
 });
 
+
+describe("restarts (self-update drain and resume)", () => {
+	it("drains: finishes running work, keeps new work queued, and the next process resumes it", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const other = t.linear.add({ title: "Fix the typo", identifier: "ENG-9", description: "typo in README" });
+		await t.manager.handle({ kind: "created", sessionId: "d-1", issueId: epic.id });
+		const drained = t.manager.drain();
+		await t.manager.handle({ kind: "created", sessionId: "d-2", issueId: other.id });
+		await drained;
+		expect(t.store.get("d-1")?.status).toBe("completed");
+		expect(t.store.get("d-2")?.status).toBe("queued");
+		expect(t.runner.calls.some((c) => c.prompt.includes("Fix the typo"))).toBe(false);
+		expect(t.linear.bodies("thought").some((b) => b.includes("restarting for an update"))).toBe(true);
+
+		// The next process loads the same store and picks the queued session up.
+		const store = new SessionStore(join(t.root, "sessions.json"));
+		await store.load();
+		const next = new SessionManager({ config: t.config, linear: t.linear, runner: t.runner, git: t.git, shell: runShell, log: silentLogger, attachments: t.fetcher }, store);
+		await next.resumeInterrupted();
+		await next.idle();
+		expect(store.get("d-2")?.status).toBe("completed");
+		expect(t.runner.calls.some((c) => c.prompt.includes("Fix the typo"))).toBe(true);
+		expect(store.get("d-1")?.status).toBe("completed"); // finished work isn't re-run
+	});
+
+	it("resumes a session a crash left running, but not one that has been stale for days", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const old = t.linear.add({ title: "Ancient", identifier: "ENG-8" });
+		const fresh = newRecord("r-1", epic.id, "ENG-1");
+		fresh.status = "running";
+		await t.store.save(fresh);
+		const stale = newRecord("r-2", old.id, "ENG-8");
+		stale.status = "running";
+		await t.store.save(stale);
+		stale.updatedAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+		await t.manager.resumeInterrupted();
+		await t.manager.idle();
+		expect(t.store.get("r-1")?.status).toBe("completed");
+		expect(t.store.get("r-2")?.status).toBe("running");
+		expect(t.linear.activities.some((a) => a.sessionId === "r-1" && "body" in a.content && a.content.body.includes("cyralph restarted"))).toBe(true);
+	});
+});

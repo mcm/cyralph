@@ -217,6 +217,39 @@ Claude authentication works the same way as for Claude Code: `ANTHROPIC_API_KEY`
 `claude`. The default `permissionMode` is `bypassPermissions`, because runs are unattended. Run it
 somewhere you are comfortable giving an agent shell access to, as you would with Cyrus.
 
+### Self-update
+
+`cyralph start` keeps itself up to date with the branch its checkout is on, so you don't have to
+update each instance by hand:
+
+1. Every `autoUpdate.intervalMinutes` (default 30) it fetches that branch from `origin`.
+2. A new commit is checked out as a git worktree under `<stateDir>/releases/<sha>` and built and
+   tested there with `autoUpdate.buildCommands` (default `npm ci`, `npm run build`, `npm test`).
+   The running build and your checkout are not touched. A commit that fails is skipped until the
+   branch moves on.
+3. Once it passes, cyralph stops starting new sessions and waits for running ones to finish.
+   Webhooks keep being accepted, and new work is queued. Then it restarts into the new build.
+4. On startup, cyralph picks up sessions that were queued or interrupted, whether by an update or a
+   crash, from the last 24 hours.
+
+`cyralph start` does this by running the agent as a child process. It restarts the agent into the
+new build, and if a new build exits within a minute of starting, it rolls back to the previous one
+and marks the commit as failed. A crash later on is restarted with backoff. SIGINT and SIGTERM are
+passed on, so it runs the same way under a terminal, tmux or systemd.
+
+```bash
+cyralph update      # check now instead of waiting for the next interval
+```
+
+```json
+{ "autoUpdate": { "enabled": true, "intervalMinutes": 30, "remote": "origin", "branch": "main",
+                  "buildCommands": ["npm ci", "npm run build", "npm test"] } }
+```
+
+`branch` defaults to the checkout's current branch. Set `"enabled": false` to turn self-update off.
+`cyralph start` then runs the agent directly, as it did before. Changes to the supervisor itself
+(`src/update/supervisor.ts`) take effect only when you restart `cyralph start` yourself.
+
 ### Other commands
 
 ```bash
@@ -277,4 +310,6 @@ Layout:
 - `src/engine`: the Ralph loop (`epic-engine.ts`), session routing, concurrency and stop
   (`session-manager.ts`), state (`store.ts`) and routing.
 - `src/agent`: the Claude Agent SDK runner and the Linear activity reporter.
+- `src/update`: self-update (`updater.ts`), the supervisor behind `cyralph start` (`supervisor.ts`)
+  and the release bookkeeping it shares (`releases.ts`).
 - `src/git`: the worktree per epic branch, plus commit, stash and push (`workspace.ts`), and GitHub/GitLab PRs and MRs (`forge.ts`).

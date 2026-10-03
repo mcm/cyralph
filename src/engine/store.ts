@@ -125,4 +125,9 @@ export class SessionStore {
 		});
 		return this.writing;
 	}
+
+	/** Resolves once every save so far is on disk. */
+	flush(): Promise<void> {
+		return this.writing.catch(() => {});
+	}
 }

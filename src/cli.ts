@@ -6,6 +6,7 @@
  *   cyralph auth                Install the Linear agent app via OAuth (actor=app) and save the token
  *   cyralph inspect <prd|ISSUE> Show how a PRD file or Linear issue would be executed (read-only)
  *   cyralph run <ISSUE>         Run an epic once from the terminal, without webhooks
+ *   cyralph update              Ask the running agent to check for an update now
  */
 import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -17,7 +18,7 @@ import { type Config, defaultConfigPath, loadConfig, saveLinearCredentials } fro
 import { EpicEngine, type EngineDeps } from "./engine/epic-engine.js";
 import { SessionManager } from "./engine/session-manager.js";
 import { SessionStore, newRecord } from "./engine/store.js";
-import { CliGitWorkspace, runShell } from "./git/workspace.js";
+import { CliGitWorkspace, run, runShell } from "./git/workspace.js";
 import { loadEpic } from "./linear/epic-loader.js";
 import { ConsoleSessionGateway, type LinearGateway, SdkLinearGateway } from "./linear/gateway.js";
 import { LinearUploadFetcher } from "./linear/attachments.js";
@@ -28,6 +29,9 @@ import { formatStoryList } from "./ralph/prompt.js";
 import { selectNextStory } from "./ralph/selection.js";
 import type { Epic } from "./ralph/types.js";
 import { createWebhookServer } from "./server.js";
+import { RESTART_EXIT_CODE, packageRoot, pidFile, promote, updateReleaseState } from "./update/releases.js";
+import { supervise } from "./update/supervisor.js";
+import { Updater, detectInstall } from "./update/updater.js";
 
 const log = createLogger();
 
@@ -73,8 +77,12 @@ function deps(config: Config, linear: LinearGateway): EngineDeps {
 	};
 }
 
-async function cmdStart(configPath: string) {
+async function cmdStart(configPath: string, args: string[]) {
 	const config = await loadConfig(configPath);
+	// Self-update needs a parent process to restart the agent into the new build.
+	if (config.autoUpdate.enabled && process.env.CYRALPH_SUPERVISED !== "1") {
+		process.exit(await supervise({ stateDir: config.stateDir, sourceDir: packageRoot(), args: ["start", ...args], log }));
+	}
 	await refreshIfPossible(config);
 	const token = requireToken(config);
 	if (!config.linear.webhookSecret) throw new Error("linear.webhookSecret (or LINEAR_WEBHOOK_SECRET) is required.");
@@ -84,22 +92,78 @@ async function cmdStart(configPath: string) {
 	const manager = new SessionManager(deps(config, gateway), store);
 	const server = createWebhookServer({ webhookSecret: config.linear.webhookSecret, manager, log });
 	server.listen(config.port, () => log.info(`cyralph listening on :${config.port} (POST /linear-webhook)`));
+	// Pick up what a restart (an update or a crash) interrupted.
+	void manager.resumeInterrupted().catch((e: unknown) => log.warn(`resuming interrupted sessions failed: ${String(e)}`));
 	// Wake sessions whose blockers resolved while we were down, then keep polling as a webhook fallback.
 	const reconcile = () => manager.reconcileParked().catch((e: unknown) => log.warn(`blocker reconcile failed: ${String(e)}`));
 	void reconcile();
 	const poll = config.blockerPollMinutes > 0 ? setInterval(reconcile, config.blockerPollMinutes * 60_000) : undefined;
 	// Linear OAuth access tokens expire; refresh twice a day.
 	const timer = setInterval(() => void refreshIfPossible(config, gateway), 12 * 60 * 60 * 1000);
-	const shutdown = async () => {
-		log.info("shutting down…");
+	let updateTimer: NodeJS.Timeout | undefined;
+	const stopTimers = () => {
 		clearInterval(timer);
 		if (poll) clearInterval(poll);
+		clearInterval(updateTimer);
+	};
+	let stopping = false;
+	const shutdown = async () => {
+		if (stopping) return;
+		stopping = true;
+		log.info("shutting down…");
+		stopTimers();
 		server.close();
 		await manager.shutdown();
 		process.exit(0);
 	};
 	process.on("SIGINT", () => void shutdown());
 	process.on("SIGTERM", () => void shutdown());
+
+	if (process.env.CYRALPH_SUPERVISED !== "1" || !config.autoUpdate.enabled) return;
+	let check = () => log.info("self-update is off for this install; nothing to check");
+	process.on("SIGUSR2", () => check());
+	const sourceDir = process.env.CYRALPH_SOURCE_DIR || packageRoot();
+	const install = await detectInstall({ sourceDir, branch: config.autoUpdate.branch, run, log });
+	if (!install) return;
+	const runningSha = process.env.CYRALPH_RELEASE_SHA || install.runningSha;
+	const updater = new Updater({
+		stateDir: config.stateDir,
+		sourceDir,
+		runningSha,
+		remote: config.autoUpdate.remote,
+		branch: install.branch,
+		buildCommands: config.autoUpdate.buildCommands,
+		run,
+		shell: runShell,
+		log,
+		onReady: async (release) => {
+			log.info(`update: restarting into ${release.sha.slice(0, 7)} once running sessions finish`);
+			clearInterval(updateTimer);
+			await manager.drain();
+			if (stopping) return;
+			stopTimers();
+			await new Promise<void>((resolve) => {
+				server.close(() => resolve());
+				server.closeIdleConnections();
+			});
+			await manager.drain(); // webhooks that arrived while the server was closing
+			await updateReleaseState(config.stateDir, (s) => promote(s, release, runningSha));
+			log.info(`update: restarting into ${release.sha.slice(0, 7)}`);
+			process.exit(RESTART_EXIT_CODE);
+		},
+	});
+	check = () => void updater.check().catch((e: unknown) => log.warn(`update check failed: ${String(e)}`));
+	log.info(`self-update: following ${config.autoUpdate.remote}/${install.branch} every ${config.autoUpdate.intervalMinutes} min (running ${runningSha.slice(0, 7)})`);
+	updateTimer = setInterval(check, config.autoUpdate.intervalMinutes * 60_000);
+	setTimeout(check, 60_000).unref();
+}
+
+async function cmdUpdate(configPath: string) {
+	const config = await loadConfig(configPath);
+	const pid = Number((await readFile(pidFile(config.stateDir), "utf8").catch(() => "")).trim());
+	if (!pid) throw new Error(`cyralph isn't running with self-update (no ${pidFile(config.stateDir)}).`);
+	process.kill(pid, "SIGUSR2");
+	console.log("Asked cyralph to check for an update. It logs what it finds, and restarts once running sessions finish.");
 }
 
 async function cmdAuth(configPath: string, args: string[]) {
@@ -205,13 +269,15 @@ async function main() {
 	const configPath = flag(args, "config") ?? defaultConfigPath();
 	switch (command) {
 		case "start":
-			return cmdStart(configPath);
+			return cmdStart(configPath, args);
 		case "auth":
 			return cmdAuth(configPath, args);
 		case "inspect":
 			return cmdInspect(configPath, args.find((a) => !a.startsWith("--")));
 		case "run":
 			return cmdRun(configPath, args.find((a) => !a.startsWith("--")));
+		case "update":
+			return cmdUpdate(configPath);
 		default:
 			console.log(`cyralph: Linear agent for ralph-tui PRD epics
 
@@ -220,6 +286,7 @@ Usage:
   cyralph auth    [--port 3458]            Install the Linear agent app (OAuth, actor=app)
   cyralph inspect <prd-file|ISSUE-ID>      Show stories, dependencies and the next story
   cyralph run     <ISSUE-ID>               Run an epic from the terminal (no webhooks)
+  cyralph update                           Ask the running agent to check for an update now
 
 Config: ${defaultConfigPath()} (override with --config or CYRALPH_CONFIG)`);
 	}
