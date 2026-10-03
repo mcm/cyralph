@@ -31,6 +31,7 @@ import {
 	COMPLETE_PATTERN,
 	DEFAULT_STORY_TEMPLATE,
 	PR_DESCRIPTION_SYSTEM_APPEND,
+	asksForPushOrPullRequest,
 	buildPullRequestPrompt,
 	buildRequestPrompt,
 	buildStoryPrompt,
@@ -74,6 +75,10 @@ const MAX_FEEDBACK = 6000;
 
 function tail(text: string, n: number): string {
 	return text.length > n ? `…${text.slice(-n)}` : text;
+}
+
+function lowerFirst(text: string): string {
+	return text.charAt(0).toLowerCase() + text.slice(1);
 }
 
 function quote(text: string): string {
@@ -138,6 +143,8 @@ export class EpicEngine {
 		}
 		const { epic } = loaded;
 		record.identifier = epic.identifier;
+		// Re-check the forge CLI every run: the user may have installed or logged in since.
+		this.forgeProblems.delete(record.sessionId);
 		record.focusStoryKey ??= loaded.focusStoryKey;
 		for (const s of epic.stories) if (record.completedKeys.includes(s.key)) s.status = "completed";
 
@@ -170,6 +177,7 @@ export class EpicEngine {
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
 		await this.gatherAttachments(ctx, epic);
+		await this.warnIfForgeUnusable(ctx, repo, worktree);
 
 		if (rootBlockers.length > 0) {
 			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
@@ -422,6 +430,22 @@ export class EpicEngine {
 		return this.deps.git.forge(worktree, { forge: repo.forge, gitlabHost: repo.gitlabHost, gitlabHosts: this.deps.config.gitlabHosts });
 	}
 
+	/**
+	 * Tell the user up front when the forge CLI can't open the PR/MR this run will need (not installed,
+	 * not logged in), so they can fix it while the stories run. The final PR/MR step checks again.
+	 */
+	private async warnIfForgeUnusable(ctx: EngineRun, repo: RepositoryConfig, worktree: string): Promise<void> {
+		const { record, reporter } = ctx;
+		if (!this.deps.config.ralph.createPullRequest || record.prUrl) return;
+		const forge = await this.forgeFor(worktree, repo);
+		const problem = forge ? await forge.preflight(worktree).catch(() => undefined) : undefined;
+		if (!forge || !problem) return;
+		this.forgeProblems.add(record.sessionId);
+		await reporter.thought(
+			`Heads up: I'll need \`${forge.cli}\` to open the ${forge.term} when the work is done, but ${lowerFirst(problem)}\n\nI'll keep working; fix it on the cyralph host before I finish and I'll open the ${forge.term} then.`,
+		);
+	}
+
 	/** Pick up a PR/MR the agent opened itself (e.g. via a direct request) so the session links it. Never opens one. */
 	private async adoptPullRequest(ctx: EngineRun, repo: RepositoryConfig, worktree: string): Promise<void> {
 		const { record, reporter } = ctx;
@@ -518,8 +542,9 @@ export class EpicEngine {
 		});
 		record.totalCostUsd += result.costUsd ?? 0;
 		if (!result.aborted) {
-			// The story prompt carried these as guidance, so they've been acted on.
-			record.pendingRequests = record.pendingRequests.filter((r) => !pendingAtStart.includes(r));
+			// The story prompt carried these as guidance, so they've been acted on. Push/PR requests stay
+			// pending for the direct request step: story agents aren't allowed to do them.
+			record.pendingRequests = record.pendingRequests.filter((r) => !pendingAtStart.includes(r) || asksForPushOrPullRequest(r));
 		}
 
 		if (result.aborted) {
@@ -582,7 +607,9 @@ export class EpicEngine {
 
 		story.status = "completed";
 		delete record.lastFeedback[story.key];
-		if (!story.issueId) record.completedKeys.push(story.key);
+		// Plain issues have no Linear state to read back (their issue stays open for review), so remember
+		// completion here: a follow-up in the thread must not re-run the finished story.
+		if ((!story.issueId || epic.kind === "single") && !record.completedKeys.includes(story.key)) record.completedKeys.push(story.key);
 		await ctx.persist();
 
 		if (story.issueId && epic.kind !== "single") {
@@ -607,7 +634,8 @@ export class EpicEngine {
 	/**
 	 * Keep the epic's PR/MR in step with the branch. `open` allows opening a new one; without it only an
 	 * existing PR/MR is updated, so a half-finished epic doesn't burn CI on every pushed story. `final` (the
-	 * epic is complete) rewrites the title and description from the finished branch.
+	 * epic is complete) rewrites the title and description from the finished branch. Returns why a PR/MR
+	 * that should have been opened wasn't (forge CLI missing or not logged in, or creation failed).
 	 */
 	private async syncPullRequest(
 		ctx: EngineRun,
@@ -615,12 +643,12 @@ export class EpicEngine {
 		repo: RepositoryConfig,
 		worktree: string,
 		opts: { ready: boolean; open: boolean; final: boolean },
-	) {
+	): Promise<string | undefined> {
 		const { config } = this.deps;
 		const { record, reporter } = ctx;
-		if (!config.ralph.createPullRequest || !record.branch) return;
+		if (!config.ralph.createPullRequest || !record.branch) return undefined;
 		const forge = await this.forgeFor(worktree, repo);
-		if (!forge) return; // no remote to open a PR/MR against yet
+		if (!forge) return undefined; // no remote to open a PR/MR against yet
 		let described: Promise<{ title: string; body: string } | undefined> | undefined;
 		const describe = () => {
 			described ??= this.describePullRequest(ctx, epic, repo, worktree, forge);
@@ -628,16 +656,18 @@ export class EpicEngine {
 		};
 		const created = !record.prUrl;
 		if (created) {
-			if (!opts.open) return;
-			// Say why there is no PR/MR instead of silently skipping it (once per run).
-			if (!this.forgeProblems.has(record.sessionId)) {
-				const problem = await forge.preflight(worktree);
-				if (problem) {
+			if (!opts.open) return undefined;
+			// Say why there is no PR/MR instead of silently skipping it (the thought once per run; the
+			// caller turns the returned problem into a question for the user).
+			const problem = await forge.preflight(worktree);
+			if (problem) {
+				const why = `I can't open a ${forge.term}: ${problem}`;
+				if (!this.forgeProblems.has(record.sessionId)) {
 					this.forgeProblems.add(record.sessionId);
-					await reporter.thought(`Commits are pushed to \`${record.branch}\`, but I can't open a ${forge.term}: ${problem}`);
-					return;
+					await reporter.thought(`Commits are pushed to \`${record.branch}\`, but ${why}`);
 				}
-			} else return;
+				return why;
+			}
 			const text = await describe();
 			let pr: { url: string; number?: number };
 			try {
@@ -649,8 +679,9 @@ export class EpicEngine {
 				});
 			} catch (err) {
 				this.forgeProblems.add(record.sessionId);
-				await reporter.error(`Couldn't open a ${forge.term} with \`${forge.cli}\`: ${tail(String(err instanceof Error ? err.message : err), 1500)}`);
-				return;
+				const why = `Couldn't open a ${forge.term} with \`${forge.cli}\`: ${tail(String(err instanceof Error ? err.message : err), 1500)}`;
+				await reporter.error(why);
+				return why;
 			}
 			record.prUrl = pr.url;
 			record.prNumber = pr.number;
@@ -662,6 +693,7 @@ export class EpicEngine {
 		const text = opts.final && !created ? await describe() : undefined;
 		const edit = text ? { title: prTitle(epic, text.title), body: prBody(epic, text.body) } : {};
 		if (record.prUrl && (text || opts.ready)) await forge.update(worktree, { url: record.prUrl, number: record.prNumber }, { ...edit, ready: opts.ready });
+		return undefined;
 	}
 
 	/**
@@ -730,16 +762,18 @@ export class EpicEngine {
 		if (isEpicComplete(scoped)) {
 			const all = isEpicComplete(epic.stories);
 			// Commits that never reached a remote (e.g. origin was added after the stories ran).
+			let problem: string | undefined;
 			if (config.ralph.pushPerStory && record.branch) {
 				try {
 					if (await this.deps.git.needsPush(worktree, repo.baseBranch)) await this.deps.git.push(worktree, record.branch);
 				} catch (err) {
-					await reporter.error(`Push failed: ${String(err)}`);
+					problem = `Push failed: ${String(err)}`;
+					await reporter.error(problem);
 				}
 			}
 			try {
 				// A PR/MR is only opened for a finished epic; a delegated story that leaves others open just pushes.
-				await this.syncPullRequest(ctx, epic, repo, worktree, {
+				problem ??= await this.syncPullRequest(ctx, epic, repo, worktree, {
 					ready: all && config.ralph.markPrReadyWhenComplete,
 					open: all || config.ralph.openPullRequestEarly,
 					final: all,
@@ -751,6 +785,20 @@ export class EpicEngine {
 				await linear
 					.setIssueState(epic.issueId, { name: config.ralph.epicCompletedStateName, type: config.ralph.epicCompletedStateType ?? undefined })
 					.catch((e: unknown) => log.warn(String(e)));
+			}
+			if (problem) {
+				// The work is done but the PR/MR step isn't: stop and ask rather than report success.
+				const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
+				await reporter.elicitation(
+					[
+						requestOutput,
+						`Finished ${what} on \`${record.branch}\`${cost}, but the last step didn't happen. ${problem}`,
+						"Please fix that on the cyralph host, then reply here (for example `open the MR`) and I'll retry.",
+					]
+						.filter(Boolean)
+						.join("\n\n"),
+				);
+				return "awaiting_input";
 			}
 			if (requestOutput) {
 				const link = record.prUrl && !requestOutput.includes(record.prUrl) ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : "";

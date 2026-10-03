@@ -196,6 +196,14 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 	return renderTemplate(template, vars).trim();
 }
 
+/**
+ * Does a message from the thread ask to push the branch or open/update the PR/MR? Story agents may not do
+ * that (the orchestrator owns git), so such requests are handled as direct requests instead of guidance.
+ */
+export function asksForPushOrPullRequest(text: string): boolean {
+	return /\b(push|pull[- ]request|merge[- ]request|PR|MR|glab|gh)\b/i.test(text);
+}
+
 export interface RequestPromptContext {
 	epic: Epic;
 	requests: string[];

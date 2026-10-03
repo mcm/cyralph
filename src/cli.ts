@@ -81,6 +81,17 @@ function deps(config: Config, linear: LinearGateway): EngineDeps {
 	};
 }
 
+/** Log a warning for every repository whose forge CLI is missing or not logged in. */
+async function checkForges(config: Config): Promise<void> {
+	if (!config.ralph.createPullRequest) return;
+	const git = new CliGitWorkspace();
+	for (const repo of config.repositories) {
+		const forge = await git.forge(repo.repositoryPath, { forge: repo.forge, gitlabHost: repo.gitlabHost, gitlabHosts: config.gitlabHosts });
+		const problem = await forge?.preflight(repo.repositoryPath);
+		if (forge && problem) log.warn(`repository ${repo.id}: can't open ${forge.term}s: ${problem.split("\n")[0]}`);
+	}
+}
+
 async function cmdStart(configPath: string, args: string[]) {
 	const config = await loadConfig(configPath);
 	// Self-update needs a parent process to restart the agent into the new build.
@@ -99,6 +110,8 @@ async function cmdStart(configPath: string, args: string[]) {
 	server.listen(config.port, () =>
 		log.info(`cyralph listening on :${config.port} (POST /linear-webhook${githubWebhookSecret ? ", POST /github-webhook" : ""})`),
 	);
+	// Warn early when a repository's forge CLI (gh/glab) can't open PRs/MRs; each run checks again too.
+	void checkForges(config).catch((e: unknown) => log.warn(`forge check failed: ${String(e)}`));
 	// Pick up what a restart (an update or a crash) interrupted.
 	void manager.resumeInterrupted().catch((e: unknown) => log.warn(`resuming interrupted sessions failed: ${String(e)}`));
 	// Wake sessions whose blockers resolved while we were down, then keep polling as a webhook fallback.

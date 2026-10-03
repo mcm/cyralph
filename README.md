@@ -214,10 +214,15 @@ For a **self-hosted GitLab** whose hostname doesn't contain "gitlab", list it in
 instance from the remote, for example an SSH alias from `~/.ssh/config` or a custom SSH port.
 
 On the cyralph host, log the CLI in once: `glab auth login --hostname git.example.com` (or
-`gh auth login`). If the CLI is missing or not logged in, cyralph says so in the session
-(*"Commits are pushed to `…`, but I can't open a merge request: …"*) and doesn't skip the step
-silently. Sessions link the result as **Merge request** or **Pull request**, and the agent in a
+`gh auth login`). cyralph checks this at startup (a warning in its log) and at the start of every
+run (a heads-up in the Linear session, so you can fix it while the stories run). If the CLI still
+can't open the PR/MR when the work is done, the session ends by asking you to fix it instead of
+reporting success; reply (for example *"open the MR"*) and cyralph retries without re-running the
+finished stories. Sessions link the result as **Merge request** or **Pull request**, and the agent in a
 request session is told which CLI to use.
+
+Replies that ask to push or open the PR/MR are handled by cyralph itself after the stories, never
+passed to a story agent (story agents aren't allowed to push).
 
 ### Automated PR reviews (Cubic)
 

@@ -730,6 +730,38 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		expect(t.runner.calls.find((c) => /## Your Task: ENG-3/.test(c.prompt))?.prompt).toContain("- Use a smallint column");
 	});
 
+	it("keeps push/MR requests away from a running story agent and handles them directly", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const injected: string[] = [];
+		let release: () => void = () => {};
+		const original = t.runner.run.bind(t.runner);
+		t.runner.run = async (req) => {
+			if (/## Your Task: ENG-2/.test(req.prompt) && !injected.includes("held")) {
+				injected.push("held");
+				req.onInjector?.((text) => {
+					injected.push(text);
+					return true;
+				});
+				await new Promise<void>((r) => {
+					release = r;
+				});
+				req.onInjector?.(undefined);
+			}
+			return original(req);
+		};
+		await t.manager.handle({ kind: "created", sessionId: "m-15", issueId: epic.id, commentBody: DELEGATION_BODY });
+		await new Promise((r) => setTimeout(r, 300));
+		await t.manager.handle({ kind: "prompted", sessionId: "m-15", issueId: epic.id, body: "Please use glab to create an MR" });
+		expect(injected).toEqual(["held"]);
+		release();
+		await t.manager.idle();
+		// Not story guidance (story agents may not push), but a direct request once the stories are done.
+		expect(t.runner.calls.find((c) => /## Your Task: ENG-3/.test(c.prompt))?.prompt).not.toContain("create an MR");
+		expect(t.runner.calls.filter(isRequest).map((c) => c.prompt)).toEqual([expect.stringContaining("> Please use glab to create an MR")]);
+		expect(t.store.get("m-15")?.pendingRequests).toEqual([]);
+	});
+
 	it("a bare mention with no instruction does nothing", async () => {
 		const t = setup();
 		const { epic } = ralphEpic(t.linear);
@@ -782,17 +814,54 @@ describe("GitHub vs GitLab forges", () => {
 		expect(req?.prompt).not.toContain("gh pr create");
 	});
 
-	it("says why no PR/MR was opened when the CLI isn't usable, once per run", async () => {
+	it("stops to ask when the CLI isn't usable, then opens the MR when told to retry", async () => {
 		const t = gitlabSetup();
 		t.git.preflightProblem = "`glab` is not logged in (run `glab auth login --hostname git.example.com`).";
 		const { epic } = ralphEpic(t.linear);
 		await t.manager.handle({ kind: "created", sessionId: "f-3", issueId: epic.id });
 		await t.manager.idle();
-		const notes = t.linear.bodies("thought").filter((b) => b.includes("can't open a merge request"));
+		// Warned once up front, not after every story.
+		const notes = t.linear.bodies("thought").filter((b) => b.includes("glab auth login"));
 		expect(notes).toHaveLength(1);
-		expect(notes[0]).toContain("glab auth login --hostname git.example.com");
+		expect(notes[0]).toContain("Heads up: I'll need `glab` to open the merge request");
+		// The run ends on a question, not a success report.
 		expect(t.store.get("f-3")?.prUrl).toBeUndefined();
+		expect(t.store.get("f-3")?.status).toBe("awaiting_input");
+		const ask = t.linear.bodies("elicitation").at(-1) ?? "";
+		expect(ask).toContain("I can't open a merge request: `glab` is not logged in");
+		expect(ask).toContain("reply here");
+		expect(t.linear.bodies("response").some((b) => b.startsWith("Finished"))).toBe(false);
+
+		// The user logs in and asks for the MR: the orchestrator retries, without re-running stories.
+		t.git.preflightProblem = undefined;
+		const before = t.runner.calls.filter((c) => !isRequest(c) && /## Your Task/.test(c.prompt)).length;
+		await t.manager.handle({ kind: "prompted", sessionId: "f-3", issueId: epic.id, body: "Please use glab to create an MR" });
+		await t.manager.idle();
+		expect(t.runner.calls.filter((c) => !isRequest(c) && /## Your Task/.test(c.prompt))).toHaveLength(before);
+		expect(t.store.get("f-3")?.prUrl).toBe("https://git.example.com/acme/app/-/merge_requests/7");
 		expect(t.store.get("f-3")?.status).toBe("completed");
+		expect(t.linear.bodies("response").at(-1)).toContain("Merge request: https://git.example.com/acme/app/-/merge_requests/7");
+	});
+
+	it("doesn't re-run a finished plain issue when the thread asks for the MR", async () => {
+		const t = gitlabSetup();
+		t.git.preflightProblem = "`glab` is not installed on the cyralph host.";
+		const issue = t.linear.add({ title: "Fix the login bug", identifier: "ENG-80", branchName: "eng-80-login" });
+		await t.manager.handle({ kind: "created", sessionId: "f-4", issueId: issue.id });
+		await t.manager.idle();
+		expect(t.store.get("f-4")?.status).toBe("awaiting_input");
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("`glab` is not installed");
+
+		t.git.preflightProblem = undefined;
+		await t.manager.handle({ kind: "prompted", sessionId: "f-4", issueId: issue.id, body: "Please use glab to create an MR" });
+		await t.manager.idle();
+		const stories = t.runner.calls.filter((c) => /## Your Task/.test(c.prompt));
+		expect(stories).toHaveLength(1);
+		const req = t.runner.calls.filter(isRequest);
+		expect(req).toHaveLength(1);
+		expect(req[0]?.prompt).toContain("> Please use glab to create an MR");
+		expect(t.store.get("f-4")?.status).toBe("completed");
+		expect(t.store.get("f-4")?.prUrl).toBe("https://git.example.com/acme/app/-/merge_requests/7");
 	});
 
 	it("passes per-repo forge overrides through", async () => {
