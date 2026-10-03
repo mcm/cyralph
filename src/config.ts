@@ -86,7 +86,7 @@ export const RalphConfigSchema = z.object({
 	maxAttemptsPerStory: z.number().int().positive().default(3),
 	/** Hard cap on iterations for one run of an epic. 0 = unlimited. */
 	maxIterationsPerRun: z.number().int().nonnegative().default(50),
-	/** When a PRD sits in an issue description, create child story issues for it in Linear (ralph-tui format). */
+	/** When a PRD sits in an issue description, create a sub-issue per story in Linear (priority, order and blocks relations as Linear metadata). */
 	materializeStories: z.boolean().default(true),
 	/** Commit after each completed story. */
 	commitPerStory: z.boolean().default(true),

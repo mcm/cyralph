@@ -24,6 +24,7 @@ export class FakeLinear implements LinearGateway {
 			stateType: "unstarted",
 			stateName: "Todo",
 			labels: [],
+			priority: 0,
 			...partial,
 		};
 		this.issues.set(id, issue);
@@ -54,7 +55,14 @@ export class FakeLinear implements LinearGateway {
 		});
 	}
 	async createIssue(input: Parameters<LinearGateway["createIssue"]>[0]) {
-		return this.add({ title: input.title, description: input.description, parentId: input.parentId, teamId: input.teamId });
+		return this.add({
+			title: input.title,
+			description: input.description,
+			parentId: input.parentId,
+			teamId: input.teamId,
+			priority: input.priority ?? 0,
+			subIssueSortOrder: input.subIssueSortOrder,
+		});
 	}
 	async createBlocksRelation(blocker: string, blocked: string) {
 		this.blocks.set(blocked, [...(this.blocks.get(blocked) ?? []), blocker]);

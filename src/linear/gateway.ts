@@ -16,6 +16,10 @@ export interface IssueSummary {
 	stateType: string;
 	stateName: string;
 	labels: string[];
+	/** Linear priority: 0 No priority, 1 Urgent, 2 High, 3 Medium, 4 Low. */
+	priority: number;
+	/** Manual position among its parent's sub-issues. */
+	subIssueSortOrder?: number;
 	projectName?: string;
 	parentId?: string;
 	assigneeId?: string;
@@ -65,6 +69,7 @@ export interface LinearGateway {
 		description: string;
 		parentId?: string;
 		priority?: number;
+		subIssueSortOrder?: number;
 		projectName?: string;
 	}): Promise<IssueSummary>;
 	/** `blockerId` blocks `blockedId`. */
@@ -109,6 +114,8 @@ export class SdkLinearGateway implements LinearGateway {
 			stateType: state?.type ?? "unstarted",
 			stateName: state?.name ?? "",
 			labels: labels.nodes.map((l) => l.name),
+			priority: issue.priority ?? 0,
+			subIssueSortOrder: issue.subIssueSortOrder ?? undefined,
 			projectName: project?.name,
 			parentId: issue.parentId ?? undefined,
 			assigneeId: issue.assigneeId ?? undefined,
@@ -165,6 +172,7 @@ export class SdkLinearGateway implements LinearGateway {
 			description: input.description,
 			parentId: input.parentId,
 			priority: input.priority,
+			subIssueSortOrder: input.subIssueSortOrder,
 			projectId,
 		});
 		const issue = await payload.issue;

@@ -1,6 +1,7 @@
 /**
  * Ralph task selection: pick the highest-priority open story whose dependencies are all done.
- * Mirrors ralph-tui's tracker semantics (in-progress first, then priority ascending).
+ * In-progress first, then priority (Linear's: Urgent first, no priority last), then the epic's
+ * sub-issue order in Linear, then the story id.
  */
 import type { Story } from "./types.js";
 
@@ -30,6 +31,7 @@ export function sortStories(stories: Story[]): Story[] {
 		(a, b) =>
 			Number(b.status === "in_progress") - Number(a.status === "in_progress") ||
 			a.priority - b.priority ||
+			(a.sortOrder ?? Number.POSITIVE_INFINITY) - (b.sortOrder ?? Number.POSITIVE_INFINITY) ||
 			naturalCompare(a.storyId, b.storyId),
 	);
 }

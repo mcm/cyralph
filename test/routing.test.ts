@@ -18,6 +18,7 @@ const issue = (i: Partial<IssueSummary> = {}): IssueSummary => ({
 	stateType: "unstarted",
 	stateName: "Todo",
 	labels: [],
+	priority: 0,
 	...i,
 });
 

@@ -4,7 +4,7 @@
  *   load epic -> prepare worktree -> repeat { pick next ready story -> fresh agent session ->
  *   check <promise>COMPLETE</promise> -> run verify commands -> commit/push/PR -> mark story Done }
  *
- * Linear child issues are the tracker (like ralph-tui's Linear tracker), the agent session is the
+ * Linear sub-issues are the tracker, the agent session is the
  * activity log, and the session plan shows story checklist progress.
  */
 import { readFile } from "node:fs/promises";
