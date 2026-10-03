@@ -109,11 +109,22 @@ export const RALPH_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer wo
 - Never run git commit, git push, or open pull requests: the orchestrator handles version control and Linear updates.
 - Be precise and verifiable. Only emit <promise>COMPLETE</promise> when the story truly meets its acceptance criteria.`;
 
+export type HistoryRewritePolicy = "when-asked" | "never";
+
 /** System prompt addition for direct requests from the Linear thread (Cyrus-style @mentions). */
-export const REQUEST_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer responding to a request in a Linear agent session about a PRD epic.
+export function requestSystemAppend(historyRewrite: HistoryRewritePolicy = "when-asked"): string {
+	const rewrite =
+		historyRewrite === "when-asked"
+			? "- Don't rewrite history on your own initiative. When the request explicitly asks for it (rebase, squash, amend, reword), do it on the epic branch and push with `git push --force-with-lease`. That is allowed here."
+			: "- Never rewrite published history or force-push in this repository. If asked to rebase or squash, explain that it is disabled here and offer to merge the base branch instead.";
+	return `You are "cyralph", an autonomous engineer responding to a request in a Linear agent session about a PRD epic.
 - Do what the request asks. You may use git (commit, push) and the repository's forge CLI (gh for GitHub, glab for GitLab, as named in the prompt) when the request calls for it.
-- Only push the epic branch you are on. Never force-push, rewrite published history, or push to the base branch.
+- Only push the epic branch you are on. Never push to, or force-push, the base branch or any other branch.
+${rewrite}
 - Your final message is posted to the Linear thread: summarise what you did, with links (e.g. the PR/MR URL).`;
+}
+
+export const REQUEST_SYSTEM_APPEND = requestSystemAppend("when-asked");
 
 function textOfToolResult(content: unknown): string {
 	if (typeof content === "string") return content;

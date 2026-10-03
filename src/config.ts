@@ -51,6 +51,8 @@ export const RepositoryConfigSchema = z.object({
 	allowedTools: z.array(z.string()).optional(),
 	disallowedTools: z.array(z.string()).optional(),
 	appendInstruction: z.string().optional(),
+	/** Per-repository override of `ralph.historyRewrite`. */
+	historyRewrite: z.enum(["when-asked", "never"]).optional(),
 	/** Custom story prompt template (Handlebars subset, see src/ralph/prompt.ts). */
 	promptTemplatePath: z.string().optional(),
 });
@@ -84,6 +86,12 @@ export const RalphConfigSchema = z.object({
 	createPullRequest: z.boolean().default(true),
 	/** Mark the PR ready for review once every story is complete. */
 	markPrReadyWhenComplete: z.boolean().default(true),
+	/**
+	 * Whether a direct request may rewrite the epic branch's history (rebase, squash, amend) and push it
+	 * with `--force-with-lease`. "when-asked": only when the request explicitly asks for it. "never": the
+	 * agent merges instead and explains. The base branch and other branches are never force-pushed.
+	 */
+	historyRewrite: z.enum(["when-asked", "never"]).default("when-asked"),
 	/** Workflow state type to move the epic issue to when every story is complete (null = leave it). */
 	epicCompletedStateType: z.enum(["started", "completed"]).nullable().default(null),
 	/** Name of a specific workflow state for the epic on completion (e.g. "In Review"); overrides the type. */

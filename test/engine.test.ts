@@ -697,3 +697,41 @@ describe("repository routing in sessions", () => {
 	});
 });
 
+describe("history rewrites on request (rebase)", () => {
+	const isRequest = (c: RunRequest) => c.prompt.includes("## Request from your team");
+
+	it("lets an explicit rebase request rewrite the epic branch with --force-with-lease", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "h-1", issueId: epic.id, commentBody: "@cyralph please rebase this branch onto main" });
+		await t.manager.idle();
+		const req = t.runner.calls.find(isRequest);
+		expect(req?.prompt).toContain("git rebase origin/main");
+		expect(req?.prompt).toContain("git push --force-with-lease origin eng-1-task-priority");
+		expect(req?.prompt).toContain("don't substitute a merge");
+		expect(req?.systemAppend).toContain("That is allowed here.");
+		expect(req?.systemAppend).not.toContain("Never rewrite published history");
+	});
+
+	it("can be disabled per repository, in which case the agent explains and offers a merge", async () => {
+		const t = setup();
+		t.config.repositories[0]!.historyRewrite = "never";
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "h-2", issueId: epic.id, commentBody: "@cyralph rebase onto main" });
+		await t.manager.idle();
+		const req = t.runner.calls.find(isRequest);
+		expect(req?.prompt).toContain("History rewrites (rebase, squash, force-push) are disabled for this repository");
+		expect(req?.prompt).not.toContain("--force-with-lease");
+		expect(req?.systemAppend).toContain("Never rewrite published history");
+	});
+
+	it("story sessions still never touch git history or pushes", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "h-3", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.calls.every((c) => c.systemAppend === undefined)).toBe(true); // story runs use RALPH_SYSTEM_APPEND
+		expect(t.runner.calls[0]?.prompt).toContain("Do NOT create git commits or push");
+	});
+});
+

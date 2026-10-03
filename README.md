@@ -69,6 +69,13 @@ These follow Cyrus:
   example:
   > @cyralph there is now a git remote, git@github.com:me/app.git, can you push and create a PR?
 
+  If you **explicitly ask** for a rebase, squash or amend, the agent rewrites the epic branch and
+  pushes it with `git push --force-with-lease`. It never rewrites history on its own initiative,
+  and it never force-pushes the base branch or any other branch. If someone else pushed in the
+  meantime, the lease is rejected and the agent reports it instead of overwriting their work. To
+  disable rewrites, set `"historyRewrite": "never"` under `ralph` or on a repository. The agent then
+  says it can't and offers a merge instead.
+
   Add **`/ralph`** to a mention (`/label-based-prompt`, Cyrus's spelling, also works) to have it
   work the epic like a delegation. The rest of the comment then becomes story guidance.
 - **Replies in a session:**

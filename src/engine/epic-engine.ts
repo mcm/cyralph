@@ -10,7 +10,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ActivityReporter } from "../agent/activity.js";
-import { type AgentRunner, REQUEST_SYSTEM_APPEND } from "../agent/runner.js";
+import { type AgentRunner, requestSystemAppend } from "../agent/runner.js";
 import type { Config, RepositoryConfig } from "../config.js";
 import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
 import { type LoadedEpic, loadEpic, openRootBlockers } from "../linear/epic-loader.js";
@@ -286,9 +286,11 @@ export class EpicEngine {
 		await reporter.thought(requests.length === 1 ? "Working on your request." : `Working on your ${requests.length} requests.`);
 		const branch = record.branch ?? epic.branchName;
 		const forge = await this.forgeFor(worktree, repo);
+		const historyRewrite = repo.historyRewrite ?? config.ralph.historyRewrite;
 		const prompt = buildRequestPrompt({
 			epic,
 			requests,
+			historyRewrite,
 			branch,
 			baseBranch: repo.baseBranch,
 			remoteUrl: await git.remoteUrl(worktree),
@@ -315,7 +317,7 @@ export class EpicEngine {
 				abortSignal: ctx.abortSignal,
 				onEvent: reporter.onRunnerEvent,
 				onInjector: ctx.setInjector,
-				systemAppend: REQUEST_SYSTEM_APPEND,
+				systemAppend: requestSystemAppend(historyRewrite),
 				resume,
 			});
 		// Follow-ups continue the previous request conversation, like Cyrus resuming its Claude session.

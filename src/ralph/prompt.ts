@@ -199,6 +199,8 @@ export interface RequestPromptContext {
 	forgeInstructions?: string;
 	/** "pull request" or "merge request". */
 	prTerm?: string;
+	/** May an explicit request rewrite the epic branch's history? Default "when-asked". */
+	historyRewrite?: "when-asked" | "never";
 }
 
 /**
@@ -228,7 +230,10 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		...ctx.requests.map((r) => `> ${r.trim().replace(/\n/g, "\n> ")}\n`),
 		"## How to handle it",
 		"- This is a direct request, not a story. Do what it asks, and nothing beyond it.",
-		`- You may commit, and push \`${ctx.branch}\` to \`origin\` (\`git push -u origin ${ctx.branch}\`), when the request calls for it. Never force-push and never push to \`${ctx.baseBranch}\`.`,
+		`- You may commit, and push \`${ctx.branch}\` to \`origin\` (\`git push -u origin ${ctx.branch}\`), when the request calls for it. Never push to \`${ctx.baseBranch}\` or any other branch.`,
+		(ctx.historyRewrite ?? "when-asked") === "when-asked"
+			? `- History rewrites are allowed on \`${ctx.branch}\` when the request asks for one. For a rebase: \`git fetch origin && git rebase origin/${ctx.baseBranch}\`, resolve conflicts, run the quality gates, then \`git push --force-with-lease origin ${ctx.branch}\`. Do the rebase that was asked for; don't substitute a merge. If the lease is rejected (someone else pushed), stop and report it instead of overwriting their work.`
+			: `- History rewrites (rebase, squash, force-push) are disabled for this repository. If the request asks for one, say so and offer to merge \`${ctx.baseBranch}\` into \`${ctx.branch}\` instead.`,
 		...(ctx.forgeInstructions ? [`- ${ctx.forgeInstructions}`] : ["- There is no `origin` remote yet, so pushing or opening a pull/merge request isn't possible until one is added."]),
 		"- If you change code, run the quality gates and commit with a clear message.",
 		"- If the request is ambiguous or can't be done (e.g. missing credentials), say exactly what's missing instead of guessing.",
