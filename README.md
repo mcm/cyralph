@@ -299,7 +299,13 @@ in priority order and then config order.
 npm test          # vitest: parsers, selection, prompt, webhooks, and an end-to-end engine
                   # run against a fake Linear and a real git repo + bare origin
 npm run typecheck
+npm run lint      # biome (lint only; formatting is not enforced)
+npm run check     # every CI gate: lint, typecheck, test, build
 ```
+
+CI (`.github/workflows/ci.yml`) runs `npm run lint`, `typecheck`, `test`, `build` and
+`npm audit --omit=dev --audit-level=high` on every pull request (and pushes to `main`),
+on Node 22, 24 and 26.
 
 Layout:
 
