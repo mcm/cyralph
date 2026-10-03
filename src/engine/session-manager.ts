@@ -7,7 +7,7 @@
  */
 import { join, resolve, sep } from "node:path";
 import { ActivityReporter } from "../agent/activity.js";
-import type { RepositoryConfig } from "../config.js";
+import type { Config, RepositoryConfig } from "../config.js";
 import { type ChangeRequestRef, type CiStatus, buildCiFailureRequest, parseChangeRequestUrl } from "../git/ci.js";
 import { type ReviewSubmitted, buildReviewRequest, githubRepoSlug, isReviewBot, parsePullRequestUrl } from "../github/reviews.js";
 import type { AgentWebhookEvent } from "../linear/webhook.js";
@@ -44,7 +44,9 @@ interface Active {
 }
 
 export class SessionManager {
-	private readonly engine: EpicEngine;
+	/** Bound to the config at the time it was made; a run keeps the engine (and config) it started with. */
+	private engine: EpicEngine;
+	private readonly forgeProblems = new Set<string>();
 	private readonly active = new Map<string, Active>();
 	private readonly queue: string[] = [];
 	/** Branch/issue currently being worked, to avoid two sessions fighting over one worktree. */
@@ -60,10 +62,21 @@ export class SessionManager {
 	private draining = false;
 
 	constructor(
-		private readonly deps: EngineDeps,
+		private deps: EngineDeps,
 		private readonly store: SessionStore,
 	) {
-		this.engine = new EpicEngine(deps);
+		this.engine = new EpicEngine(deps, this.forgeProblems);
+	}
+
+	/**
+	 * Swap in a reloaded config. Runs already in progress keep the config they started with; queued and
+	 * new work, polling and webhook handling use the new one.
+	 */
+	setConfig(config: Config): void {
+		this.deps = { ...this.deps, config };
+		this.engine = new EpicEngine(this.deps, this.forgeProblems);
+		// maxConcurrentSessions may have gone up.
+		this.pump();
 	}
 
 	private reporter(sessionId: string) {

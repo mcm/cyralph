@@ -1385,3 +1385,28 @@ describe("cleanup after a merge", () => {
 		expect(existsSync(off.path)).toBe(true);
 	});
 });
+
+describe("config reload", () => {
+	it("keeps the running epic on the config it started with; new runs use the reloaded one", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		const run = t.runner.run.bind(t.runner);
+		let reloaded = false;
+		t.runner.run = async (req) => {
+			if (!reloaded && !req.prompt.includes(PR_DESCRIPTION_HEADING)) {
+				reloaded = true;
+				t.manager.setConfig({ ...t.config, model: "reloaded-model" });
+			}
+			return run(req);
+		};
+		await t.manager.handle({ kind: "created", sessionId: "sess-1", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.runner.calls.map((c) => c.model)).toEqual(["opus", "opus", "opus"]);
+
+		const other = t.linear.add({ title: "Another task", identifier: "ENG-9", branchName: "eng-9-other", description: "do it" });
+		await t.manager.handle({ kind: "created", sessionId: "sess-2", issueId: other.id });
+		await t.manager.idle();
+		expect(t.runner.calls.slice(3).map((c) => c.model)).toContain("reloaded-model");
+		expect(t.runner.calls.slice(3).every((c) => c.model === "reloaded-model")).toBe(true);
+	});
+});

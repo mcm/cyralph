@@ -62,15 +62,22 @@ async function handleGitHub(req: IncomingMessage, res: ServerResponse, secret: s
 	manager.handleReview(event).catch((err: unknown) => log.error(`review handling failed: ${String(err)}`));
 }
 
-export function createWebhookServer(opts: { webhookSecret: string; githubWebhookSecret?: string; manager: SessionManager; log: Logger }): Server {
-	const { webhookSecret, githubWebhookSecret, manager, log } = opts;
+/** A secret, or a function returning the current one (so a config reload can change it). */
+type Secret = string | undefined | (() => string | undefined);
+const current = (s: Secret) => (typeof s === "function" ? s() : s);
+
+export function createWebhookServer(opts: { webhookSecret: Secret; githubWebhookSecret?: Secret; manager: SessionManager; log: Logger }): Server {
+	const { manager, log } = opts;
 	return createServer(async (req, res) => {
+		const webhookSecret = current(opts.webhookSecret);
+		const githubWebhookSecret = current(opts.githubWebhookSecret);
 		const url = new URL(req.url ?? "/", "http://localhost");
 		if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true });
 		if (req.method === "POST" && url.pathname === "/github-webhook") return handleGitHub(req, res, githubWebhookSecret, manager, log);
 		if (req.method !== "POST" || (url.pathname !== "/linear-webhook" && url.pathname !== "/webhook")) {
 			return send(res, 404, { error: "not found" });
 		}
+		if (!webhookSecret) return send(res, 503, { error: "linear.webhookSecret is not configured" });
 		let raw: Buffer;
 		try {
 			raw = await readBody(req);

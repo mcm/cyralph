@@ -27,4 +27,19 @@ describe("webhook server", () => {
 		expect(seen).toEqual([expect.objectContaining({ kind: "created", sessionId: "s1", issueId: "i1" })]);
 		server.close();
 	});
+
+	it("checks webhooks against the current secret, so a reloaded one applies", async () => {
+		const manager = { handle: async () => {} } as unknown as SessionManager;
+		let secret = "old";
+		const server = createWebhookServer({ webhookSecret: () => secret, manager, log: silentLogger });
+		await new Promise<void>((r) => server.listen(0, r));
+		const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/linear-webhook`;
+		const body = JSON.stringify({ type: "Unknown", webhookTimestamp: Date.now() });
+		const post = (key: string) => fetch(url, { method: "POST", body, headers: { "linear-signature": signBody(body, key) } });
+		expect((await post("old")).status).toBe(200);
+		secret = "new";
+		expect((await post("old")).status).toBe(401);
+		expect((await post("new")).status).toBe(200);
+		server.close();
+	});
 });
