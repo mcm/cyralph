@@ -62,6 +62,8 @@ export class FakeLinear implements LinearGateway {
 			teamId: input.teamId,
 			priority: input.priority ?? 0,
 			subIssueSortOrder: input.subIssueSortOrder,
+			labels: input.labels ?? [],
+			projectName: input.projectName,
 		});
 	}
 	async createBlocksRelation(blocker: string, blocked: string) {

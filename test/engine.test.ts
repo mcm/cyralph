@@ -1665,6 +1665,43 @@ describe("issues filed during a run", () => {
 		expect(thoughts).not.toContain("joined **ENG-1**");
 	});
 
+	it("files a manual follow-up for a person: never runs it, and the story waits until it's done", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-4", (req, run) => {
+			if (run > 1) return undefined;
+			expect(req.prompt).toContain('<follow-up title="…" manual>');
+			return {
+				output: 'I need access.\n<follow-up title="Grant the bot access to the registry" manual>\nAdd cyralph to the registry.\n</follow-up>',
+				isError: false,
+				aborted: false,
+			};
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-fm", issueId: epic.id });
+		await t.manager.idle();
+
+		const filed = (await t.linear.getChildren(epic.id)).find((c) => c.title === "Grant the bot access to the registry");
+		expect(filed?.labels).toEqual(["manual"]);
+		expect(t.linear.blocks.get(s3.id)).toEqual([filed?.id]);
+		// No agent turn is spent on the manual step, and ENG-4 isn't re-run while it's open.
+		expect(order(t)).toEqual(["ENG-2", "ENG-3", "ENG-4"]);
+		expect(t.store.get("sess-fm")?.attempts[s3.id]).toBe(0);
+		const thoughts = t.linear.bodies("thought").join("\n");
+		expect(thoughts).toContain(`**${filed?.identifier}** is a manual step for a person (labelled \`manual\`)`);
+		expect(thoughts).toContain(`**${filed?.identifier}** is a manual step for a person, so ENG-4 runs again once it's done.`);
+		expect(thoughts).not.toContain("I'll work it next");
+		expect(t.store.get("sess-fm")?.status).toBe("blocked");
+		expect(t.store.get("sess-fm")?.waitingOn).toEqual([{ id: filed?.id, identifier: filed?.identifier }]);
+
+		// The person does the manual step in Linear; ENG-4 runs again.
+		t.linear.issues.get(filed!.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "issue_state", issueId: filed!.id, identifier: filed!.identifier, stateType: "completed", removed: false });
+		await t.manager.idle();
+		expect(order(t)).toEqual(["ENG-2", "ENG-3", "ENG-4", "ENG-4"]);
+		expect(t.store.get("sess-fm")?.status).toBe("completed");
+	});
+
 	it("adds follow-ups from a completed story as new stories without blocking it", async () => {
 		const t = setup();
 		const { epic, s1 } = ralphEpic(t.linear);

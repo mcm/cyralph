@@ -189,4 +189,19 @@ describe("parseFollowUps", () => {
 		expect(parseFollowUps(Array.from({ length: 15 }, (_, i) => `<follow-up title="T${i}">x</follow-up>`).join(""))).toHaveLength(10);
 		expect(parseFollowUps("<promise>COMPLETE</promise>")).toEqual([]);
 	});
+
+	it("reads the manual attribute, in any position", () => {
+		const out = [
+			'<follow-up title="Grant access" manual>Add the bot to the org.</follow-up>',
+			'<follow-up manual="true" title="Rotate the key">Rotate it.</follow-up>',
+			'<follow-up title="Not manual" manual="false">x</follow-up>',
+			'<follow-up title="Code fix">y</follow-up>',
+		].join("\n");
+		expect(parseFollowUps(out)).toEqual([
+			{ title: "Grant access", description: "Add the bot to the org.", manual: true },
+			{ title: "Rotate the key", description: "Rotate it.", manual: true },
+			{ title: "Not manual", description: "x" },
+			{ title: "Code fix", description: "y" },
+		]);
+	});
 });
