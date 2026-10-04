@@ -94,6 +94,8 @@ class ScriptedRunner implements AgentRunner {
 		"Looked at the diff.\n<pr-title>Add task priorities with badges and sorting</pr-title>\n<pr-description>\nTasks get a priority.\n\n**Breaking changes**: none.\n</pr-description>";
 	failFirst = new Set<string>();
 	neverComplete = new Set<string>();
+	/** Custom behaviour per story id, by how many times that story has run (1 = first); undefined = the default. */
+	script = new Map<string, (req: RunRequest, run: number) => Promise<RunResult | undefined> | RunResult | undefined>();
 	async run(req: RunRequest): Promise<RunResult> {
 		if (req.prompt.includes(PR_DESCRIPTION_HEADING)) {
 			this.describeCalls.push(req);
@@ -102,6 +104,9 @@ class ScriptedRunner implements AgentRunner {
 		}
 		this.calls.push(req);
 		const id = /## Your Task: (\S+)/.exec(req.prompt)?.[1] ?? "unknown";
+		const run = this.calls.filter((c) => c.prompt.includes(`## Your Task: ${id} `)).length;
+		const scripted = await this.script.get(id)?.(req, run);
+		if (scripted) return scripted;
 		req.onEvent?.({ type: "tool", name: "Write", input: { file_path: `${id}.txt` } });
 		if (this.neverComplete.has(id) || this.failFirst.delete(id)) {
 			writeFileSync(join(req.cwd, `${id}.partial`), "wip\n");
@@ -1408,5 +1413,133 @@ describe("config reload", () => {
 		await t.manager.idle();
 		expect(t.runner.calls.slice(3).map((c) => c.model)).toContain("reloaded-model");
 		expect(t.runner.calls.slice(3).every((c) => c.model === "reloaded-model")).toBe(true);
+	});
+});
+
+describe("issues filed during a run", () => {
+	const order = (t: ReturnType<typeof setup>) => t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+	const done = (output: string): RunResult => ({ output: `${output}\n<promise>COMPLETE</promise>`, isError: false, aborted: false });
+
+	it("works sub-issues a validation story filed itself, then re-runs the validation story", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-4", (_req, run) => {
+			if (run > 1) return undefined;
+			// The agent files the problems it found in Linear itself (e.g. with its own Linear tools).
+			for (const id of ["UI-21", "UI-22"]) {
+				const issue = t.linear.add({ title: `Fix ${id}`, identifier: id, parentId: epic.id, priority: 3 });
+				t.linear.blocks.set(s3.id, [...(t.linear.blocks.get(s3.id) ?? []), issue.id]);
+			}
+			return { output: "Validation found two problems; filed UI-21 and UI-22.", isError: false, aborted: false };
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f1", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(order(t)).toEqual(["ENG-2", "ENG-3", "ENG-4", "UI-21", "UI-22", "ENG-4"]);
+		const record = t.store.get("sess-f1");
+		expect(record?.status).toBe("completed");
+		// Waiting on its follow-ups didn't use up an attempt.
+		expect(record?.attempts[s3.id]).toBe(1);
+		expect(t.runner.calls.at(-1)?.prompt).toContain("this story waited for UI-21, UI-22");
+		expect(t.linear.bodies("thought").join("\n")).toContain("**ENG-4** needs **UI-21**, **UI-22** done first");
+		expect(t.linear.bodies("response").at(-1)).toContain("all 5 stories of **ENG-1**");
+	});
+
+	it("files <follow-up> blocks as sub-issues that block the story, works them, and re-runs the story", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-4", (req, run) => {
+			if (run > 1) return undefined;
+			expect(req.prompt).toContain('<follow-up title="Short imperative title">');
+			return {
+				output: 'Two things are broken.\n<follow-up title="Fix the badge colour">\nWrong colour.\n- [ ] badge is red\n</follow-up>\n<follow-up title="Handle empty lists">\nCrashes.\n</follow-up>',
+				isError: false,
+				aborted: false,
+			};
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f2", issueId: epic.id });
+		await t.manager.idle();
+
+		const children = await t.linear.getChildren(epic.id);
+		const filed = children.filter((c) => c.title === "Fix the badge colour" || c.title === "Handle empty lists");
+		expect(filed).toHaveLength(2);
+		expect(filed[0]?.description).toContain("- [ ] badge is red");
+		expect(filed[0]?.description).toContain("Filed by cyralph while working on ENG-4");
+		expect(t.linear.blocks.get(s3.id)).toEqual(filed.map((f) => f.id));
+		expect(order(t)).toEqual(["ENG-2", "ENG-3", "ENG-4", ...filed.map((f) => f.identifier), "ENG-4"]);
+		expect(t.store.get("sess-f2")?.status).toBe("completed");
+		for (const f of filed) expect(t.linear.issues.get(f.id)?.stateType).toBe("completed");
+		const thoughts = t.linear.bodies("thought").join("\n");
+		expect(thoughts).toContain(`Filed ${filed.map((f) => `**${f.identifier}**`).join(", ")} as new stories of **ENG-1**, blocking **ENG-4**`);
+		expect(thoughts).not.toContain("joined **ENG-1**");
+	});
+
+	it("adds follow-ups from a completed story as new stories without blocking it", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req, run) => {
+			if (run > 1) return undefined;
+			writeFileSync(join(req.cwd, "ENG-2.txt"), "x\n");
+			return done('Done.\n<follow-up title="Add an index on priority">\nSlow queries.\n</follow-up>');
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f3", issueId: epic.id });
+		await t.manager.idle();
+
+		const filed = (await t.linear.getChildren(epic.id)).find((c) => c.title === "Add an index on priority");
+		expect(filed).toBeDefined();
+		expect(t.linear.blocks.get(s1.id)).toBeUndefined();
+		expect(order(t)).toContain(filed?.identifier);
+		expect(t.store.get("sess-f3")?.status).toBe("completed");
+		expect(t.linear.bodies("response").at(-1)).toContain("all 4 stories of **ENG-1**");
+	});
+
+	it("picks up a sub-issue a person adds to the epic while the run is going", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req) => {
+			t.linear.add({ title: "Also export priorities", identifier: "ENG-90", parentId: epic.id, priority: 4 });
+			writeFileSync(join(req.cwd, "ENG-2.txt"), "x\n");
+			return done("Done.");
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f4", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(order(t)).toEqual(["ENG-2", "ENG-3", "ENG-4", "ENG-90"]);
+		expect(t.linear.bodies("thought").join("\n")).toContain("A new story joined **ENG-1**: **ENG-90** Also export priorities");
+		expect(t.linear.plans.at(-1)?.map((p) => p.content)).toContain("ENG-90: Also export priorities");
+	});
+
+	it("a directly delegated story works the follow-ups it files, but not other siblings", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (_req, run) =>
+			run === 1 ? { output: '<follow-up title="Fix the migration tool">\nIt drops columns.\n</follow-up>', isError: false, aborted: false } : undefined,
+		);
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f5", issueId: s1.id });
+		await t.manager.idle();
+
+		const filed = (await t.linear.getChildren(epic.id)).find((c) => c.title === "Fix the migration tool");
+		expect(order(t)).toEqual(["ENG-2", filed?.identifier, "ENG-2"]);
+		expect(t.store.get("sess-f5")?.status).toBe("completed");
+	});
+
+	it("stops pausing a story that keeps turning up more work and counts its attempts", async () => {
+		const t = setup({ maxAttemptsPerStory: 1 });
+		const { epic } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-4", (_req, run) => ({ output: `<follow-up title="Problem ${run}">\nMore.\n</follow-up>`, isError: false, aborted: false }));
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-f6", issueId: epic.id });
+		await t.manager.idle();
+
+		// Three rounds of follow-ups, then the fourth counts as its one attempt and it's set aside.
+		expect(order(t).filter((id) => id === "ENG-4")).toHaveLength(4);
+		expect(t.store.get("sess-f6")?.status).toBe("awaiting_input");
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("ENG-4: Sort by priority** failed 1 attempts");
+		expect((await t.linear.getChildren(epic.id)).filter((c) => c.title.startsWith("Problem "))).toHaveLength(4);
 	});
 });

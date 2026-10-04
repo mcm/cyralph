@@ -58,6 +58,10 @@ export interface SessionRecord {
 	/** Completed story keys for in-memory ("prd" kind) epics that were not materialized. */
 	completedKeys: string[];
 	focusStoryKey?: string;
+	/** Stories filed during this session as follow-ups of a story; a focused run works them too. */
+	followUpKeys?: string[];
+	/** Times each story was paused to wait on follow-ups it turned up (capped, so it can't loop forever). */
+	followUpRounds?: Record<string, number>;
 	/** Open issues (outside the epic) the run is parked on; resolving any of them wakes the session. */
 	waitingOn: Array<{ id: string; identifier: string }>;
 	/** A human said to start despite open blockers. */

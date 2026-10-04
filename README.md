@@ -170,6 +170,23 @@ What cyralph adds on top:
   attempt, and its output goes into the retry.
 - **Git is also owned by the orchestrator.** The agent is told not to commit. cyralph commits once
   per story, pushes, and opens or updates the PR/MR with `gh` or `glab` (see *GitHub and GitLab*).
+- **Work found along the way becomes stories.** The epic's sub-issues are re-read from Linear before
+  every story, so issues added to the epic during a run (by a person, or by the agent) join it, and
+  new blocks relations count. A story agent that finds work outside its story (a validation story
+  that turns up bugs, say) ends its final message with one block per item:
+
+  ```
+  <follow-up title="Fix the empty-list crash">
+  What is wrong and what done looks like, with `- [ ]` acceptance criteria.
+  </follow-up>
+  ```
+
+  cyralph files each as a sub-issue of the epic. Without the completion signal they block the story
+  that found them: it pauses without using up an attempt, the follow-ups are worked next, and then
+  the story runs again. With the completion signal they are just added as new stories. The same pause
+  applies when the agent files blocking issues itself; one that isn't a sub-issue of the epic is
+  waited on like any outside blocker. A directly delegated story works its own follow-ups too. After
+  three such pauses, a story's next round counts as a normal failed attempt.
 
 ## GitHub and GitLab
 
