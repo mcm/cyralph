@@ -8,6 +8,27 @@ import { type Epic, type Story, dependencyLabel } from "./types.js";
 
 export const COMPLETE_PATTERN = /<promise>\s*COMPLETE\s*<\/promise>/i;
 
+/** At most this many follow-up issues are filed from one story session. */
+export const MAX_FOLLOW_UPS = 10;
+
+export interface FollowUp {
+	title: string;
+	description: string;
+}
+
+/**
+ * Follow-up issues a story agent asks the orchestrator to file, written in its final message as
+ * `<follow-up title="…">description</follow-up>` blocks.
+ */
+export function parseFollowUps(output: string): FollowUp[] {
+	const out: FollowUp[] = [];
+	for (const m of output.matchAll(/<follow-up\s+title\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/follow-up>/gi)) {
+		const title = (m[1] ?? "").trim();
+		if (title && !out.some((f) => f.title.toLowerCase() === title.toLowerCase())) out.push({ title, description: (m[2] ?? "").trim() });
+	}
+	return out.slice(0, MAX_FOLLOW_UPS);
+}
+
 export interface PromptContext {
 	epic: Epic;
 	story: Story;
@@ -24,6 +45,8 @@ export interface PromptContext {
 	appendInstruction?: string;
 	/** Markdown list of downloaded Linear attachments (see formatAttachments). */
 	attachments?: string;
+	/** The orchestrator files `<follow-up>` blocks as sub-issues of the epic (Linear-backed epics only). */
+	followUps?: boolean;
 }
 
 export const DEFAULT_STORY_TEMPLATE = `You are working through a PRD epic from Linear, one user story per session.
@@ -123,6 +146,16 @@ If the story is already implemented (e.g. by a previous session), verify it meet
 Only when every acceptance criterion is met and the quality gates pass, end your final message with:
 <promise>COMPLETE</promise>
 If you are blocked and cannot complete the story, explain precisely why and do NOT output the completion signal.
+{{#if followUps}}
+
+## Follow-up Work
+If you find work this story needs that is outside its scope (bugs elsewhere, missing pieces, problems a validation turns up), don't create Linear issues yourself and don't leave it as a note. Put one block per item in your final message, and the orchestrator files each as a new story (a sub-issue of {{epicIdentifier}}):
+<follow-up title="Short imperative title">
+What is wrong, where, and what done looks like (acceptance criteria as \`- [ ]\` checkboxes).
+</follow-up>
+- If {{storyId}} can't be completed until they are fixed, leave out the completion signal. They will block {{storyId}}, be worked first, and then {{storyId}} runs again.
+- If {{storyId}} is complete anyway, add the completion signal too, and they join the epic as new stories.
+{{/if}}
 `;
 
 type Vars = Record<string, string | number | undefined>;
@@ -192,6 +225,7 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 		currentDate: new Date().toISOString().slice(0, 10),
 		appendInstruction: ctx.appendInstruction,
 		attachments: ctx.attachments,
+		followUps: ctx.followUps ? "yes" : undefined,
 	};
 	return renderTemplate(template, vars).trim();
 }

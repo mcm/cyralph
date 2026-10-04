@@ -34,7 +34,9 @@ import {
 	asksForPushOrPullRequest,
 	buildPullRequestPrompt,
 	buildRequestPrompt,
+	type FollowUp,
 	buildStoryPrompt,
+	parseFollowUps,
 	parsePullRequestDescription,
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
@@ -72,6 +74,14 @@ export interface EngineRun {
 }
 
 const MAX_FEEDBACK = 6000;
+/** Times one story may pause for follow-ups it filed before a further round counts as a failed attempt. */
+const MAX_FOLLOW_UP_ROUNDS = 3;
+
+/** "Start anyway": outside blockers and manual steps no longer gate any story. */
+function dropOutsideBlockers(epic: Epic): void {
+	const manual = new Set(epic.stories.filter((s) => s.manual).map((s) => s.key));
+	for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d) && !manual.has(d));
+}
 
 function tail(text: string, n: number): string {
 	return text.length > n ? `…${text.slice(-n)}` : text;
@@ -87,6 +97,12 @@ function quote(text: string): string {
 		.split("\n")
 		.map((l) => `> ${l}`)
 		.join("\n");
+}
+
+const FOLLOW_UP_MARK = "Filed by cyralph while working on";
+
+function followUpFooter(story: Story): string {
+	return `_${FOLLOW_UP_MARK} ${story.storyId}._`;
 }
 
 export function planFor(epic: Epic, current?: Story, exhausted: ReadonlySet<string> = new Set()): PlanStep[] {
@@ -157,8 +173,7 @@ export class EpicEngine {
 		let rootBlockers: Array<{ id: string; identifier: string }> = [];
 		if (record.ignoreBlockers) {
 			// A human said to go ahead: outside blockers and manual steps no longer gate any story.
-			const manual = new Set(epic.stories.filter((s) => s.manual).map((s) => s.key));
-			for (const s of epic.stories) s.dependsOn = s.dependsOn.filter((d) => !externalIdOf(d) && !manual.has(d));
+			dropOutsideBlockers(epic);
 		} else {
 			// Blocked-by on the epic (or plain issue) itself gates the story work, as in Cyrus.
 			rootBlockers = await openRootBlockers(linear, epic);
@@ -197,11 +212,10 @@ export class EpicEngine {
 			await linear.setIssueState(epic.issueId, { type: "started" }).catch((e: unknown) => log.warn(String(e)));
 		}
 
-		// Which stories this run may touch.
-		const inScope = (s: Story) => !record.focusStoryKey || s.key === record.focusStoryKey;
+		// Which stories this run may touch: a focused run also works the follow-ups its story turned up.
+		const inScope = (s: Story) => !record.focusStoryKey || s.key === record.focusStoryKey || (record.followUpKeys ?? []).includes(s.key);
 		const exhausted = () =>
 			new Set(epic.stories.filter((s) => (record.attempts[s.key] ?? 0) >= config.ralph.maxAttemptsPerStory).map((s) => s.key));
-		const outOfScope = new Set(epic.stories.filter((s) => !inScope(s)).map((s) => s.key));
 
 		await reporter.plan(planFor(epic, undefined, exhausted()));
 
@@ -209,6 +223,9 @@ export class EpicEngine {
 		const cap = config.ralph.maxIterationsPerRun;
 		while (!ctx.abortSignal.aborted) {
 			if (cap > 0 && iterations >= cap) break;
+			// Issues filed under the epic while the run goes on (by a story, or by a person) join it.
+			if (iterations > 0) await this.refreshStories(ctx, epic);
+			const outOfScope = epic.stories.filter((s) => !inScope(s)).map((s) => s.key);
 			const skip = new Set([...exhausted(), ...outOfScope]);
 			const story = selectNextStory(epic.stories, skip);
 			if (!story) break;
@@ -501,6 +518,7 @@ export class EpicEngine {
 		const { config, linear, runner, log } = this.deps;
 		const { record, reporter } = ctx;
 		const max = config.ralph.maxAttemptsPerStory;
+		const depsBefore = new Set(story.dependsOn);
 		const attempt = (record.attempts[story.key] ?? 0) + 1;
 		record.attempts[story.key] = attempt;
 		await ctx.persist();
@@ -527,6 +545,7 @@ export class EpicEngine {
 				maxAttempts: max,
 				appendInstruction: repo.appendInstruction,
 				attachments: formatAttachments(attachmentsForStory(ctx.attachments ?? [], story.key)),
+				followUps: epic.kind === "children",
 			},
 			template,
 		);
@@ -556,6 +575,9 @@ export class EpicEngine {
 			await ctx.persist();
 			return;
 		}
+
+		const complete = !result.isError && COMPLETE_PATTERN.test(result.output);
+		if (await this.handleFollowUps({ ctx, epic, story, output: result.output, complete, depsBefore, attempt, exhausted: args.exhausted })) return;
 
 		let feedback: string | undefined;
 		if (result.isError) {
@@ -592,6 +614,143 @@ export class EpicEngine {
 		}
 
 		await this.completeStory({ ctx, epic, story, worktree, repo, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
+	}
+
+	/**
+	 * File the story session's `<follow-up>` blocks as sub-issues of the epic (blocking the story when it
+	 * didn't complete), then re-read the epic. Returns true when the story now waits on issues filed during
+	 * its session, through these blocks or by the agent itself: the attempt doesn't count, those issues are
+	 * worked first (or waited for, outside the epic), and the story runs again once they're done.
+	 */
+	private async handleFollowUps(args: {
+		ctx: EngineRun;
+		epic: Epic;
+		story: Story;
+		output: string;
+		complete: boolean;
+		depsBefore: ReadonlySet<string>;
+		attempt: number;
+		exhausted: () => Set<string>;
+	}): Promise<boolean> {
+		const { ctx, epic, story, output, complete, depsBefore, attempt } = args;
+		if (epic.kind !== "children") return false;
+		const { record, reporter } = ctx;
+		const requested = parseFollowUps(output);
+		if (requested.length > 0) await this.fileFollowUps(ctx, epic, story, requested, !complete);
+		if (complete) return false;
+
+		await this.refreshStories(ctx, epic);
+		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
+		const current = byKey.get(story.key);
+		const added = (current?.dependsOn ?? []).filter((d) => {
+			const dep = byKey.get(d);
+			return !depsBefore.has(d) && !(dep && isStoryDone(dep));
+		});
+		if (added.length === 0) return false;
+		const round = (record.followUpRounds?.[story.key] ?? 0) + 1;
+		// A story that keeps turning up more work falls back to counting attempts, so it can't loop forever.
+		if (round > MAX_FOLLOW_UP_ROUNDS) return false;
+		record.followUpRounds = { ...record.followUpRounds, [story.key]: round };
+		record.attempts[story.key] = attempt - 1;
+		const inEpic = added.filter((d) => byKey.has(d));
+		record.followUpKeys = [...new Set([...(record.followUpKeys ?? []), ...inEpic])];
+		const names = added.map((d) => dependencyLabel(epic, d));
+		record.lastFeedback[story.key] =
+			`The previous session found work that had to be done first, so this story waited for ${names.join(", ")}. That work is finished now: check every acceptance criterion again. The previous session's final message was:\n\n${quote(tail(output, 2000))}`;
+		await ctx.persist();
+
+		const bold = (ids: string[]) => ids.map((d) => `**${dependencyLabel(epic, d)}**`).join(", ");
+		const outside = added.filter((d) => !byKey.has(d));
+		const lines = [`⏸️ **${story.storyId}** needs ${bold(added)} done first.`];
+		if (inEpic.length) lines.push(`I'll work ${inEpic.length === 1 ? "it" : "them"} next and then run ${story.storyId} again.`);
+		if (outside.length) {
+			lines.push(
+				`${bold(outside)} ${outside.length === 1 ? "isn't a sub-issue" : "aren't sub-issues"} of **${epic.identifier}**, so ${story.storyId} also waits until ${outside.length === 1 ? "it's" : "they're"} done.`,
+			);
+		}
+		await reporter.thought(lines.join(" "));
+		await reporter.plan(planFor(epic, undefined, args.exhausted()));
+		return true;
+	}
+
+	/** Create sub-issues of the epic for follow-up work a story turned up; `blocking` makes them block that story. */
+	private async fileFollowUps(ctx: EngineRun, epic: Epic, story: Story, followUps: FollowUp[], blocking: boolean): Promise<void> {
+		const { linear, log } = this.deps;
+		const parent = await linear.getIssue(epic.issueId).catch(() => undefined);
+		const teamId = parent?.teamId ?? epic.teamId;
+		if (!teamId) {
+			log.warn(`${epic.identifier}: no team to file follow-ups in`);
+			return;
+		}
+		const open = new Map(epic.stories.filter((s) => !isStoryDone(s)).map((s) => [s.title.toLowerCase(), s]));
+		const filed: string[] = [];
+		const failed: string[] = [];
+		for (const f of followUps) {
+			try {
+				// A retry that reports the same follow-up again reuses the open issue filed the first time.
+				const existing = open.get(f.title.toLowerCase());
+				const issue = existing?.issueId
+					? { id: existing.issueId, identifier: existing.storyId }
+					: await linear.createIssue({
+							teamId,
+							parentId: epic.issueId,
+							title: f.title,
+							description: `${f.description}\n\n${followUpFooter(story)}`.trim(),
+							priority: story.priority <= 4 ? story.priority : 0,
+							projectName: parent?.projectName,
+						});
+				if (blocking && story.issueId && issue.id !== story.issueId && !story.dependsOn.includes(issue.id)) {
+					await linear.createBlocksRelation(issue.id, story.issueId);
+				}
+				filed.push(`**${issue.identifier}**`);
+			} catch (err) {
+				log.warn(`could not file follow-up "${f.title}": ${String(err)}`);
+				failed.push(`"${f.title}"`);
+			}
+		}
+		const lines: string[] = [];
+		if (filed.length) {
+			lines.push(
+				`Filed ${filed.join(", ")} as ${filed.length === 1 ? "a new story" : "new stories"} of **${epic.identifier}**${blocking ? `, blocking **${story.storyId}**` : ""}.`,
+			);
+		}
+		if (failed.length) lines.push(`I couldn't file ${failed.join(", ")} in Linear.`);
+		if (lines.length) await ctx.reporter.thought(lines.join(" "));
+	}
+
+	/**
+	 * Re-read the epic's sub-issues from Linear, so issues filed while the run goes on join it and new
+	 * blockers are honoured. Stories this run completed stay completed (in case marking them Done failed).
+	 */
+	private async refreshStories(ctx: EngineRun, epic: Epic): Promise<void> {
+		if (epic.kind !== "children") return;
+		const { config, linear, log } = this.deps;
+		const { record, reporter } = ctx;
+		let fresh: Epic;
+		try {
+			fresh = (await loadEpic(linear, record.issueId, { materializeStories: false, manualLabels: config.ralph.manualLabels })).epic;
+		} catch (err) {
+			log.warn(`${epic.identifier}: could not refresh stories from Linear: ${String(err)}`);
+			return;
+		}
+		if (fresh.kind !== "children" || fresh.issueId !== epic.issueId) return;
+		const old = new Map(epic.stories.map((s) => [s.key, s]));
+		for (const s of fresh.stories) if (old.get(s.key)?.status === "completed") s.status = "completed";
+		epic.stories = fresh.stories;
+		epic.externalIssues = fresh.externalIssues;
+		if (record.ignoreBlockers) dropOutsideBlockers(epic);
+
+		const added = fresh.stories.filter((s) => !old.has(s.key));
+		if (added.length === 0) return;
+		// Follow-ups cyralph filed itself were already announced.
+		const others = added.filter((s) => !s.sourceText?.includes(FOLLOW_UP_MARK));
+		if (others.length) {
+			await reporter.thought(
+				`${others.length === 1 ? "A new story" : `${others.length} new stories`} joined **${epic.identifier}**: ${others.map((s) => `**${s.storyId}** ${s.title}`).join(", ")}.`,
+			);
+		}
+		const max = config.ralph.maxAttemptsPerStory;
+		await reporter.plan(planFor(epic, undefined, new Set(epic.stories.filter((s) => (record.attempts[s.key] ?? 0) >= max).map((s) => s.key))));
 	}
 
 	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; worktree: string; repo: RepositoryConfig; summary: string }) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractCodebasePatterns, recentProgressEntries } from "../src/ralph/progress.js";
-import { COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
+import { COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
 import { blockedStories, isEpicComplete, selectNextStory } from "../src/ralph/selection.js";
 import type { Epic, Story } from "../src/ralph/types.js";
 
@@ -149,5 +149,17 @@ describe("progress log", () => {
 		const recent = recentProgressEntries(log, 1);
 		expect(recent).toContain("US-002");
 		expect(recent).not.toContain("US-001");
+	});
+});
+
+describe("parseFollowUps", () => {
+	it("reads follow-up blocks, drops repeats by title, and caps the count", () => {
+		const out = 'Found things.\n<follow-up title="Fix A">\nA is broken.\n- [ ] A works\n</follow-up>\n<follow-up title="fix a">dup</follow-up>\n<FOLLOW-UP title=" Fix B ">B</FOLLOW-UP>';
+		expect(parseFollowUps(out)).toEqual([
+			{ title: "Fix A", description: "A is broken.\n- [ ] A works" },
+			{ title: "Fix B", description: "B" },
+		]);
+		expect(parseFollowUps(Array.from({ length: 15 }, (_, i) => `<follow-up title="T${i}">x</follow-up>`).join(""))).toHaveLength(10);
+		expect(parseFollowUps("<promise>COMPLETE</promise>")).toEqual([]);
 	});
 });
