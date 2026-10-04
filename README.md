@@ -36,7 +36,8 @@ comes from Linear's own fields, not from title prefixes or body markup:
 | Order | **Priority** (Urgent first, *No priority* last), then the sub-issues' manual order in the parent |
 | Dependencies | **Blocks** relations (to siblings, or to issues outside the epic) |
 | Done / in progress | Workflow state type (completed or canceled = done, started = in progress) |
-| Manual step for a person | A label from `ralph.manualLabels` |
+| Manual step for a person | A label from `ralph.manualLabels`, or a project or `[repo=…]` tag no configured repository matches |
+| Repository | The epic's, unless the story's own tag, label, project or team routes it elsewhere (see [Stories in other repositories](#stories-in-other-repositories)) |
 | Acceptance criteria | Checkboxes in the description (an `## Acceptance Criteria` section if present) |
 
 | Delegated issue | Behaviour |
@@ -133,6 +134,7 @@ relation seen from either side, so it doesn't matter which issue you added the l
 | **The epic issue itself** (or a plain delegated issue) blocked by an open issue | Nothing starts: no worktree is created and the issue's state isn't changed. The session is parked. A parent that lists its own child as a blocker is ignored. |
 | A story delegated on its own whose sibling prerequisite isn't done | Parked on that sibling. |
 | Story issue labelled **manual** (any label in `ralph.manualLabels`, default `["manual"]`, case-insensitive) | A step for a person. The agent never works it. Stories that depend on it are held as if blocked by an outside issue: other stories run first, then the session is parked on the manual story until someone moves it to Done or Canceled. |
+| Story that belongs in a repository cyralph doesn't have (its project or `[repo=…]` tag matches no configured repository) | Treated exactly like a manual story. |
 
 A parked session posts *"…blocked on **ENG-99**. I'll start automatically when it's done or
 canceled."* It wakes when any issue it waits on is completed, canceled or deleted. Every wake
@@ -429,8 +431,27 @@ repository configured but never route to it.
 ```
 
 A `#branch` override only affects a newly created epic branch. An existing branch keeps its
-history. Unlike Cyrus, one issue routes to **one** repository. If several match, the first wins,
-in priority order and then config order.
+history. If several repositories match, the first wins, in priority order and then config order.
+
+#### Stories in other repositories
+
+An epic can span repositories. The epic routes as above, and then each story is routed on the
+signals it doesn't share with the epic, in the same order: a `[repo=…]` tag in its description, a
+routing label, a Linear project other than the epic's, or a team other than the epic's. A story
+without any of these stays in the epic's repository.
+
+- **It matches a configured repository**: the story runs in a worktree of that repository, on a
+  branch with the epic's branch name. Its commits go there, and that repository gets its own
+  pull/merge request when the epic is done. Reviews and CI failures on that PR/MR are worked in the
+  same worktree, and it is cleaned up once merged. A repository none of the stories committed to
+  gets no PR/MR.
+- **Its project or tag matches no configured repository**: the story is treated like a manual step
+  for a person (or for another cyralph that has that repository). It is never worked here, and the
+  stories that depend on it wait until it is Done or Canceled. Teams and labels often span
+  repositories, so an unmatched team or label never has this effect: the story stays in the
+  epic's repository.
+
+Follow-ups a story files go in the story's project, so they route to the same repository.
 
 ## Development
 

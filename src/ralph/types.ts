@@ -26,6 +26,17 @@ export interface Story {
 	notes?: string;
 	/** A manual step done by a person (labelled with `ralph.manualLabels`): never given to the agent. */
 	manual?: boolean;
+	/**
+	 * Why the story is treated as manual although it isn't labelled so: it belongs in a repository this
+	 * cyralph has no access to (e.g. "project `Docs`, which no repository here is set up for").
+	 */
+	elsewhere?: string;
+	/** A repository other than the epic's that the story routed to (its own worktree, branch and PR/MR). */
+	repo?: { id: string; name: string; routedBy: string };
+	/** The story issue's routing fields: its Linear project, team and labels. */
+	projectName?: string;
+	teamKey?: string;
+	labels?: string[];
 	/** The full Linear issue body (for finding uploaded files outside the Description section). */
 	sourceText?: string;
 	/** Present when the story is backed by a Linear issue. */
@@ -50,6 +61,9 @@ export interface Epic {
 	description: string;
 	url?: string;
 	teamId?: string;
+	/** The epic issue's Linear project and team, which its stories inherit for routing unless they differ. */
+	projectName?: string;
+	teamKey?: string;
 	branchName: string;
 	/** Shell commands the PRD requires to pass for every story. */
 	qualityGates: string[];

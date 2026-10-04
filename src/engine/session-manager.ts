@@ -16,7 +16,13 @@ import type { EngineDeps } from "./epic-engine.js";
 import { EpicEngine } from "./epic-engine.js";
 import { asksForPushOrPullRequest } from "../ralph/prompt.js";
 import { matchSelection, selectionValue } from "./routing.js";
-import { PARKED, type SessionRecord, type SessionStore, newRecord } from "./store.js";
+import { PARKED, type RepoLane, type SessionRecord, type SessionStore, lanesOf, newRecord } from "./store.js";
+
+/** A PR/MR cyralph opened: the session it belongs to and the repository lane it was opened from. */
+interface LaneRef {
+	record: SessionRecord;
+	lane: RepoLane;
+}
 
 const RESOLVED_STATE_TYPES = new Set(["completed", "canceled"]);
 
@@ -54,8 +60,8 @@ export class SessionManager {
 	/** Worktree path -> session id; an epic session and a story session share one branch. */
 	private readonly busyWorktrees = new Map<string, string>();
 	private readonly toldQueued = new Set<string>();
-	/** Delivers a message into the agent session currently running for a cyralph session. */
-	private readonly injectors = new Map<string, (text: string) => boolean>();
+	/** Delivers a message into the agent session currently running for a cyralph session, and the repository it works in. */
+	private readonly injectors = new Map<string, { inject: (text: string) => boolean; repoId?: string }>();
 	/** Webhook handlers still in flight, so a restart doesn't cut one off halfway. */
 	private readonly handling = new Set<Promise<void>>();
 	/** Set while waiting to restart for an update: nothing new starts, new work stays queued. */
@@ -156,16 +162,19 @@ export class SessionManager {
 	 * Newest session per PR/MR whose worktree is still on disk and whose PR/MR may have been merged
 	 * (PRs/MRs known to be closed without merging are left alone).
 	 */
-	private mergeCandidates(issueId?: string): SessionRecord[] {
-		const latest = new Map<string, SessionRecord>();
-		for (const r of this.store.all()) {
-			if (!r.prUrl || (issueId && r.issueId !== issueId)) continue;
-			const seen = latest.get(r.prUrl);
-			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
+	private mergeCandidates(issueId?: string): LaneRef[] {
+		const latest = new Map<string, LaneRef>();
+		for (const record of this.store.all()) {
+			if (issueId && record.issueId !== issueId) continue;
+			for (const lane of lanesOf(record)) {
+				if (!lane.prUrl) continue;
+				const seen = latest.get(lane.prUrl);
+				if (!seen || record.updatedAt > seen.record.updatedAt) latest.set(lane.prUrl, { record, lane });
+			}
 		}
-		return [...latest.values()].filter((r) => {
-			const repo = this.deps.config.repositories.find((x) => x.id === r.repoId);
-			return r.worktreePath && r.branch && r.prMerged !== false && repo && repo.cleanupMergedWorktrees !== false;
+		return [...latest.values()].filter(({ lane }) => {
+			const repo = this.deps.config.repositories.find((x) => x.id === lane.repoId);
+			return lane.worktreePath && lane.branch && lane.prMerged !== false && repo && repo.cleanupMergedWorktrees !== false;
 		});
 	}
 
@@ -178,21 +187,21 @@ export class SessionManager {
 	async cleanupMerged(issueId?: string): Promise<void> {
 		const { ci, config, git, log } = this.deps;
 		if (!ci) return;
-		for (const record of this.mergeCandidates(issueId)) {
-			const ref = parseChangeRequestUrl(record.prUrl);
-			const repo = config.repositories.find((x) => x.id === record.repoId);
-			const path = record.worktreePath;
-			const branch = record.branch;
+		for (const { record, lane } of this.mergeCandidates(issueId)) {
+			const ref = parseChangeRequestUrl(lane.prUrl);
+			const repo = config.repositories.find((x) => x.id === lane.repoId);
+			const path = lane.worktreePath;
+			const branch = lane.branch;
 			if (!ref || !repo || !path || !branch) continue;
 			// Work on the issue may still use the worktree; check again on a later pass.
-			const sessions = this.store.all().filter((r) => r.issueId === record.issueId || r.worktreePath === path);
+			const sessions = this.store.all().filter((r) => r.issueId === record.issueId || lanesOf(r).some((l) => l.worktreePath === path));
 			if (sessions.some((r) => this.active.has(r.sessionId) || this.queue.includes(r.sessionId) || this.busyIssues.has(r.issueId))) continue;
 			if ([...this.busyWorktrees.keys()].includes(path)) continue;
 			try {
 				const state = await ci.state(ref);
 				if (!state || state.open) continue;
-				record.prClosed = true;
-				record.prMerged = state.merged;
+				lane.prClosed = true;
+				lane.prMerged = state.merged;
 				await this.store.save(record);
 				if (!state.merged) continue;
 				const term = ref.forge === "gitlab" ? "merge request" : "pull request";
@@ -222,8 +231,9 @@ export class SessionManager {
 	/** Stop tracking a worktree that was removed (or isn't cyralph's to remove). */
 	private async forgetWorktree(path: string): Promise<void> {
 		for (const r of this.store.all()) {
-			if (r.worktreePath !== path) continue;
-			r.worktreePath = undefined;
+			const lanes = lanesOf(r).filter((l) => l.worktreePath === path);
+			if (lanes.length === 0) continue;
+			for (const l of lanes) l.worktreePath = undefined;
 			await this.store.save(r);
 		}
 	}
@@ -243,17 +253,18 @@ export class SessionManager {
 		const repo = await this.repoForSlug(event.repo);
 		if (!repo) return log.debug(`ignoring ${where}: no configured repository`);
 		if (repo.respondToReviews === false) return log.debug(`ignoring ${where}: respondToReviews is off for ${repo.id}`);
-		const record = this.recordForPullRequest(repo.id, event);
-		if (!record) return log.debug(`ignoring ${where}: not a pull request cyralph opened`);
+		const found = this.recordForPullRequest(repo.id, event);
+		if (!found) return log.debug(`ignoring ${where}: not a pull request cyralph opened`);
+		const { record, lane } = found;
 		if (!event.prOpen) {
-			record.prClosed = true;
+			lane.prClosed = true;
 			await this.store.save(record);
 			await this.cleanupMerged(record.issueId);
 			return;
 		}
 		if (record.status === "stopped") return log.info(`ignoring ${where}: session ${record.identifier ?? record.sessionId} was stopped`);
 		if (this.reviewHandled(event.prUrl, review.id)) return;
-		record.handledReviewIds = [...(record.handledReviewIds ?? []), review.id];
+		lane.handledReviewIds = [...(lane.handledReviewIds ?? []), review.id];
 		// A review of an older commit is out of date: cyralph has pushed since.
 		if (review.commitId && event.headSha && review.commitId !== event.headSha) {
 			await this.store.save(record);
@@ -261,7 +272,7 @@ export class SessionManager {
 		}
 
 		const reporter = this.reporter(record.sessionId);
-		const rounds = record.reviewRounds ?? 0;
+		const rounds = lane.reviewRounds ?? 0;
 		if (rounds >= config.github.maxReviewRounds) {
 			await this.store.save(record);
 			await this.notify(
@@ -280,19 +291,20 @@ export class SessionManager {
 			await this.store.save(record);
 			return log.info(`skipping ${where}: nothing to act on`);
 		}
-		record.reviewRounds = rounds + 1;
-		const text = buildReviewRequest({ review, comments, prNumber: event.prNumber, prUrl: event.prUrl, branch: record.branch ?? event.headRef });
+		lane.reviewRounds = rounds + 1;
+		const text = buildReviewRequest({ review, comments, prNumber: event.prNumber, prUrl: event.prUrl, branch: lane.branch ?? event.headRef });
 		const what = `${review.author} reviewed the pull request${comments.length ? ` with ${comments.length} comment${comments.length === 1 ? "" : "s"}` : ""}`;
 		log.info(`acting on ${where} for ${record.identifier ?? record.sessionId}`);
 
-		// Delivered like a reply in the Linear thread: into the live agent, after the current step, or as a new run.
-		const inject = this.injectors.get(record.sessionId);
-		if (inject?.(text)) {
+		// Delivered like a reply in the Linear thread: into the live agent (when it works in that repository),
+		// after the current step, or as a new run.
+		const live = this.injectors.get(record.sessionId);
+		if (live && live.repoId === lane.repoId && live.inject(text)) {
 			await this.store.save(record);
 			await reporter.thought(`${what}. Passed it to the agent that's working right now.`);
 			return;
 		}
-		record.pendingRequests.push(text);
+		lane.pendingRequests = [...(lane.pendingRequests ?? []), text];
 		await this.store.save(record);
 		if (this.active.has(record.sessionId)) {
 			await reporter.thought(`${what}. I'll work through it as soon as the current step finishes.`);
@@ -309,9 +321,9 @@ export class SessionManager {
 	async pollReviews(): Promise<void> {
 		const { config, github, log } = this.deps;
 		if (!github) return;
-		for (const [prUrl, record] of this.openPullRequests()) {
+		for (const [prUrl, { record, lane }] of this.openPullRequests()) {
 			if (!parsePullRequestUrl(prUrl)) continue;
-			const repo = config.repositories.find((x) => x.id === record.repoId);
+			const repo = config.repositories.find((x) => x.id === lane.repoId);
 			if (!repo || repo.respondToReviews === false || record.status === "stopped") continue;
 			const pr = parsePullRequestUrl(prUrl);
 			if (!pr) continue;
@@ -319,7 +331,7 @@ export class SessionManager {
 				const state = await github.pullRequest(pr.repo, pr.number);
 				if (!state) continue;
 				if (!state.open) {
-					record.prClosed = true;
+					lane.prClosed = true;
 					await this.store.save(record);
 					await this.cleanupMerged(record.issueId);
 					continue;
@@ -331,7 +343,7 @@ export class SessionManager {
 				if (!review) continue;
 				// Only the newest review of the head commit is acted on; earlier ones on it are superseded.
 				if (fresh.length) {
-					record.handledReviewIds = [...(record.handledReviewIds ?? []), ...fresh.map((rv) => rv.id)];
+					lane.handledReviewIds = [...(lane.handledReviewIds ?? []), ...fresh.map((rv) => rv.id)];
 					await this.store.save(record);
 				}
 				await this.handleReview({ kind: "review_submitted", repo: pr.repo, prNumber: pr.number, prUrl, prOpen: true, headRef: state.headRef, headSha: state.headSha, review });
@@ -342,12 +354,14 @@ export class SessionManager {
 	}
 
 	/** Pull/merge requests cyralph opened that aren't known to be closed, each with its newest session. */
-	private openPullRequests(): Map<string, SessionRecord> {
-		const latest = new Map<string, SessionRecord>();
-		for (const r of this.store.all()) {
-			if (!r.prUrl || r.prClosed) continue;
-			const seen = latest.get(r.prUrl);
-			if (!seen || r.updatedAt > seen.updatedAt) latest.set(r.prUrl, r);
+	private openPullRequests(): Map<string, LaneRef> {
+		const latest = new Map<string, LaneRef>();
+		for (const record of this.store.all()) {
+			for (const lane of lanesOf(record)) {
+				if (!lane.prUrl || lane.prClosed) continue;
+				const seen = latest.get(lane.prUrl);
+				if (!seen || record.updatedAt > seen.record.updatedAt) latest.set(lane.prUrl, { record, lane });
+			}
 		}
 		return latest;
 	}
@@ -359,24 +373,31 @@ export class SessionManager {
 	async pollCi(): Promise<void> {
 		const { config, ci, log } = this.deps;
 		if (!ci) return;
-		for (const [prUrl, record] of this.openPullRequests()) {
-			const repo = config.repositories.find((x) => x.id === record.repoId);
+		// Work on the issue is running or queued and may push again; check its CI on a later poll. Decided
+		// before acting on any failure, so one session's PRs/MRs in several repositories are all checked.
+		const busy = new Set(
+			this.store
+				.all()
+				.filter((r) => this.active.has(r.sessionId) || this.queue.includes(r.sessionId) || this.busyIssues.has(r.issueId))
+				.map((r) => r.sessionId),
+		);
+		for (const [prUrl, { record, lane }] of this.openPullRequests()) {
+			const repo = config.repositories.find((x) => x.id === lane.repoId);
 			if (!repo || repo.respondToCiFailures === false || record.status === "stopped") continue;
-			// Work on the issue is running or queued and may push again; check its CI on a later poll.
-			if (this.active.has(record.sessionId) || this.queue.includes(record.sessionId) || this.busyIssues.has(record.issueId)) continue;
+			if (busy.has(record.sessionId)) continue;
 			const ref = parseChangeRequestUrl(prUrl);
 			if (!ref) continue;
 			try {
 				const status = await ci.status(ref);
 				if (!status) continue;
 				if (!status.open) {
-					record.prClosed = true;
+					lane.prClosed = true;
 					await this.store.save(record);
 					await this.cleanupMerged(record.issueId);
 					continue;
 				}
 				if (status.state !== "failed" || this.ciHandled(prUrl, status.headSha)) continue;
-				const p = this.onCiFailure(record, ref, status).finally(() => this.handling.delete(p));
+				const p = this.onCiFailure({ record, lane }, ref, status).finally(() => this.handling.delete(p));
 				this.handling.add(p);
 				await p;
 			} catch (err) {
@@ -385,13 +406,13 @@ export class SessionManager {
 		}
 	}
 
-	private async onCiFailure(record: SessionRecord, ref: ChangeRequestRef, status: CiStatus): Promise<void> {
+	private async onCiFailure({ record, lane }: LaneRef, ref: ChangeRequestRef, status: CiStatus): Promise<void> {
 		const { config, ci, log } = this.deps;
 		const sha = status.headSha.slice(0, 7);
 		const term = ref.forge === "gitlab" ? "merge request" : "pull request";
-		record.handledCiShas = [...(record.handledCiShas ?? []), status.headSha];
+		lane.handledCiShas = [...(lane.handledCiShas ?? []), status.headSha];
 		const reporter = this.reporter(record.sessionId);
-		const rounds = record.ciFixRounds ?? 0;
+		const rounds = lane.ciFixRounds ?? 0;
 		if (rounds >= config.ci.maxFixRounds) {
 			await this.store.save(record);
 			await this.notify(
@@ -411,9 +432,9 @@ export class SessionManager {
 					: "",
 			})),
 		);
-		record.ciFixRounds = rounds + 1;
-		const branch = record.branch ?? "the pull request branch";
-		record.pendingRequests.push(buildCiFailureRequest({ ref, headSha: status.headSha, branch, pipelineUrl: status.pipelineUrl, jobs }));
+		lane.ciFixRounds = rounds + 1;
+		const branch = lane.branch ?? "the pull request branch";
+		lane.pendingRequests = [...(lane.pendingRequests ?? []), buildCiFailureRequest({ ref, headSha: status.headSha, branch, pipelineUrl: status.pipelineUrl, jobs })];
 		await this.store.save(record);
 		const names = jobs.map((j) => `\`${j.name}\``);
 		const shown = names.length > 3 ? `${names.slice(0, 3).join(", ")} and ${names.length - 3} more` : names.join(", ");
@@ -422,14 +443,18 @@ export class SessionManager {
 		this.enqueue(record);
 	}
 
-	private ciHandled(prUrl: string, sha: string): boolean {
+	/** Every lane of every session that opened this PR/MR (a re-delegation carries it forward). */
+	private lanesForPullRequest(prUrl: string): RepoLane[] {
 		const url = prUrl.toLowerCase();
-		return this.store.all().some((r) => r.prUrl?.toLowerCase() === url && r.handledCiShas?.includes(sha));
+		return this.store.all().flatMap((r) => lanesOf(r).filter((l) => l.prUrl?.toLowerCase() === url));
+	}
+
+	private ciHandled(prUrl: string, sha: string): boolean {
+		return this.lanesForPullRequest(prUrl).some((l) => l.handledCiShas?.includes(sha));
 	}
 
 	private reviewHandled(prUrl: string, reviewId: number): boolean {
-		const url = prUrl.toLowerCase();
-		return this.store.all().some((r) => r.prUrl?.toLowerCase() === url && r.handledReviewIds?.includes(reviewId));
+		return this.lanesForPullRequest(prUrl).some((l) => l.handledReviewIds?.includes(reviewId));
 	}
 
 	/** The configured repository a webhook's `owner/name` belongs to (its `githubUrl`, else its `origin` remote). */
@@ -442,13 +467,13 @@ export class SessionManager {
 		return undefined;
 	}
 
-	/** The newest session whose pull request (or, before it was recorded, branch) this is. */
-	private recordForPullRequest(repoId: string, event: ReviewSubmitted): SessionRecord | undefined {
+	/** The newest session (and its lane) whose pull request (or, before it was recorded, branch) this is. */
+	private recordForPullRequest(repoId: string, event: ReviewSubmitted): LaneRef | undefined {
 		const url = event.prUrl.toLowerCase();
-		const mine = this.store.all().filter((r) => r.repoId === repoId);
-		const byUrl = mine.filter((r) => r.prUrl?.toLowerCase() === url);
-		const matches = byUrl.length ? byUrl : mine.filter((r) => !r.prUrl && r.branch === event.headRef);
-		return matches.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+		const mine = this.store.all().flatMap((record) => lanesOf(record).filter((l) => l.repoId === repoId).map((lane) => ({ record, lane })));
+		const byUrl = mine.filter(({ lane }) => lane.prUrl?.toLowerCase() === url);
+		const matches = byUrl.length ? byUrl : mine.filter(({ lane }) => !lane.prUrl && lane.branch === event.headRef);
+		return matches.sort((a, b) => b.record.updatedAt.localeCompare(a.record.updatedAt))[0];
 	}
 
 	private async onCreated(event: Extract<AgentWebhookEvent, { kind: "created" }>) {
@@ -470,6 +495,12 @@ export class SessionManager {
 			record.reviewRounds ??= previous.reviewRounds;
 			record.handledCiShas ??= previous.handledCiShas;
 			record.ciFixRounds ??= previous.ciFixRounds;
+			// Branches and PRs/MRs in the other repositories the epic's stories routed to; their requests stay behind.
+			if (previous.lanes && !record.lanes) {
+				record.lanes = Object.fromEntries(
+					Object.entries(previous.lanes).map(([id, { pendingRequests: _, requestClaudeSessionId: __, ...lane }]) => [id, structuredClone(lane)]),
+				);
+			}
 			record.guidance = [...previous.guidance];
 			// A re-delegated plain issue is new work, so its own earlier completion doesn't carry over.
 			record.completedKeys = previous.completedKeys.filter((k) => k !== event.issueId);
@@ -544,7 +575,7 @@ export class SessionManager {
 			// it would only refuse. Keep it as a direct request, run once the stories are done.
 			const orchestratorWork = record.mode === "epic" && asksForPushOrPullRequest(text);
 			// Running: deliver into the live agent session, as Cyrus streams follow-ups.
-			const inject = orchestratorWork ? undefined : this.injectors.get(record.sessionId);
+			const inject = orchestratorWork ? undefined : this.injectors.get(record.sessionId)?.inject;
 			if (inject?.(text)) {
 				if (record.mode === "epic") record.guidance.push(text); // later stories should know too
 				await this.store.save(record);
@@ -577,8 +608,8 @@ export class SessionManager {
 	/** Deliver text into a live agent session working on this issue, if there is one. */
 	private injectIntoIssue(issueId: string, text: string): boolean {
 		const owner = this.busyIssues.get(issueId);
-		const inject = owner ? this.injectors.get(owner) : undefined;
-		return inject ? inject(text) : false;
+		const live = owner ? this.injectors.get(owner) : undefined;
+		return live ? live.inject(text) : false;
 	}
 
 	private enqueue(record: SessionRecord) {
@@ -646,7 +677,8 @@ export class SessionManager {
 		const reporter = this.reporter(record.sessionId);
 		record.status = "running";
 		this.busyIssues.set(record.issueId, record.sessionId);
-		const pendingAtStart = new Set(record.pendingRequests);
+		const pending = () => lanesOf(record).flatMap((l) => l.pendingRequests ?? []);
+		const pendingAtStart = new Set(pending());
 		const done = (async () => {
 			try {
 				await this.store.save(record);
@@ -655,8 +687,8 @@ export class SessionManager {
 					reporter,
 					abortSignal: abort.signal,
 					persist: () => this.store.save(record),
-					setInjector: (inject) => {
-						if (inject) this.injectors.set(record.sessionId, inject);
+					setInjector: (inject, repoId) => {
+						if (inject) this.injectors.set(record.sessionId, { inject, repoId });
 						else this.injectors.delete(record.sessionId);
 					},
 					claimWorktree: (path) => {
@@ -681,7 +713,7 @@ export class SessionManager {
 				for (const [path, owner] of this.busyWorktrees) if (owner === record.sessionId) this.busyWorktrees.delete(path);
 				// Requests that arrived after this run's request step ("I'll handle this as soon as the current
 				// step finishes") get a run of their own instead of waiting for the next message.
-				const arrived = record.pendingRequests.some((r) => !pendingAtStart.has(r));
+				const arrived = pending().some((r) => !pendingAtStart.has(r));
 				if (arrived && !abort.signal.aborted && record.status !== "failed" && record.status !== "stopped") this.enqueue(record);
 				this.pump();
 			}

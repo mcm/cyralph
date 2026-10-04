@@ -88,6 +88,8 @@ export interface GitWorkspace {
 	remoteUrl(cwd: string): Promise<string | undefined>;
 	/** True when `origin` exists and the branch has commits it doesn't have yet. */
 	needsPush(cwd: string, baseBranch: string): Promise<boolean>;
+	/** True when the branch has commits its base branch doesn't (on `origin` when it has the base). */
+	hasCommits(cwd: string, baseBranch: string): Promise<boolean>;
 	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
 	stashAll(cwd: string, message: string): Promise<boolean>;
 	push(cwd: string, branch: string): Promise<void>;
@@ -156,6 +158,12 @@ export class CliGitWorkspace implements GitWorkspace {
 		const hasRemoteBase = (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${baseBranch}`], cwd)).code === 0;
 		const range = upstream.code === 0 ? "@{u}..HEAD" : `${hasRemoteBase ? `origin/${baseBranch}` : baseBranch}..HEAD`;
 		const count = await git(["rev-list", "--count", range], cwd);
+		return count.code === 0 && Number(count.stdout.trim()) > 0;
+	}
+
+	async hasCommits(cwd: string, baseBranch: string): Promise<boolean> {
+		const hasRemoteBase = (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${baseBranch}`], cwd)).code === 0;
+		const count = await git(["rev-list", "--count", `${hasRemoteBase ? `origin/${baseBranch}` : baseBranch}..HEAD`], cwd);
 		return count.code === 0 && Number(count.stdout.trim()) > 0;
 	}
 

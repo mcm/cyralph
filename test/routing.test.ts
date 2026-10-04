@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { RepositoryConfigSchema, type RepositoryConfig } from "../src/config.js";
-import { matchSelection, parseRepoTags, routeIssue, tagMatchesRepo } from "../src/engine/routing.js";
+import { matchSelection, parseRepoTags, routeIssue, routeStory, tagMatchesRepo } from "../src/engine/routing.js";
 import type { IssueSummary } from "../src/linear/gateway.js";
 
 const repo = (r: Partial<RepositoryConfig> & { id: string }): RepositoryConfig =>
@@ -95,5 +95,41 @@ describe("matchSelection", () => {
 		expect(matchSelection("2", [a, b])).toBe(b);
 		expect(matchSelection("the platform/api one please", [a, b])).toBe(a);
 		expect(matchSelection("mobile", [a, b])).toBeUndefined();
+	});
+});
+
+describe("routeStory (a story of an epic)", () => {
+	const repos = [repo({ id: "api", projectKeys: ["API"], teamKeys: ["BE"] }), repo({ id: "web", projectKeys: ["Web"], routingLabels: ["frontend"], teamKeys: ["FE"] })];
+	const epic = { projectName: "API", teamKey: "BE" };
+	const routed = (story: Parameters<typeof routeStory>[1]) => {
+		const r = routeStory(repos, story, epic);
+		return r.type === "selected" ? `${r.repo.id} by ${r.method}` : r.type === "unroutable" ? `unroutable: ${r.reason}` : "epic";
+	};
+
+	it("stays with the epic without signals of its own", () => {
+		expect(routed({})).toBe("epic");
+		expect(routed({ projectName: "API", teamKey: "BE", labels: ["bug"] })).toBe("epic");
+		expect(routed({ projectName: "api" })).toBe("epic");
+	});
+
+	it("follows its own tag, label, project or team, in that order", () => {
+		expect(routed({ description: "[repo=web]", projectName: "API" })).toBe("web by description-tag");
+		expect(routed({ labels: ["Frontend"], projectName: "Docs" })).toBe("web by label");
+		expect(routed({ projectName: "Web", teamKey: "BE" })).toBe("web by project");
+		expect(routed({ teamKey: "FE" })).toBe("web by team");
+		// A label or tag can route a story back to the epic's own repository.
+		expect(routed({ description: "repo=api", projectName: "Web" })).toBe("api by description-tag");
+	});
+
+	it("is unroutable when its own tag or project matches no repository here", () => {
+		expect(routed({ projectName: "Docs" })).toBe("unroutable: it's in project Docs, which no repository here is set up for");
+		expect(routed({ description: "\\[repo=mobile\\]" })).toBe("unroutable: its `[repo=mobile]` tag names no repository here");
+		// Teams and labels span repositories, so an unknown one isn't a reason to give the story away.
+		expect(routed({ teamKey: "OPS", labels: ["infra"] })).toBe("epic");
+	});
+
+	it("ignores inactive repositories", () => {
+		const r = routeStory([repos[0]!, { ...repos[1]!, isActive: false }], { projectName: "Web" }, epic);
+		expect(r.type).toBe("unroutable");
 	});
 });
