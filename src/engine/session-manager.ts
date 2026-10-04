@@ -569,6 +569,7 @@ export class SessionManager {
 		}
 		// Paused/finished/stopped: guidance earns every set-aside story a fresh set of attempts.
 		record.attempts = {};
+		record.blockedKeys = [];
 		await this.store.save(record);
 		await reporter.thought("On it.");
 		this.enqueue(record);

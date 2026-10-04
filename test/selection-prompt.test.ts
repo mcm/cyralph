@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractCodebasePatterns, recentProgressEntries } from "../src/ralph/progress.js";
-import { COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
+import { BLOCKED_PATTERN, COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
 import { blockedStories, isEpicComplete, selectNextStory } from "../src/ralph/selection.js";
 import type { Epic, Story } from "../src/ralph/types.js";
 
@@ -105,6 +105,8 @@ describe("prompt", () => {
 	it("detects the completion signal", () => {
 		expect(COMPLETE_PATTERN.test("done\n<promise> COMPLETE </promise>")).toBe(true);
 		expect(COMPLETE_PATTERN.test("not yet")).toBe(false);
+		expect(BLOCKED_PATTERN.test("can't reach the API\n<promise> blocked </promise>")).toBe(true);
+		expect(BLOCKED_PATTERN.test("<promise>COMPLETE</promise>")).toBe(false);
 	});
 });
 

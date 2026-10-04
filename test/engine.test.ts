@@ -248,6 +248,44 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(t.linear.issues.get(s2.id)?.stateType).toBe("completed");
 	});
 
+	it("sets a story that reports <promise>BLOCKED</promise> aside without retrying, until a reply", async () => {
+		const t = setup({ maxAttemptsPerStory: 3 });
+		const { epic, s1 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req, run) => {
+			if (run > 1) return undefined;
+			expect(req.prompt).toContain("<promise>BLOCKED</promise>");
+			writeFileSync(join(req.cwd, "ENG-2.partial"), "wip\n");
+			// Blocked wins over a stray completion signal.
+			return { output: "The database credentials are missing.\n<promise>COMPLETE</promise>\n<promise>BLOCKED</promise>", isError: false, aborted: false };
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-b", issueId: epic.id });
+		await t.manager.idle();
+
+		const ids = t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+		// One attempt only; ENG-3 depends on it, ENG-4 still runs.
+		expect(ids).toEqual(["ENG-2", "ENG-4"]);
+		const record = t.store.get("sess-b");
+		expect(record?.status).toBe("awaiting_input");
+		expect(t.linear.issues.get(s1.id)?.stateType).not.toBe("completed");
+		expect(t.linear.bodies("thought").join("\n")).toContain("ENG-2 is blocked; setting it aside without retrying (partial work stashed)");
+		const ask = t.linear.bodies("elicitation").at(-1) ?? "";
+		expect(ask).toContain("**ENG-2: Add priority field** is blocked, so I didn't retry it");
+		expect(ask).toContain("The database credentials are missing.");
+		expect(ask).not.toContain("failed 3 attempts");
+		const wt = record?.worktreePath ?? "";
+		expect(sh(wt, "log", "--format=%s", "main..HEAD")).not.toContain("ENG-2");
+
+		// A reply unblocks it: the story runs again with the reply as guidance.
+		await t.manager.handle({ kind: "prompted", sessionId: "sess-b", issueId: epic.id, body: "Credentials are in .env now." });
+		await t.manager.idle();
+		expect(t.store.get("sess-b")?.status).toBe("completed");
+		const resumed = t.runner.calls.slice(2);
+		expect(resumed.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["ENG-2", "ENG-3"]);
+		expect(resumed[0]?.prompt).toContain("The previous session reported it was blocked");
+		expect(resumed[0]?.prompt).toContain("- Credentials are in .env now.");
+	});
+
 	it("materializes a PRD in the description into sub-issues with Linear metadata", async () => {
 		const t = setup();
 		const epic = t.linear.add({
