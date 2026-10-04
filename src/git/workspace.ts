@@ -132,11 +132,31 @@ export class CliGitWorkspace implements GitWorkspace {
 		} else if (remoteExists) {
 			await gitOrThrow(["worktree", "add", "--track", "-b", branch, path, `origin/${branch}`], repo);
 		} else {
-			const remoteBase = hasRemote && (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${opts.baseBranch}`], repo)).code === 0;
+			let remoteBase = hasRemote && (await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${opts.baseBranch}`], repo)).code === 0;
+			if (!remoteBase && (await git(["rev-parse", "--verify", "--quiet", `refs/heads/${opts.baseBranch}`], repo)).code !== 0) {
+				// A brand-new repository has no commits, and a worktree needs one to branch from.
+				await this.createInitialCommit(repo, opts.baseBranch, hasRemote);
+				remoteBase = hasRemote;
+			}
 			const start = remoteBase ? `origin/${opts.baseBranch}` : opts.baseBranch;
 			await gitOrThrow(["worktree", "add", "--no-track", "-b", branch, path, start], repo);
 		}
 		return { ...base, created: true };
+	}
+
+	/**
+	 * Give an empty repository its first (empty) commit on `baseBranch`, pushed to `origin` when there
+	 * is one. A repository that already has commits elsewhere is left alone: its base branch is just
+	 * missing, which is a configuration mistake rather than something to paper over.
+	 */
+	private async createInitialCommit(repo: string, baseBranch: string, hasRemote: boolean): Promise<void> {
+		const refs = await gitOrThrow(["for-each-ref", "--count=1", "--format=%(refname)", "refs/heads", "refs/remotes"], repo);
+		if (refs) throw new Error(`base branch \`${baseBranch}\` doesn't exist in ${repo}${hasRemote ? " or on origin" : ""}`);
+		const emptyTree = await gitOrThrow(["hash-object", "-t", "tree", "/dev/null"], repo);
+		const sha = await gitOrThrow(["commit-tree", emptyTree, "-m", "Initial commit"], repo);
+		// The empty old value makes this fail rather than overwrite a branch created in the meantime.
+		await gitOrThrow(["update-ref", `refs/heads/${baseBranch}`, sha, ""], repo);
+		if (hasRemote) await gitOrThrow(["push", "origin", `refs/heads/${baseBranch}:refs/heads/${baseBranch}`], repo);
 	}
 
 	async commitAll(cwd: string, message: string): Promise<string | undefined> {
