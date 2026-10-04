@@ -19,7 +19,11 @@ function recordingLogger() {
 
 const base = { linear: { webhookSecret: "s" }, repositories: [{ id: "app", name: "app", repositoryPath: "./app" }] };
 
-async function setup(raw: Record<string, unknown> = base) {
+/**
+ * Tests that call `reload()` themselves get a watcher that never fires during the test, so a debounced
+ * reload from the watcher can't apply a write before their own call does. Only the watch test uses a short debounce.
+ */
+async function setup(raw: Record<string, unknown> = base, debounceMs = 60_000) {
 	const dir = mkdtempSync(join(tmpdir(), "cyralph-reload-"));
 	const path = join(dir, "config.json");
 	writeFileSync(path, JSON.stringify(raw));
@@ -30,7 +34,7 @@ async function setup(raw: Record<string, unknown> = base) {
 		path,
 		initial,
 		log,
-		debounceMs: 20,
+		debounceMs,
 		apply: (next) => void applied.push(next),
 		validate: (c) => (c.linear.webhookSecret ? undefined : "linear.webhookSecret is required"),
 	});
@@ -103,7 +107,7 @@ describe("config reloader", () => {
 	});
 
 	it("notices edits on its own, including editors that save by renaming over the file", async () => {
-		const t = await setup();
+		const t = await setup(base, 20);
 		await t.reloader.start();
 		const tmp = join(t.dir, ".config.json.swp");
 		writeFileSync(tmp, JSON.stringify({ ...base, model: "sonnet" }));
