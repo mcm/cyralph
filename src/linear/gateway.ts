@@ -71,6 +71,8 @@ export interface LinearGateway {
 		priority?: number;
 		subIssueSortOrder?: number;
 		projectName?: string;
+		/** Label names (case-insensitive); a label the team doesn't have yet is created for it. */
+		labels?: string[];
 	}): Promise<IssueSummary>;
 	/** `blockerId` blocks `blockedId`. */
 	createBlocksRelation(blockerId: string, blockedId: string): Promise<void>;
@@ -166,6 +168,7 @@ export class SdkLinearGateway implements LinearGateway {
 			const projects = await this.client.projects({ filter: { name: { eq: input.projectName } }, first: 1 });
 			projectId = projects.nodes[0]?.id;
 		}
+		const labelIds = input.labels?.length ? await Promise.all(input.labels.map((name) => this.labelId(input.teamId, name))) : undefined;
 		const payload = await this.client.createIssue({
 			teamId: input.teamId,
 			title: input.title,
@@ -174,10 +177,23 @@ export class SdkLinearGateway implements LinearGateway {
 			priority: input.priority,
 			subIssueSortOrder: input.subIssueSortOrder,
 			projectId,
+			...(labelIds && { labelIds }),
 		});
 		const issue = await payload.issue;
 		if (!issue) throw new Error(`Linear did not return the created issue "${input.title}"`);
 		return this.summarize(issue);
+	}
+
+	/** The team's (or workspace's) label with this name, created on the team when there is none. */
+	private async labelId(teamId: string, name: string): Promise<string> {
+		const conn = await this.client.issueLabels({ filter: { name: { eqIgnoreCase: name } }, first: 50 });
+		const usable = await Promise.all(conn.nodes.map(async (l) => ({ id: l.id, teamId: (await l.team)?.id })));
+		const found = usable.find((l) => l.teamId === teamId) ?? usable.find((l) => !l.teamId);
+		if (found) return found.id;
+		const payload = await this.client.createIssueLabel({ name, teamId });
+		const label = await payload.issueLabel;
+		if (!label) throw new Error(`Linear did not return the created label "${name}"`);
+		return label.id;
 	}
 
 	async createBlocksRelation(blockerId: string, blockedId: string): Promise<void> {

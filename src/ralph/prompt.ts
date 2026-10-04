@@ -36,17 +36,24 @@ function normalizeCommand(cmd: string): string {
 export interface FollowUp {
 	title: string;
 	description: string;
+	/** Work for a person (`manual` attribute): filed with the manual label so no agent attempts it. */
+	manual?: boolean;
 }
 
 /**
  * Follow-up issues a story agent asks the orchestrator to file, written in its final message as
- * `<follow-up title="…">description</follow-up>` blocks.
+ * `<follow-up title="…">description</follow-up>` blocks, with a `manual` (or `manual="true"`)
+ * attribute for work only a person can do.
  */
 export function parseFollowUps(output: string): FollowUp[] {
 	const out: FollowUp[] = [];
-	for (const m of output.matchAll(/<follow-up\s+title\s*=\s*"([^"]+)"\s*>([\s\S]*?)<\/follow-up>/gi)) {
-		const title = (m[1] ?? "").trim();
-		if (title && !out.some((f) => f.title.toLowerCase() === title.toLowerCase())) out.push({ title, description: (m[2] ?? "").trim() });
+	for (const m of output.matchAll(/<follow-up((?:\s+[\w-]+(?:\s*=\s*"[^"]*")?)*)\s*>([\s\S]*?)<\/follow-up>/gi)) {
+		const attrs = new Map<string, string>();
+		for (const a of (m[1] ?? "").matchAll(/([\w-]+)(?:\s*=\s*"([^"]*)")?/g)) attrs.set((a[1] ?? "").toLowerCase(), a[2] ?? "");
+		const title = (attrs.get("title") ?? "").trim();
+		if (!title || out.some((f) => f.title.toLowerCase() === title.toLowerCase())) continue;
+		const manual = attrs.has("manual") && !/^(false|no|0)$/i.test((attrs.get("manual") ?? "").trim());
+		out.push({ title, description: (m[2] ?? "").trim(), ...(manual && { manual: true }) });
 	}
 	return out.slice(0, MAX_FOLLOW_UPS);
 }
@@ -194,6 +201,7 @@ What is wrong, where, and what done looks like (acceptance criteria as \`- [ ]\`
 </follow-up>
 - If {{storyId}} can't be completed until they are fixed, leave out the completion signal. They will block {{storyId}}, be worked first, and then {{storyId}} runs again.
 - If {{storyId}} is complete anyway, add the completion signal too, and they join the epic as new stories.
+- If an item is work only a person can do (granting access, changing settings in an outside service, a decision), mark it manual: \`<follow-up title="…" manual>\`. It is filed for a person and never attempted by an agent; stories it blocks wait until a person marks it done.
 {{/if}}
 `;
 

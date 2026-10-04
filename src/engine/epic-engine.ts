@@ -796,8 +796,15 @@ export class EpicEngine {
 
 		const bold = (ids: string[]) => ids.map((d) => `**${dependencyLabel(epic, d)}**`).join(", ");
 		const outside = added.filter((d) => !byKey.has(d));
+		const forAgent = inEpic.filter((d) => !byKey.get(d)?.manual);
+		const forPerson = inEpic.filter((d) => byKey.get(d)?.manual);
 		const lines = [`⏸️ **${story.storyId}** needs ${bold(added)} done first.`];
-		if (inEpic.length) lines.push(`I'll work ${inEpic.length === 1 ? "it" : "them"} next and then run ${story.storyId} again.`);
+		if (forAgent.length) lines.push(`I'll work ${forAgent.length === inEpic.length ? (forAgent.length === 1 ? "it" : "them") : bold(forAgent)} next and then run ${story.storyId} again.`);
+		if (forPerson.length) {
+			lines.push(
+				`${bold(forPerson)} ${forPerson.length === 1 ? "is a manual step" : "are manual steps"} for a person, so ${story.storyId} runs again once ${forPerson.length === 1 ? "it's" : "they're"} done.`,
+			);
+		}
 		if (outside.length) {
 			lines.push(
 				`${bold(outside)} ${outside.length === 1 ? "isn't a sub-issue" : "aren't sub-issues"} of **${epic.identifier}**, so ${story.storyId} also waits until ${outside.length === 1 ? "it's" : "they're"} done.`,
@@ -818,7 +825,10 @@ export class EpicEngine {
 			return;
 		}
 		const open = new Map(epic.stories.filter((s) => !isStoryDone(s)).map((s) => [s.title.toLowerCase(), s]));
+		// A manual follow-up carries the first manual label, so the epic loader treats it as a step for a person.
+		const manualLabel = this.deps.config.ralph.manualLabels[0];
 		const filed: string[] = [];
+		const forPerson: string[] = [];
 		const failed: string[] = [];
 		for (const f of followUps) {
 			try {
@@ -834,11 +844,16 @@ export class EpicEngine {
 							priority: story.priority <= 4 ? story.priority : 0,
 							// In the story's project, so a follow-up of a story in another repository routes there too.
 							projectName: story.projectName ?? parent?.projectName,
+							...(f.manual && manualLabel && { labels: [manualLabel] }),
 						});
 				if (blocking && story.issueId && issue.id !== story.issueId && !story.dependsOn.includes(issue.id)) {
 					await linear.createBlocksRelation(issue.id, story.issueId);
 				}
 				filed.push(`**${issue.identifier}**`);
+				if (f.manual) {
+					if (manualLabel) forPerson.push(`**${issue.identifier}**`);
+					else log.warn(`${issue.identifier}: filed as a manual follow-up, but no manual label is configured (ralph.manualLabels)`);
+				}
 			} catch (err) {
 				log.warn(`could not file follow-up "${f.title}": ${String(err)}`);
 				failed.push(`"${f.title}"`);
@@ -848,6 +863,11 @@ export class EpicEngine {
 		if (filed.length) {
 			lines.push(
 				`Filed ${filed.join(", ")} as ${filed.length === 1 ? "a new story" : "new stories"} of **${epic.identifier}**${blocking ? `, blocking **${story.storyId}**` : ""}.`,
+			);
+		}
+		if (forPerson.length) {
+			lines.push(
+				`${forPerson.join(", ")} ${forPerson.length === 1 ? "is a manual step" : "are manual steps"} for a person (labelled \`${manualLabel}\`): I won't work ${forPerson.length === 1 ? "it" : "them"}.`,
 			);
 		}
 		if (failed.length) lines.push(`I couldn't file ${failed.join(", ")} in Linear.`);

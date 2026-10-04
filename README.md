@@ -197,6 +197,11 @@ What cyralph adds on top:
   waited on like any outside blocker. A directly delegated story works its own follow-ups too. After
   three such pauses, a story's next round counts as a normal failed attempt.
 
+  Work only a person can do (granting access, changing an outside service's settings, a decision) is
+  marked manual: `<follow-up title="Grant the bot registry access" manual>`. It is filed with the
+  first label in `ralph.manualLabels`, so no agent turn is spent on it; a story it blocks is parked
+  on it like any manual step and runs again once a person moves it to Done.
+
 ## GitHub and GitLab
 
 Git itself (worktrees, commits, pushes) works with any host. Pull and merge requests are opened per
