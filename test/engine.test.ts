@@ -327,6 +327,27 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(t.linear.issues.get(issue.id)?.stateType).toBe("started");
 	});
 
+	it("runs a check that is both a quality gate and a verify command once, and tells the agent it needn't", async () => {
+		const t = setup();
+		const log = join(mkdtempSync(join(tmpdir(), "cyralph-verify-")), "runs");
+		const check = `echo run >> ${log}`;
+		t.config.repositories[0]!.verifyCommands = [check];
+		t.config.repositories[0]!.runPrdQualityGates = true;
+		const issue = t.linear.add({
+			title: "Fix login bug",
+			identifier: "ENG-71",
+			description: `Users can't log in.\n\n- [ ] login works\n\n## Quality Gates\n- \`${check}\`\n- \`true\`\n`,
+		});
+		await t.manager.handle({ kind: "created", sessionId: "sess-dedupe", issueId: issue.id });
+		await t.manager.idle();
+		expect(readFileSync(log, "utf8")).toBe("run\n");
+		const [gates = "", checked = ""] = t.runner.calls[0]?.prompt.split("### Checked by the Orchestrator") ?? [];
+		// runPrdQualityGates hands every gate to the orchestrator, so none is left for the agent.
+		expect(gates).not.toContain("### Quality Gates");
+		expect(checked).toContain(`- \`${check}\``);
+		expect(checked).toContain("- `true`");
+	});
+
 	it("focuses on one story when a story issue is delegated directly", async () => {
 		const t = setup();
 		const { s3 } = ralphEpic(t.linear);

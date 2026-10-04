@@ -39,6 +39,7 @@ import {
 	buildStoryPrompt,
 	parseFollowUps,
 	parsePullRequestDescription,
+	uniqueCommands,
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
@@ -451,7 +452,7 @@ export class EpicEngine {
 			remoteUrl: await git.remoteUrl(worktree),
 			prUrl: lane.prUrl,
 			progressFile,
-			qualityGates: [...epic.qualityGates, ...(repo.verifyCommands ?? [])],
+			qualityGates: uniqueCommands([...epic.qualityGates, ...(repo.verifyCommands ?? [])]),
 			forgeInstructions: forge?.agentInstructions({
 				branch,
 				baseBranch: repo.baseBranch,
@@ -636,7 +637,8 @@ export class EpicEngine {
 		const { repo, worktree } = ws;
 		const { config, linear, runner, log } = this.deps;
 		const template = repo.promptTemplatePath ? await readFile(repo.promptTemplatePath, "utf8") : DEFAULT_STORY_TEMPLATE;
-		const verifyCommands = [...(repo.verifyCommands ?? []), ...(repo.runPrdQualityGates ? epic.qualityGates : [])];
+		// Each check runs once: the agent is told which ones the orchestrator runs, so it skips those.
+		const verifyCommands = uniqueCommands([...(repo.verifyCommands ?? []), ...(repo.runPrdQualityGates ? epic.qualityGates : [])]);
 		const { record, reporter } = ctx;
 		const max = config.ralph.maxAttemptsPerStory;
 		const depsBefore = new Set(story.dependsOn);
@@ -668,6 +670,7 @@ export class EpicEngine {
 				attachments: formatAttachments(attachmentsForStory(ctx.attachments ?? [], story.key)),
 				followUps: epic.kind === "children",
 				repository: story.repo?.name,
+				verifyCommands,
 			},
 			template,
 		);

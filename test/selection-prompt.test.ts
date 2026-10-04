@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { extractCodebasePatterns, recentProgressEntries } from "../src/ralph/progress.js";
-import { BLOCKED_PATTERN, COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate } from "../src/ralph/prompt.js";
+import { BLOCKED_PATTERN, COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate, uniqueCommands } from "../src/ralph/prompt.js";
 import { blockedStories, isEpicComplete, selectNextStory } from "../src/ralph/selection.js";
 import type { Epic, Story } from "../src/ralph/types.js";
 
@@ -95,6 +95,31 @@ describe("prompt", () => {
 		expect(p).toContain("lint failed");
 		expect(p).toContain("<prd-document>\nThe PRD body");
 		expect(p).not.toMatch(/\{\{/);
+	});
+
+	it("leaves quality gates the orchestrator runs to the orchestrator", () => {
+		const gated: Epic = { ...epic, qualityGates: ["pnpm lint", "pnpm  test", "pnpm typecheck", "pnpm lint"] };
+		const p = buildStoryPrompt({
+			epic: gated,
+			story: gated.stories[1]!,
+			progressFile: "/tmp/p.md",
+			attempt: 1,
+			maxAttempts: 3,
+			verifyCommands: ["pnpm test", "pnpm build", "pnpm build"],
+		});
+		const [gates = "", checked = ""] = p.split("### Checked by the Orchestrator");
+		expect(gates).toContain("- `pnpm lint`\n- `pnpm typecheck`\n\n");
+		expect(gates).not.toContain("pnpm  test");
+		expect(checked).toContain("- `pnpm test`\n- `pnpm build`\n\n");
+		expect(p.match(/`pnpm lint`/g)).toHaveLength(1);
+
+		const all = buildStoryPrompt({ epic: gated, story: gated.stories[1]!, progressFile: "/tmp/p.md", attempt: 1, maxAttempts: 3, verifyCommands: ["pnpm lint", "pnpm test", "pnpm typecheck"] });
+		expect(all).not.toContain("### Quality Gates");
+		expect(all).toContain("### Checked by the Orchestrator");
+	});
+
+	it("drops duplicate commands, ignoring whitespace", () => {
+		expect(uniqueCommands([" pnpm test", "pnpm  test", "", "pnpm lint", "pnpm test"])).toEqual(["pnpm test", "pnpm lint"]);
 	});
 
 	it("supports nested if/else in custom templates", () => {

@@ -13,6 +13,26 @@ export const BLOCKED_PATTERN = /<promise>\s*BLOCKED\s*<\/promise>/i;
 /** At most this many follow-up issues are filed from one story session. */
 export const MAX_FOLLOW_UPS = 10;
 
+/**
+ * Commands with duplicates dropped (compared with whitespace collapsed), first occurrence kept. A command
+ * that's both a PRD quality gate and a repository verify command should only run once.
+ */
+export function uniqueCommands(commands: readonly string[]): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const cmd of commands) {
+		const key = normalizeCommand(cmd);
+		if (!key || seen.has(key)) continue;
+		seen.add(key);
+		out.push(cmd.trim());
+	}
+	return out;
+}
+
+function normalizeCommand(cmd: string): string {
+	return cmd.trim().replace(/\s+/g, " ");
+}
+
 export interface FollowUp {
 	title: string;
 	description: string;
@@ -51,6 +71,11 @@ export interface PromptContext {
 	followUps?: boolean;
 	/** The story's repository, when it isn't the epic's main one. */
 	repository?: string;
+	/**
+	 * Commands the orchestrator runs itself after the agent signals completion. Quality gates among them
+	 * aren't repeated as the agent's to run, so each check runs once.
+	 */
+	verifyCommands?: string[];
 }
 
 export const DEFAULT_STORY_TEMPLATE = `You are working through a PRD epic from Linear, one user story per session.
@@ -102,6 +127,12 @@ Files attached in Linear (screenshots, mockups, documents). Open each one with t
 {{#if qualityGates}}
 ### Quality Gates (must pass before you signal completion)
 {{qualityGates}}
+
+{{/if}}
+{{#if verifyCommands}}
+### Checked by the Orchestrator
+The orchestrator runs these itself after you signal completion and sends any failure back to you, so you don't need to run them as a final check (run one earlier only if you need its output while working):
+{{verifyCommands}}
 
 {{/if}}
 {{#if guidance}}
@@ -207,6 +238,9 @@ export function formatStoryList(epic: Epic, current?: Story): string {
 export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TEMPLATE): string {
 	const { epic, story } = ctx;
 	const completed = epic.stories.filter((s) => s.status === "completed" || s.status === "cancelled").length;
+	const verifyCommands = uniqueCommands(ctx.verifyCommands ?? []);
+	const checked = new Set(verifyCommands.map(normalizeCommand));
+	const qualityGates = uniqueCommands(epic.qualityGates).filter((g) => !checked.has(normalizeCommand(g)));
 	const vars: Vars = {
 		epicTitle: epic.title,
 		epicIdentifier: epic.identifier,
@@ -223,7 +257,8 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 		storyDescription: story.description.trim() || undefined,
 		acceptanceCriteria: story.acceptanceCriteria.map((c) => `- [ ] ${c}`).join("\n") || undefined,
 		notes: story.notes,
-		qualityGates: epic.qualityGates.map((g) => `- \`${g}\``).join("\n") || undefined,
+		qualityGates: qualityGates.map((g) => `- \`${g}\``).join("\n") || undefined,
+		verifyCommands: verifyCommands.map((g) => `- \`${g}\``).join("\n") || undefined,
 		guidance: ctx.guidance?.length ? ctx.guidance.map((g) => `- ${g.replace(/\n/g, "\n  ")}`).join("\n") : undefined,
 		previousAttemptFeedback: ctx.previousAttemptFeedback,
 		attempt: ctx.attempt,
@@ -286,7 +321,7 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		`- Git remote \`origin\`: ${ctx.remoteUrl ? `\`${ctx.remoteUrl}\`` : "none configured"}`,
 		`- ${capitalize(ctx.prTerm ?? "pull request")}: ${ctx.prUrl ?? "none opened yet"}`,
 		`- Progress log (learnings from earlier sessions): \`${ctx.progressFile}\``,
-		...(ctx.qualityGates.length ? [`- Quality gates: ${ctx.qualityGates.map((g) => `\`${g}\``).join(", ")}`] : []),
+		...(ctx.qualityGates.length ? [`- Quality gates: ${uniqueCommands(ctx.qualityGates).map((g) => `\`${g}\``).join(", ")}`] : []),
 		...(prd ? ["", "<prd-document>", prd.length > 6000 ? `${prd.slice(0, 6000)}\n…` : prd, "</prd-document>"] : []),
 		...(ctx.attachments
 			? ["", "## Attachments", "Files attached in Linear. Open the ones relevant to the request with the Read tool (it shows images):", ctx.attachments]
