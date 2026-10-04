@@ -112,8 +112,11 @@ describe("release state", () => {
 	});
 });
 
-/** A stand-in for the agent process; `exits` says how each start ends. */
-function fakeAgents(exits: Array<number | "wait">) {
+/**
+ * A stand-in for the agent process; `exits` says how each start ends. `ready` holds back each exit until it
+ * resolves (e.g. a state file the agent writes before exiting).
+ */
+function fakeAgents(exits: Array<number | "wait">, ready: () => Promise<unknown> = () => Promise.resolve()) {
 	const starts: Array<{ script: string; env: NodeJS.ProcessEnv }> = [];
 	const spawnAgent = (script: string, _args: string[], env: NodeJS.ProcessEnv) => {
 		starts.push({ script, env });
@@ -123,7 +126,7 @@ function fakeAgents(exits: Array<number | "wait">) {
 			return true;
 		}) as ChildProcess["kill"];
 		const exit = exits.shift();
-		if (exit !== "wait" && exit !== undefined) setTimeout(() => child.emit("exit", exit, null), 5);
+		if (exit !== "wait" && exit !== undefined) void ready().then(() => setTimeout(() => child.emit("exit", exit, null), 5));
 		return child;
 	};
 	return { starts, spawnAgent };
@@ -145,14 +148,15 @@ describe("supervisor", () => {
 	it("restarts into the new release when the agent exits to update", async () => {
 		const o = base();
 		const dir = releaseDir(o.stateDir, "b");
-		const agents = fakeAgents([RESTART_EXIT_CODE, 0]);
+		let promoted: Promise<void> = Promise.resolve();
+		const agents = fakeAgents([RESTART_EXIT_CODE, 0], () => promoted);
 		let n = 0;
 		const code = await supervise({
 			...o,
 			confirmAfterMs: 0,
 			spawnAgent: (script, args, env) => {
 				// The first agent promotes release b before exiting with 75.
-				if (n++ === 0) void saveReleaseState(o.stateDir, { current: { sha: "b", dir }, previous: { sha: "a" }, pending: false, failed: [] });
+				if (n++ === 0) promoted = saveReleaseState(o.stateDir, { current: { sha: "b", dir }, previous: { sha: "a" }, pending: false, failed: [] });
 				return agents.spawnAgent(script, args, env);
 			},
 		});
