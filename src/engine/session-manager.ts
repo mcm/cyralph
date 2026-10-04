@@ -83,6 +83,17 @@ export class SessionManager {
 		return new ActivityReporter(this.deps.linear, sessionId, this.deps.log);
 	}
 
+	/**
+	 * Tell a session something that needs no further work. Linear marks a session active on any
+	 * thought and expects a response to follow, so outside a run this is a response (completing the
+	 * session again); otherwise the session sits active until Linear calls it "Stopped responding".
+	 */
+	private notify(sessionId: string, body: string): Promise<void> {
+		const reporter = this.reporter(sessionId);
+		const running = this.active.has(sessionId) || this.queue.includes(sessionId);
+		return running ? reporter.thought(body) : reporter.response(body);
+	}
+
 	handle(event: AgentWebhookEvent): Promise<void> {
 		const p = this.dispatch(event).finally(() => this.handling.delete(p));
 		this.handling.add(p);
@@ -194,13 +205,12 @@ export class SessionManager {
 					continue;
 				}
 				const kept = await git.removeWorkspace({ repositoryPath: repo.repositoryPath, path, branch, mergedSha: state.headSha });
-				const reporter = this.reporter(record.sessionId);
 				if (kept) {
 					log.warn(`kept ${path} after ${ref.url} merged: ${kept}`);
-					await reporter.thought(`The ${term} ${ref.url} was merged, but I kept the worktree \`${path}\` and the branch \`${branch}\`: ${kept}.`);
+					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, but I kept the worktree \`${path}\` and the branch \`${branch}\`: ${kept}.`);
 				} else {
 					log.info(`removed ${path} and branch ${branch}: ${ref.url} was merged`);
-					await reporter.thought(`The ${term} ${ref.url} was merged, so I removed its worktree and the local branch \`${branch}\`.`);
+					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, so I removed its worktree and the local branch \`${branch}\`.`);
 				}
 				await this.forgetWorktree(path);
 			} catch (err) {
@@ -254,7 +264,8 @@ export class SessionManager {
 		const rounds = record.reviewRounds ?? 0;
 		if (rounds >= config.github.maxReviewRounds) {
 			await this.store.save(record);
-			await reporter.thought(
+			await this.notify(
+				record.sessionId,
 				`${review.author} reviewed ${event.prUrl} again. I've already worked through ${rounds} of its reviews on this pull request, so I'm leaving this one for a person.`,
 			);
 			return;
@@ -383,7 +394,8 @@ export class SessionManager {
 		const rounds = record.ciFixRounds ?? 0;
 		if (rounds >= config.ci.maxFixRounds) {
 			await this.store.save(record);
-			await reporter.thought(
+			await this.notify(
+				record.sessionId,
 				`CI failed again on ${ref.url} (\`${sha}\`). I've already tried to fix CI ${rounds} time${rounds === 1 ? "" : "s"} on this ${term}, so I'm leaving this one for a person.`,
 			);
 			return;
