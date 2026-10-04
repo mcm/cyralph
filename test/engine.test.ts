@@ -1179,7 +1179,7 @@ describe("automated PR reviews", () => {
 		await t.manager.handleReview(reviewEvent(cubicReview(32, { commitId: "head2" }), { headSha: "head2" }));
 		await t.manager.idle();
 		expect(t.requestPrompts()).toHaveLength(1);
-		expect(t.linear.bodies("thought").some((b) => b.includes("leaving this one for a person"))).toBe(true);
+		expect(t.linear.bodies("response").some((b) => b.includes("leaving this one for a person"))).toBe(true);
 	});
 
 	it("polls open PRs for the newest bot review of the head commit when there is no webhook", async () => {
@@ -1284,10 +1284,10 @@ describe("CI failures", () => {
 		await t.manager.pollCi();
 		await t.manager.idle();
 		expect(t.requestPrompts()).toHaveLength(1);
-		expect(t.linear.bodies("thought").some((b) => b.includes("leaving this one for a person"))).toBe(true);
+		expect(t.linear.bodies("response").some((b) => b.includes("leaving this one for a person"))).toBe(true);
 		// Said once, not on every poll.
 		await t.manager.pollCi();
-		expect(t.linear.bodies("thought").filter((b) => b.includes("leaving this one for a person"))).toHaveLength(1);
+		expect(t.linear.bodies("response").filter((b) => b.includes("leaving this one for a person"))).toHaveLength(1);
 	});
 
 	it("skips repositories that opted out, stopped sessions, and closed PRs", async () => {
@@ -1342,7 +1342,10 @@ describe("cleanup after a merge", () => {
 		const record = t.store.get("ci-1");
 		expect(record?.worktreePath).toBeUndefined();
 		expect(record?.prMerged).toBe(true);
-		expect(t.linear.bodies("thought").some((b) => b.includes("was merged, so I removed its worktree and the local branch `eng-1-task-priority`"))).toBe(true);
+		expect(t.linear.bodies("response").some((b) => b.includes("was merged, so I removed its worktree and the local branch `eng-1-task-priority`"))).toBe(true);
+		// The note is the session's last activity and a response, so Linear sees the session complete
+		// again instead of waiting on it until it calls it "Stopped responding".
+		expect(t.linear.activities.at(-1)?.content.type).toBe("response");
 	});
 
 	it("cleans up when polling sees the PR merged, as a fallback for a missed webhook", async () => {
@@ -1371,7 +1374,7 @@ describe("cleanup after a merge", () => {
 		writeFileSync(join(dirty.path, "notes.txt"), "wip\n");
 		await dirty.manager.cleanupMerged(dirty.epicId);
 		expect(existsSync(join(dirty.path, "notes.txt"))).toBe(true);
-		expect(dirty.linear.bodies("thought").some((b) => b.includes("I kept the worktree") && b.includes("uncommitted changes"))).toBe(true);
+		expect(dirty.linear.bodies("response").some((b) => b.includes("I kept the worktree") && b.includes("uncommitted changes"))).toBe(true);
 		expect(dirty.store.get("ci-1")?.worktreePath).toBeUndefined(); // said once, not on every pass
 
 		const ahead = await mergedEpic();
@@ -1382,7 +1385,7 @@ describe("cleanup after a merge", () => {
 		await ahead.manager.cleanupMerged();
 		expect(existsSync(ahead.path)).toBe(true);
 		expect(branchExists(ahead.repo, "eng-1-task-priority")).toBe(true);
-		expect(ahead.linear.bodies("thought").some((b) => b.includes("has commits that weren't merged"))).toBe(true);
+		expect(ahead.linear.bodies("response").some((b) => b.includes("has commits that weren't merged"))).toBe(true);
 
 		const off = await mergedEpic({ repo: { cleanupMergedWorktrees: false } });
 		off.ci.mergedAt = off.head;
