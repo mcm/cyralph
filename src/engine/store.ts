@@ -90,6 +90,50 @@ export function lanesOf(record: SessionRecord): RepoLane[] {
 	return [record, ...Object.values(record.lanes ?? {})];
 }
 
+/** `routedBy` of a repository a human picked in Linear (it stays put; config routing doesn't override it). */
+export const ROUTED_BY_SELECTION = "your selection";
+
+/** The repository-specific fields of a lane, i.e. all but the requests, which follow the epic. */
+const LANE_FIELDS: Record<Exclude<keyof RepoLane, "pendingRequests">, true> = {
+	repoId: true,
+	branch: true,
+	worktreePath: true,
+	prUrl: true,
+	prNumber: true,
+	prClosed: true,
+	prMerged: true,
+	handledReviewIds: true,
+	reviewRounds: true,
+	handledCiShas: true,
+	ciFixRounds: true,
+	requestClaudeSessionId: true,
+};
+
+/**
+ * Make `repoId` the session's main repository. The old main lane's branch and PR/MR are dropped from
+ * the record (and returned, to tell the user where they are): they're left as they are in that
+ * repository, never published or polled again. A lane the epic already has in the new repository
+ * (stories routed there) becomes the main lane.
+ */
+export function moveToRepository(record: SessionRecord, repoId: string): RepoLane | undefined {
+	if (record.repoId === repoId) return undefined;
+	const old: RepoLane = {};
+	const fields = Object.keys(LANE_FIELDS) as Array<keyof typeof LANE_FIELDS>;
+	for (const key of fields) {
+		if (record[key] !== undefined) Object.assign(old, { [key]: record[key] });
+		delete record[key];
+	}
+	const lane = record.lanes?.[repoId];
+	if (lane) {
+		delete record.lanes?.[repoId];
+		for (const key of fields) if (lane[key] !== undefined) Object.assign(record, { [key]: lane[key] });
+		record.pendingRequests.push(...(lane.pendingRequests ?? []));
+	}
+	if (record.lanes && Object.keys(record.lanes).length === 0) delete record.lanes;
+	record.repoId = repoId;
+	return old.repoId ? old : undefined;
+}
+
 /** Whether any lane has requests waiting for a direct request session. */
 export function hasPendingRequests(record: SessionRecord): boolean {
 	return lanesOf(record).some((l) => (l.pendingRequests?.length ?? 0) > 0);

@@ -13,10 +13,10 @@ import { type ReviewSubmitted, buildReviewRequest, githubRepoSlug, isReviewBot, 
 import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
-import { EpicEngine } from "./epic-engine.js";
+import { EpicEngine, leftBehindNote } from "./epic-engine.js";
 import { asksForPushOrPullRequest } from "../ralph/prompt.js";
 import { matchSelection, selectionValue } from "./routing.js";
-import { PARKED, type RepoLane, type SessionRecord, type SessionStore, lanesOf, newRecord } from "./store.js";
+import { PARKED, ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStore, lanesOf, moveToRepository, newRecord } from "./store.js";
 
 /** A PR/MR cyralph opened: the session it belongs to and the repository lane it was opened from. */
 interface LaneRef {
@@ -485,7 +485,7 @@ export class SessionManager {
 		const previous = this.store.latestForIssue(event.issueId);
 		if (previous && previous.sessionId !== record.sessionId) {
 			record.branch ??= previous.branch;
-			// Routing is sticky per issue, like Cyrus' issue -> repository cache.
+			// The repository the issue last worked in; the engine re-checks it against the current config.
 			record.repoId ??= previous.repoId;
 			record.routedBy ??= previous.routedBy;
 			record.baseBranchOverride ??= previous.baseBranchOverride;
@@ -558,11 +558,12 @@ export class SessionManager {
 				await reporter.select(`I couldn't match "${text}" to a repository. Which one should I use?`, candidates.map(selectionValue));
 				return;
 			}
-			record.repoId = repo.id;
-			record.routedBy = "your selection";
+			const left = moveToRepository(record, repo.id);
+			record.routedBy = ROUTED_BY_SELECTION;
 			record.repoSelection = undefined;
 			await this.store.save(record);
-			await reporter.thought(`Using \`${repo.name}\`.`);
+			const oldName = left && this.deps.config.repositories.find((r) => r.id === left.repoId)?.name;
+			await reporter.thought(left ? leftBehindNote(left, oldName, repo.name) : `Using \`${repo.name}\`.`);
 			this.enqueue(record);
 			return;
 		}
