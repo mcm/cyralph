@@ -46,6 +46,8 @@ export interface SessionRecord {
 	ciFixRounds?: number;
 	/** Iterations spent per story key. */
 	attempts: Record<string, number>;
+	/** Stories whose agent reported `<promise>BLOCKED</promise>`: set aside without retries until a reply. */
+	blockedKeys?: string[];
 	/** Why the last attempt of a story failed, fed into the next attempt. */
 	lastFeedback: Record<string, string>;
 	/** Follow-up instructions from the Linear session, included in every prompt. */

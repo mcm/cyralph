@@ -28,6 +28,7 @@ import type { IssueSummary, LinearGateway, PlanStep } from "../linear/gateway.js
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
 import {
+	BLOCKED_PATTERN,
 	COMPLETE_PATTERN,
 	DEFAULT_STORY_TEMPLATE,
 	PR_DESCRIPTION_SYSTEM_APPEND,
@@ -576,13 +577,17 @@ export class EpicEngine {
 			return;
 		}
 
-		const complete = !result.isError && COMPLETE_PATTERN.test(result.output);
+		// An explicit "blocked" wins over a completion signal: unfinished work is never committed.
+		const blocked = !result.isError && BLOCKED_PATTERN.test(result.output);
+		const complete = !result.isError && !blocked && COMPLETE_PATTERN.test(result.output);
 		if (await this.handleFollowUps({ ctx, epic, story, output: result.output, complete, depsBefore, attempt, exhausted: args.exhausted })) return;
 
 		let feedback: string | undefined;
 		if (result.isError) {
 			feedback = `The agent session errored (${result.errorMessage ?? "unknown error"}). Last message:\n\n${quote(tail(result.output, 2000))}`;
-		} else if (!COMPLETE_PATTERN.test(result.output)) {
+		} else if (blocked) {
+			feedback = `The previous session reported it was blocked. Its final message was:\n\n${quote(tail(result.output, 3000))}`;
+		} else if (!complete) {
 			feedback = `The previous session ended without the completion signal. Its final message was:\n\n${quote(tail(result.output, 3000))}`;
 		} else {
 			for (const cmd of verifyCommands) {
@@ -598,14 +603,20 @@ export class EpicEngine {
 
 		if (feedback) {
 			record.lastFeedback[story.key] = feedback;
+			if (blocked) {
+				// Another attempt can't get past it: use up the budget so the story waits for a person.
+				record.attempts[story.key] = Math.max(attempt, max);
+				record.blockedKeys = [...new Set([...(record.blockedKeys ?? []), story.key])];
+			}
 			await ctx.persist();
-			if (attempt >= max) {
+			if (blocked || attempt >= max) {
 				// Park the partial work so the next story starts from a clean tree.
 				const stashed = await this.deps.git.stashAll(worktree, `cyralph: incomplete ${story.storyId} (${epic.identifier})`).catch(() => false);
 				story.status = story.issueId ? "in_progress" : "open";
-				await reporter.thought(
-					`⚠️ ${story.storyId} did not complete after ${attempt} attempts; setting it aside${stashed ? " (partial work stashed)" : ""}.\n\n${feedback}`,
-				);
+				const lead = blocked
+					? `🚧 ${story.storyId} is blocked; setting it aside without retrying`
+					: `⚠️ ${story.storyId} did not complete after ${attempt} attempts; setting it aside`;
+				await reporter.thought(`${lead}${stashed ? " (partial work stashed)" : ""}.\n\n${feedback}`);
 			} else {
 				await reporter.thought(`${story.storyId} attempt ${attempt} did not complete; retrying with feedback.\n\n${tail(feedback, 1500)}`);
 			}
@@ -1032,7 +1043,12 @@ export class EpicEngine {
 		const lines: string[] = [];
 		if (hitCap) lines.push(`I reached the per-run iteration cap (${config.ralph.maxIterationsPerRun}).`);
 		for (const s of stuck) {
-			lines.push(`**${s.storyId}: ${s.title}** failed ${record.attempts[s.key]} attempts. Last problem:\n\n${tail(record.lastFeedback[s.key] ?? "unknown", 1500)}`);
+			const problem = tail(record.lastFeedback[s.key] ?? "unknown", 1500);
+			lines.push(
+				record.blockedKeys?.includes(s.key)
+					? `**${s.storyId}: ${s.title}** is blocked, so I didn't retry it:\n\n${problem}`
+					: `**${s.storyId}: ${s.title}** failed ${record.attempts[s.key]} attempts. Last problem:\n\n${problem}`,
+			);
 		}
 		const blocked = blockedStories(scoped, exhausted);
 		for (const s of blocked) {

@@ -330,6 +330,7 @@ async function cmdRun(configPath: string, target: string | undefined) {
 	const issue = await linear.getIssue(target);
 	const record = store.get(sessionId) ?? newRecord(sessionId, issue.id, issue.identifier);
 	record.attempts = {};
+	record.blockedKeys = [];
 	const abort = new AbortController();
 	process.on("SIGINT", () => abort.abort());
 	const status = await new EpicEngine(deps(config, linear)).run({

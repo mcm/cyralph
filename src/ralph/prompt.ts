@@ -7,6 +7,8 @@
 import { type Epic, type Story, dependencyLabel } from "./types.js";
 
 export const COMPLETE_PATTERN = /<promise>\s*COMPLETE\s*<\/promise>/i;
+/** The agent hit an obstacle a retry can't get past: the story is set aside without further attempts. */
+export const BLOCKED_PATTERN = /<promise>\s*BLOCKED\s*<\/promise>/i;
 
 /** At most this many follow-up issues are filed from one story session. */
 export const MAX_FOLLOW_UPS = 10;
@@ -145,7 +147,9 @@ If you discovered a **reusable pattern**, also add it to the \`## Codebase Patte
 If the story is already implemented (e.g. by a previous session), verify it meets the acceptance criteria and signal completion immediately.
 Only when every acceptance criterion is met and the quality gates pass, end your final message with:
 <promise>COMPLETE</promise>
-If you are blocked and cannot complete the story, explain precisely why and do NOT output the completion signal.
+If you are blocked by something another attempt can't get past (missing access or credentials, an unavailable service, a decision only a person can make), explain precisely why and what would unblock you, and end your final message with:
+<promise>BLOCKED</promise>
+The story is then set aside without retries until someone replies. If the story is just unfinished, leave out both signals and it gets another attempt.
 {{#if followUps}}
 
 ## Follow-up Work

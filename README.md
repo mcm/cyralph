@@ -20,6 +20,7 @@ Linear: delegate ENG-1 "Task Priority System" to @cyralph
             → fresh Claude Agent SDK session with PRD + progress log + one story
             → final message ends with <promise>COMPLETE</promise>?  → run verifyCommands
             → commit "feat(ENG-3): …" → push → sub-issue ► Done
+            → <promise>BLOCKED</promise>? → set aside at once (no retries) until you reply
             → otherwise retry with the failure fed back (max N attempts, then set aside)
        └─ all done → open PR (ready for review) → response in the session
           stuck    → elicitation in the session; your reply becomes guidance and resumes the loop
@@ -155,6 +156,10 @@ triggers a wake:
   and the last 5 entries are injected into each prompt.
 - **Completion requires `<promise>COMPLETE</promise>`** in the agent's *final* message. A zero exit
   code is not enough, and neither is mentioning the tag partway through.
+- **An explicit "blocked".** When an obstacle won't go away on a retry (missing credentials, a
+  service that's down, a decision only a person can make), the agent ends with
+  `<promise>BLOCKED</promise>` and says why. The story is set aside right away instead of using up
+  its remaining attempts, and the pause message quotes the reason. Your reply resumes it.
 - **Error strategy.** A failed story is retried with feedback, then skipped after
   `maxAttemptsPerStory`. Its partial work is `git stash`ed so the next story starts clean. Stories
   that depend on it are reported as blocked.
