@@ -8,7 +8,8 @@
  *   5. catch-all         a repository with no routing configuration at all
  *   otherwise            ask in Linear which repository to use (or the only configured repository)
  *
- * The delegated issue is consulted first, then its epic (for a story delegated on its own).
+ * The delegated issue is consulted first, then its epic (for a story delegated on its own). Each story
+ * of an epic is then routed on its own signals (`routeStory`), so one epic can span repositories.
  */
 import type { RepositoryConfig } from "../config.js";
 import type { IssueSummary } from "../linear/gateway.js";
@@ -139,4 +140,53 @@ export function selectRepository(repos: RepositoryConfig[], issue: IssueSummary)
 	const repo = r.type === "selected" ? r.repo : repos[0];
 	if (!repo) throw new Error("No repositories configured");
 	return repo;
+}
+
+/** Where one story of an epic goes, judged by the routing signals it doesn't share with the epic. */
+export type StoryRoute =
+	| { type: "epic" }
+	| { type: "selected"; repo: RepositoryConfig; method: RoutingMethod; detail?: string }
+	| { type: "unroutable"; reason: string };
+
+/**
+ * Route a story of an epic. Only the story's own signals count, in the usual order: a repo tag, a
+ * routing label, a project other than the epic's, a team other than the epic's. A story without any
+ * stays in the epic's repository. A repo tag or a different project that no repository here matches
+ * means the story belongs to a repository this cyralph doesn't have (teams and labels often span
+ * repositories, so they never make a story unroutable).
+ */
+export function routeStory(
+	repos: RepositoryConfig[],
+	story: { description?: string; labels?: string[]; projectName?: string; teamKey?: string },
+	epic: { projectName?: string; teamKey?: string },
+): StoryRoute {
+	const active = repos.filter((r) => r.isActive !== false);
+	const lower = (xs: string[] | undefined) => (xs ?? []).map((x) => x.toLowerCase());
+
+	const tags = parseRepoTags(story.description);
+	for (const tag of tags) {
+		const repo = active.find((r) => tagMatchesRepo(tag.repo, r));
+		if (repo) return { type: "selected", repo, method: "description-tag", detail: `[repo=${tag.repo}]` };
+	}
+	if (tags.length) return { type: "unroutable", reason: `its \`[repo=${tags.map((t) => t.repo).join(",")}]\` tag names no repository here` };
+
+	const labels = lower(story.labels);
+	for (const repo of active) {
+		const hit = lower(repo.routingLabels).find((l) => labels.includes(l));
+		if (hit) return { type: "selected", repo, method: "label", detail: story.labels?.[labels.indexOf(hit)] };
+	}
+
+	const project = story.projectName;
+	if (project && project.toLowerCase() !== epic.projectName?.toLowerCase()) {
+		const repo = active.find((r) => [...lower(r.projectKeys), ...lower(r.projectNames)].includes(project.toLowerCase()));
+		if (repo) return { type: "selected", repo, method: "project", detail: project };
+		return { type: "unroutable", reason: `it's in project ${project}, which no repository here is set up for` };
+	}
+
+	const team = story.teamKey;
+	if (team && team.toLowerCase() !== epic.teamKey?.toLowerCase()) {
+		const repo = active.find((r) => lower(r.teamKeys).includes(team.toLowerCase()));
+		if (repo) return { type: "selected", repo, method: "team", detail: team };
+	}
+	return { type: "epic" };
 }

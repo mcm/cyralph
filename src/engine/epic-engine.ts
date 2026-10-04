@@ -42,8 +42,8 @@ import {
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
-import { describeRouting, routeIssue, selectionValue } from "./routing.js";
-import type { SessionRecord, SessionStatus } from "./store.js";
+import { describeRouting, routeIssue, routeStory, selectionValue } from "./routing.js";
+import { type RepoLane, type SessionRecord, type SessionStatus, hasPendingRequests, lanesOf } from "./store.js";
 
 export interface EngineDeps {
 	config: Config;
@@ -70,8 +70,17 @@ export interface EngineRun {
 	claimWorktree?: (path: string) => boolean;
 	/** Linear uploads gathered for this run (set by the engine). */
 	attachments?: AttachmentEntry[];
-	/** Receives the live session's message injector while an agent session runs. */
-	setInjector?: (inject: ((text: string) => boolean) | undefined) => void;
+	/** Receives the live session's message injector (and the repository it works in) while an agent session runs. */
+	setInjector?: (inject: ((text: string) => boolean) | undefined, repoId?: string) => void;
+	/** Worktrees prepared during this run, by repository id (set by the engine). */
+	workspaces?: Map<string, Workspace>;
+}
+
+/** A repository the run works in: its config, its lane in the session record, and its worktree. */
+export interface Workspace {
+	repo: RepositoryConfig;
+	lane: RepoLane;
+	worktree: string;
 }
 
 const MAX_FEEDBACK = 6000;
@@ -108,7 +117,7 @@ function followUpFooter(story: Story): string {
 
 export function planFor(epic: Epic, current?: Story, exhausted: ReadonlySet<string> = new Set()): PlanStep[] {
 	return epic.stories.map((s) => ({
-		content: `${s.storyId}: ${s.title}${s.manual ? " (manual)" : ""}`,
+		content: `${s.storyId}: ${s.title}${s.elsewhere ? " (manual: no repository here)" : s.manual ? " (manual)" : s.repo ? ` (in ${s.repo.name})` : ""}`,
 		status:
 			s.status === "completed"
 				? "completed"
@@ -165,7 +174,7 @@ export class EpicEngine {
 		const { epic } = loaded;
 		record.identifier = epic.identifier;
 		// Re-check the forge CLI every run: the user may have installed or logged in since.
-		this.forgeProblems.delete(record.sessionId);
+		for (const key of this.forgeProblems) if (key.startsWith(`${record.sessionId}:`)) this.forgeProblems.delete(key);
 		record.focusStoryKey ??= loaded.focusStoryKey;
 		for (const s of epic.stories) if (record.completedKeys.includes(s.key)) s.status = "completed";
 
@@ -179,7 +188,7 @@ export class EpicEngine {
 			// Blocked-by on the epic (or plain issue) itself gates the story work, as in Cyrus.
 			rootBlockers = await openRootBlockers(linear, epic);
 			// Direct requests (e.g. "push and open a PR") aren't story work, so they still run.
-			if (rootBlockers.length > 0 && record.pendingRequests.length === 0) {
+			if (rootBlockers.length > 0 && !hasPendingRequests(record)) {
 				return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is blocked`);
 			}
 		}
@@ -188,26 +197,25 @@ export class EpicEngine {
 		const issue = await linear.getIssue(epic.issueId);
 		const repo = await this.resolveRepo(ctx, issue);
 		if (!repo) return "awaiting_input";
+		this.routeStories(ctx, epic);
 
 		await reporter.thought(this.describeEpic(epic, loaded, repo, record.routedBy));
 
-		const worktree = await this.prepareWorkspace(ctx, epic, repo);
-		if (typeof worktree !== "string") return worktree.status;
+		ctx.workspaces = new Map();
+		const main = await this.workspaceFor(ctx, epic, repo);
+		if (!("worktree" in main)) return main.status;
 
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
 		await this.gatherAttachments(ctx, epic);
-		await this.warnIfForgeUnusable(ctx, repo, worktree);
+		await this.warnIfForgeUnusable(ctx, main);
 
 		if (rootBlockers.length > 0) {
-			const requestOutput = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+			const requestOutput = await this.runAllRequests(ctx, epic, progressFile);
 			if (requestOutput) await reporter.thought(requestOutput);
-			await this.adoptPullRequest(ctx, repo, worktree);
+			await this.adoptPullRequests(ctx, epic);
 			return this.park(ctx, epic, rootBlockers, `**${epic.identifier}** is still blocked`);
 		}
-
-		const template = repo.promptTemplatePath ? await readFile(repo.promptTemplatePath, "utf8") : DEFAULT_STORY_TEMPLATE;
-		const verifyCommands = [...(repo.verifyCommands ?? []), ...(repo.runPrdQualityGates ? epic.qualityGates : [])];
 
 		if (!["started", "completed"].includes(issue.stateType)) {
 			await linear.setIssueState(epic.issueId, { type: "started" }).catch((e: unknown) => log.warn(String(e)));
@@ -230,17 +238,45 @@ export class EpicEngine {
 			const skip = new Set([...exhausted(), ...outOfScope]);
 			const story = selectNextStory(epic.stories, skip);
 			if (!story) break;
+			// A story routed to another repository works in that repository's own worktree and branch.
+			const storyRepo = (story.repo && this.repoById(story.repo.id)) || repo;
+			const fresh = !ctx.workspaces.has(storyRepo.id);
+			const ws = await this.workspaceFor(ctx, epic, storyRepo);
+			if (!("worktree" in ws)) return ws.status;
+			if (fresh) await this.warnIfForgeUnusable(ctx, ws);
 			iterations++;
-			await this.runStory({ ctx, epic, story, repo, worktree, progressFile, template, verifyCommands, exhausted });
+			await this.runStory({ ctx, epic, story, ws, progressFile, exhausted });
 		}
 
 		// Instructions no story iteration picked up (e.g. "push and open a PR" on a finished epic)
 		// run as a direct request, the way Cyrus handles an @mention.
-		const requestOutput = ctx.abortSignal.aborted
-			? undefined
-			: await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+		const requestOutput = ctx.abortSignal.aborted ? undefined : await this.runAllRequests(ctx, epic, progressFile);
 
-		return this.finish({ ctx, epic, repo, worktree, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap, requestOutput });
+		return this.finish({ ctx, epic, inScope, exhausted: exhausted(), hitCap: cap > 0 && iterations >= cap, requestOutput });
+	}
+
+	private repoById(id: string | undefined): RepositoryConfig | undefined {
+		return id ? this.deps.config.repositories.find((r) => r.id === id) : undefined;
+	}
+
+	/**
+	 * Route each story of a sub-issue epic on its own signals (see `routeStory`). A story that belongs
+	 * in another configured repository is worked there; one that belongs in a repository this cyralph
+	 * doesn't have is left to a person, exactly like a story labelled manual.
+	 */
+	private routeStories(ctx: EngineRun, epic: Epic): void {
+		if (epic.kind !== "children") return;
+		const { record } = ctx;
+		for (const s of epic.stories) {
+			if (s.manual) continue;
+			const route = routeStory(this.deps.config.repositories, { description: s.sourceText, labels: s.labels, projectName: s.projectName, teamKey: s.teamKey }, epic);
+			if (route.type === "unroutable") {
+				s.manual = true;
+				s.elsewhere = route.reason;
+			} else if (route.type === "selected" && route.repo.id !== record.repoId) {
+				s.repo = { id: route.repo.id, name: route.repo.name, routedBy: describeRouting(route) };
+			}
+		}
 	}
 
 	/**
@@ -274,25 +310,50 @@ export class EpicEngine {
 		return withBase(routed.repo);
 	}
 
-	/** Create/reuse the epic's worktree. Returns its path, or the status to end the run with. */
-	private async prepareWorkspace(ctx: EngineRun, epic: Epic, repo: RepositoryConfig): Promise<string | { status: SessionStatus }> {
+	/**
+	 * The worktree for a repository this run works in, prepared once per run. The session's main
+	 * repository keeps its branch and PR/MR on the record itself; any other gets a lane in `record.lanes`.
+	 */
+	private async workspaceFor(ctx: EngineRun, epic: Epic, repo: RepositoryConfig): Promise<Workspace | { status: SessionStatus }> {
+		ctx.workspaces ??= new Map();
+		const spaces = ctx.workspaces;
+		const known = spaces.get(repo.id);
+		if (known) return known;
+		const { record } = ctx;
+		let lane: RepoLane = record;
+		if (repo.id !== record.repoId) {
+			record.lanes ??= {};
+			lane = record.lanes[repo.id] ??= { repoId: repo.id };
+		}
+		const worktree = await this.prepareWorkspace(ctx, epic, repo, lane);
+		if (typeof worktree !== "string") {
+			if (lane !== record && !lane.branch) delete record.lanes?.[repo.id];
+			return worktree;
+		}
+		const ws = { repo, lane, worktree };
+		spaces.set(repo.id, ws);
+		return ws;
+	}
+
+	/** Create/reuse the epic's worktree in a repository. Returns its path, or the status to end the run with. */
+	private async prepareWorkspace(ctx: EngineRun, epic: Epic, repo: RepositoryConfig, lane: RepoLane): Promise<string | { status: SessionStatus }> {
 		const { config } = this.deps;
-		const { record, reporter } = ctx;
+		const { reporter } = ctx;
 		try {
 			const ws = await this.deps.git.prepare({
 				repositoryPath: repo.repositoryPath,
 				workspaceBaseDir: repo.workspaceBaseDir ?? join(config.stateDir, "worktrees", repo.id),
-				branch: record.branch ?? epic.branchName,
+				branch: lane.branch ?? epic.branchName,
 				baseBranch: repo.baseBranch,
 			});
 			if (ctx.claimWorktree && !ctx.claimWorktree(ws.path)) {
 				await reporter.elicitation(
-					`Another cyralph session is already working on \`${ws.branch}\`. Reply here once it finishes and I'll pick up.`,
+					`Another cyralph session is already working on \`${ws.branch}\`${lane === ctx.record ? "" : ` in \`${repo.name}\``}. Reply here once it finishes and I'll pick up.`,
 				);
 				return { status: "awaiting_input" };
 			}
-			record.branch = ws.branch;
-			record.worktreePath = ws.path;
+			lane.branch = ws.branch;
+			lane.worktreePath = ws.path;
 			await ctx.persist();
 			if (ws.created && repo.setupCommand) {
 				await reporter.action("Setup", repo.setupCommand);
@@ -301,7 +362,7 @@ export class EpicEngine {
 			}
 			return ws.path;
 		} catch (err) {
-			await reporter.error(`Could not prepare the git worktree: ${String(err)}`);
+			await reporter.error(`Could not prepare the git worktree${lane === ctx.record ? "" : ` in \`${repo.name}\``}: ${String(err)}`);
 			return { status: "failed" };
 		}
 	}
@@ -313,39 +374,72 @@ export class EpicEngine {
 	private async runRequestOnly(ctx: EngineRun, epic: Epic): Promise<SessionStatus> {
 		const { config, linear } = this.deps;
 		const { record, reporter } = ctx;
-		if (record.pendingRequests.length === 0) {
+		if (!hasPendingRequests(record)) {
 			await reporter.response("Nothing to do: the mention didn't include a request. Delegate the issue to me to work the epic.");
 			return "completed";
 		}
 		const repo = await this.resolveRepo(ctx, await linear.getIssue(epic.issueId));
 		if (!repo) return "awaiting_input";
-		const worktree = await this.prepareWorkspace(ctx, epic, repo);
-		if (typeof worktree !== "string") return worktree.status;
+		ctx.workspaces = new Map();
+		const main = await this.workspaceFor(ctx, epic, repo);
+		if (!("worktree" in main)) return main.status;
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await ensureProgressFile(progressFile, `${epic.identifier}: ${epic.title}`);
 		await this.gatherAttachments(ctx, epic);
 
-		const output = await this.runRequests({ ctx, epic, repo, worktree, progressFile });
+		const output = await this.runAllRequests(ctx, epic, progressFile);
 		if (ctx.abortSignal.aborted) {
 			await reporter.response("Stopped.");
 			return "stopped";
 		}
-		await this.adoptPullRequest(ctx, repo, worktree);
-		const link = record.prUrl && output && !output.includes(record.prUrl) ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : "";
-		await reporter.response(`${output ?? "Done."}${link}`);
+		await this.adoptPullRequests(ctx, epic);
+		await reporter.response(this.withPullRequestLinks(record, output ?? "Done."));
 		return "completed";
 	}
 
-	/** Run pending thread requests as one direct agent session. Returns its summary for the thread. */
-	private async runRequests(args: { ctx: EngineRun; epic: Epic; repo: RepositoryConfig; worktree: string; progressFile: string }): Promise<string | undefined> {
-		const { ctx, epic, repo, worktree, progressFile } = args;
+	/** Run each lane's pending requests in its own worktree, the main repository first. Returns their summaries. */
+	private async runAllRequests(ctx: EngineRun, epic: Epic, progressFile: string): Promise<string | undefined> {
+		const outputs: string[] = [];
+		const spaces = await this.laneWorkspaces(ctx, epic, (l) => (l.pendingRequests?.length ?? 0) > 0);
+		for (const ws of spaces) {
+			if (ctx.abortSignal.aborted) break;
+			const output = await this.runRequests({ ctx, epic, ws, progressFile });
+			if (output) outputs.push(spaces.length > 1 || ws.lane !== ctx.record ? `**${ws.repo.name}**: ${output}` : output);
+		}
+		return outputs.length ? outputs.join("\n\n") : undefined;
+	}
+
+	/** Workspaces of the session's lanes that pass `want`, preparing worktrees this run hasn't used yet. */
+	private async laneWorkspaces(ctx: EngineRun, epic: Epic, want: (lane: RepoLane) => boolean): Promise<Workspace[]> {
+		const { record } = ctx;
+		const out: Workspace[] = [];
+		const main = record.repoId ? ctx.workspaces?.get(record.repoId) : undefined;
+		if (main && want(record)) out.push(main);
+		for (const [id, lane] of Object.entries(record.lanes ?? {})) {
+			if (!want(lane)) continue;
+			const repo = this.repoById(id);
+			if (!repo) {
+				this.deps.log.warn(`${record.identifier ?? record.sessionId}: repository ${id} is no longer configured; skipping its branch`);
+				continue;
+			}
+			const ws = await this.workspaceFor(ctx, epic, repo);
+			if ("worktree" in ws) out.push(ws);
+		}
+		return out;
+	}
+
+	/** Run a lane's pending requests as one direct agent session in its worktree. Returns its summary for the thread. */
+	private async runRequests(args: { ctx: EngineRun; epic: Epic; ws: Workspace; progressFile: string }): Promise<string | undefined> {
+		const { ctx, epic, ws, progressFile } = args;
+		const { repo, lane, worktree } = ws;
 		const { config, runner, git } = this.deps;
-		const { record, reporter } = ctx;
-		const requests = [...record.pendingRequests];
+		const { reporter } = ctx;
+		const requests = [...(lane.pendingRequests ?? [])];
 		if (requests.length === 0) return undefined;
 
-		await reporter.thought(requests.length === 1 ? "Working on your request." : `Working on your ${requests.length} requests.`);
-		const branch = record.branch ?? epic.branchName;
+		const where = lane === ctx.record ? "" : ` in \`${repo.name}\``;
+		await reporter.thought(requests.length === 1 ? `Working on your request${where}.` : `Working on your ${requests.length} requests${where}.`);
+		const branch = lane.branch ?? epic.branchName;
 		const forge = await this.forgeFor(worktree, repo);
 		const historyRewrite = repo.historyRewrite ?? config.ralph.historyRewrite;
 		const prompt = buildRequestPrompt({
@@ -355,7 +449,7 @@ export class EpicEngine {
 			branch,
 			baseBranch: repo.baseBranch,
 			remoteUrl: await git.remoteUrl(worktree),
-			prUrl: record.prUrl,
+			prUrl: lane.prUrl,
 			progressFile,
 			qualityGates: [...epic.qualityGates, ...(repo.verifyCommands ?? [])],
 			forgeInstructions: forge?.agentInstructions({
@@ -378,23 +472,32 @@ export class EpicEngine {
 				permissionMode: config.permissionMode,
 				abortSignal: ctx.abortSignal,
 				onEvent: reporter.onRunnerEvent,
-				onInjector: ctx.setInjector,
+				onInjector: (inject) => ctx.setInjector?.(inject, repo.id),
 				systemAppend: requestSystemAppend(historyRewrite),
 				resume,
 			});
 		// Follow-ups continue the previous request conversation, like Cyrus resuming its Claude session.
-		let result = await runOnce(record.requestClaudeSessionId);
-		if (result.isError && record.requestClaudeSessionId && !result.sessionId && !ctx.abortSignal.aborted) {
-			this.deps.log.warn(`could not resume request session ${record.requestClaudeSessionId}; starting fresh`);
+		let result = await runOnce(lane.requestClaudeSessionId);
+		if (result.isError && lane.requestClaudeSessionId && !result.sessionId && !ctx.abortSignal.aborted) {
+			this.deps.log.warn(`could not resume request session ${lane.requestClaudeSessionId}; starting fresh`);
 			result = await runOnce(undefined);
 		}
-		if (result.sessionId) record.requestClaudeSessionId = result.sessionId;
-		record.totalCostUsd += result.costUsd ?? 0;
+		if (result.sessionId) lane.requestClaudeSessionId = result.sessionId;
+		ctx.record.totalCostUsd += result.costUsd ?? 0;
 		if (result.aborted) return undefined; // keep the requests pending for the next run
-		record.pendingRequests = record.pendingRequests.filter((r) => !requests.includes(r));
+		lane.pendingRequests = (lane.pendingRequests ?? []).filter((r) => !requests.includes(r));
 		await ctx.persist();
 		if (result.isError) return `I ran into an error working on your request (${result.errorMessage ?? "unknown error"}).\n\n${tail(result.output, 2000)}`.trim();
 		return result.output.trim() || "Done.";
+	}
+
+	/** The session's PR/MR links not already in `text`, appended one per line (named by repository when there are several). */
+	private withPullRequestLinks(record: SessionRecord, text: string): string {
+		const lanes = lanesOf(record).filter((l) => l.prUrl);
+		const links = lanes
+			.filter((l) => l.prUrl && !text.includes(l.prUrl))
+			.map((l) => `${prLabel(l.prUrl ?? "")}${lanes.length > 1 ? ` (${this.repoById(l.repoId)?.name ?? l.repoId})` : ""}: ${l.prUrl}`);
+		return links.length ? `${text}\n\n${links.join("\n")}` : text;
 	}
 
 	private attachmentsDir(epic: Epic): string {
@@ -452,33 +555,40 @@ export class EpicEngine {
 		return this.deps.git.forge(worktree, { forge: repo.forge, gitlabHost: repo.gitlabHost, gitlabHosts: this.deps.config.gitlabHosts });
 	}
 
+	/** Key of a lane in `forgeProblems`: the problem is reported once per session and repository. */
+	private problemKey(ctx: EngineRun, ws: Workspace): string {
+		return `${ctx.record.sessionId}:${ws.repo.id}`;
+	}
+
 	/**
 	 * Tell the user up front when the forge CLI can't open the PR/MR this run will need (not installed,
 	 * not logged in), so they can fix it while the stories run. The final PR/MR step checks again.
 	 */
-	private async warnIfForgeUnusable(ctx: EngineRun, repo: RepositoryConfig, worktree: string): Promise<void> {
-		const { record, reporter } = ctx;
-		if (!this.deps.config.ralph.createPullRequest || record.prUrl) return;
-		const forge = await this.forgeFor(worktree, repo);
-		const problem = forge ? await forge.preflight(worktree).catch(() => undefined) : undefined;
+	private async warnIfForgeUnusable(ctx: EngineRun, ws: Workspace): Promise<void> {
+		const { reporter } = ctx;
+		if (!this.deps.config.ralph.createPullRequest || ws.lane.prUrl) return;
+		const forge = await this.forgeFor(ws.worktree, ws.repo);
+		const problem = forge ? await forge.preflight(ws.worktree).catch(() => undefined) : undefined;
 		if (!forge || !problem) return;
-		this.forgeProblems.add(record.sessionId);
+		this.forgeProblems.add(this.problemKey(ctx, ws));
+		const where = ws.lane === ctx.record ? "" : ` in \`${ws.repo.name}\``;
 		await reporter.thought(
-			`Heads up: I'll need \`${forge.cli}\` to open the ${forge.term} when the work is done, but ${lowerFirst(problem)}\n\nI'll keep working; fix it on the cyralph host before I finish and I'll open the ${forge.term} then.`,
+			`Heads up: I'll need \`${forge.cli}\` to open the ${forge.term}${where} when the work is done, but ${lowerFirst(problem)}\n\nI'll keep working; fix it on the cyralph host before I finish and I'll open the ${forge.term} then.`,
 		);
 	}
 
-	/** Pick up a PR/MR the agent opened itself (e.g. via a direct request) so the session links it. Never opens one. */
-	private async adoptPullRequest(ctx: EngineRun, repo: RepositoryConfig, worktree: string): Promise<void> {
-		const { record, reporter } = ctx;
-		if (record.prUrl || !record.branch) return;
-		const forge = await this.forgeFor(worktree, repo);
-		const pr = forge ? await forge.find(worktree, record.branch).catch(() => undefined) : undefined;
-		if (!pr) return;
-		record.prUrl = pr.url;
-		record.prNumber = pr.number;
-		await ctx.persist();
-		await reporter.externalUrl(prLabel(record.prUrl), pr.url);
+	/** Pick up PRs/MRs the agent opened itself (e.g. via a direct request) so the session links them. Never opens one. */
+	private async adoptPullRequests(ctx: EngineRun, epic: Epic): Promise<void> {
+		const { reporter } = ctx;
+		for (const { repo, lane, worktree } of await this.laneWorkspaces(ctx, epic, (l) => !l.prUrl && !!l.branch)) {
+			const forge = await this.forgeFor(worktree, repo);
+			const pr = forge && lane.branch ? await forge.find(worktree, lane.branch).catch(() => undefined) : undefined;
+			if (!pr) continue;
+			lane.prUrl = pr.url;
+			lane.prNumber = pr.number;
+			await ctx.persist();
+			await reporter.externalUrl(prLabel(pr.url), pr.url);
+		}
 	}
 
 	private describeEpic(epic: Epic, loaded: LoadedEpic, repo: RepositoryConfig, routedBy?: string): string {
@@ -494,7 +604,17 @@ export class EpicEngine {
 			const s = epic.stories.find((x) => x.key === loaded.focusStoryKey);
 			lines.push(`This issue is one story of the epic, so I'll only work on ${s?.storyId ?? "it"}.`);
 		}
-		const manual = epic.stories.filter((s) => s.manual && !isStoryDone(s));
+		const open = epic.stories.filter((s) => !isStoryDone(s));
+		for (const s of open.filter((x) => x.repo)) {
+			const pr = this.deps.config.ralph.createPullRequest ? " and its own pull/merge request" : "";
+			lines.push(`**${s.storyId}** belongs in \`${s.repo?.name}\` (routed by ${s.repo?.routedBy}), so I'll work it there, on its own branch${pr}.`);
+		}
+		for (const s of open.filter((x) => x.elsewhere)) {
+			lines.push(
+				`**${s.storyId}** isn't in a repository I have (${s.elsewhere}), so I'll treat it like a manual step: I won't work it, and stories that depend on it wait until it's done.`,
+			);
+		}
+		const manual = open.filter((s) => s.manual && !s.elsewhere);
 		if (manual.length) {
 			lines.push(
 				`${manual.map((s) => `**${s.storyId}**`).join(", ")} ${manual.length === 1 ? "is a manual step" : "are manual steps"} for a person: I won't work ${manual.length === 1 ? "it" : "them"}, and stories that depend on ${manual.length === 1 ? "it" : "them"} wait until ${manual.length === 1 ? "it's" : "they're"} done.`,
@@ -508,15 +628,15 @@ export class EpicEngine {
 		ctx: EngineRun;
 		epic: Epic;
 		story: Story;
-		repo: RepositoryConfig;
-		worktree: string;
+		ws: Workspace;
 		progressFile: string;
-		template: string;
-		verifyCommands: string[];
 		exhausted: () => Set<string>;
 	}): Promise<void> {
-		const { ctx, epic, story, repo, worktree, progressFile, template, verifyCommands } = args;
+		const { ctx, epic, story, ws, progressFile } = args;
+		const { repo, worktree } = ws;
 		const { config, linear, runner, log } = this.deps;
+		const template = repo.promptTemplatePath ? await readFile(repo.promptTemplatePath, "utf8") : DEFAULT_STORY_TEMPLATE;
+		const verifyCommands = [...(repo.verifyCommands ?? []), ...(repo.runPrdQualityGates ? epic.qualityGates : [])];
 		const { record, reporter } = ctx;
 		const max = config.ralph.maxAttemptsPerStory;
 		const depsBefore = new Set(story.dependsOn);
@@ -547,6 +667,7 @@ export class EpicEngine {
 				appendInstruction: repo.appendInstruction,
 				attachments: formatAttachments(attachmentsForStory(ctx.attachments ?? [], story.key)),
 				followUps: epic.kind === "children",
+				repository: story.repo?.name,
 			},
 			template,
 		);
@@ -562,7 +683,7 @@ export class EpicEngine {
 			permissionMode: config.permissionMode,
 			abortSignal: ctx.abortSignal,
 			onEvent: reporter.onRunnerEvent,
-			onInjector: ctx.setInjector,
+			onInjector: (inject) => ctx.setInjector?.(inject, repo.id),
 		});
 		record.totalCostUsd += result.costUsd ?? 0;
 		if (!result.aborted) {
@@ -624,7 +745,7 @@ export class EpicEngine {
 			return;
 		}
 
-		await this.completeStory({ ctx, epic, story, worktree, repo, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
+		await this.completeStory({ ctx, epic, story, ws, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
 	}
 
 	/**
@@ -708,7 +829,8 @@ export class EpicEngine {
 							title: f.title,
 							description: `${f.description}\n\n${followUpFooter(story)}`.trim(),
 							priority: story.priority <= 4 ? story.priority : 0,
-							projectName: parent?.projectName,
+							// In the story's project, so a follow-up of a story in another repository routes there too.
+							projectName: story.projectName ?? parent?.projectName,
 						});
 				if (blocking && story.issueId && issue.id !== story.issueId && !story.dependsOn.includes(issue.id)) {
 					await linear.createBlocksRelation(issue.id, story.issueId);
@@ -749,6 +871,7 @@ export class EpicEngine {
 		for (const s of fresh.stories) if (old.get(s.key)?.status === "completed") s.status = "completed";
 		epic.stories = fresh.stories;
 		epic.externalIssues = fresh.externalIssues;
+		this.routeStories(ctx, epic);
 		if (record.ignoreBlockers) dropOutsideBlockers(epic);
 
 		const added = fresh.stories.filter((s) => !old.has(s.key));
@@ -764,8 +887,9 @@ export class EpicEngine {
 		await reporter.plan(planFor(epic, undefined, new Set(epic.stories.filter((s) => (record.attempts[s.key] ?? 0) >= max).map((s) => s.key))));
 	}
 
-	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; worktree: string; repo: RepositoryConfig; summary: string }) {
-		const { ctx, epic, story, worktree, repo, summary } = args;
+	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; ws: Workspace; summary: string }) {
+		const { ctx, epic, story, ws, summary } = args;
+		const { worktree, lane } = ws;
 		const { config, linear, git, log } = this.deps;
 		const { record, reporter } = ctx;
 
@@ -788,15 +912,16 @@ export class EpicEngine {
 
 		if (story.issueId && epic.kind !== "single") {
 			await linear.setIssueState(story.issueId, { type: "completed" }).catch((e: unknown) => log.warn(String(e)));
-			const note = [`✅ Completed by cyralph${sha ? ` in \`${sha.slice(0, 10)}\`` : ""} on \`${record.branch}\`.`, "", tail(summary, 4000)].join("\n");
+			const where = `\`${lane.branch}\`${lane === record ? "" : ` in \`${ws.repo.name}\``}`;
+			const note = [`✅ Completed by cyralph${sha ? ` in \`${sha.slice(0, 10)}\`` : ""} on ${where}.`, "", tail(summary, 4000)].join("\n");
 			await linear.addComment(story.issueId, note).catch((e: unknown) => log.warn(String(e)));
 		}
 
 		// No remote yet is fine: commits stay local and are pushed once `origin` exists.
-		if (sha && config.ralph.pushPerStory && record.branch && (await git.remoteUrl(worktree))) {
+		if (sha && config.ralph.pushPerStory && lane.branch && (await git.remoteUrl(worktree))) {
 			try {
-				await git.push(worktree, record.branch);
-				await this.syncPullRequest(ctx, epic, repo, worktree, { ready: false, open: config.ralph.openPullRequestEarly, final: false });
+				await git.push(worktree, lane.branch);
+				await this.syncPullRequest(ctx, epic, ws, { ready: false, open: config.ralph.openPullRequestEarly, final: false });
 			} catch (err) {
 				await reporter.error(`Push failed: ${String(err)}`);
 			}
@@ -806,7 +931,7 @@ export class EpicEngine {
 	}
 
 	/**
-	 * Keep the epic's PR/MR in step with the branch. `open` allows opening a new one; without it only an
+	 * Keep a lane's PR/MR in step with its branch. `open` allows opening a new one; without it only an
 	 * existing PR/MR is updated, so a half-finished epic doesn't burn CI on every pushed story. `final` (the
 	 * epic is complete) rewrites the title and description from the finished branch. Returns why a PR/MR
 	 * that should have been opened wasn't (forge CLI missing or not logged in, or creation failed).
@@ -814,21 +939,21 @@ export class EpicEngine {
 	private async syncPullRequest(
 		ctx: EngineRun,
 		epic: Epic,
-		repo: RepositoryConfig,
-		worktree: string,
+		ws: Workspace,
 		opts: { ready: boolean; open: boolean; final: boolean },
 	): Promise<string | undefined> {
 		const { config } = this.deps;
-		const { record, reporter } = ctx;
-		if (!config.ralph.createPullRequest || !record.branch) return undefined;
+		const { reporter } = ctx;
+		const { repo, lane, worktree } = ws;
+		if (!config.ralph.createPullRequest || !lane.branch) return undefined;
 		const forge = await this.forgeFor(worktree, repo);
 		if (!forge) return undefined; // no remote to open a PR/MR against yet
 		let described: Promise<{ title: string; body: string } | undefined> | undefined;
 		const describe = () => {
-			described ??= this.describePullRequest(ctx, epic, repo, worktree, forge);
+			described ??= this.describePullRequest(ctx, epic, ws, forge);
 			return described;
 		};
-		const created = !record.prUrl;
+		const created = !lane.prUrl;
 		if (created) {
 			if (!opts.open) return undefined;
 			// Say why there is no PR/MR instead of silently skipping it (the thought once per run; the
@@ -836,9 +961,10 @@ export class EpicEngine {
 			const problem = await forge.preflight(worktree);
 			if (problem) {
 				const why = `I can't open a ${forge.term}: ${problem}`;
-				if (!this.forgeProblems.has(record.sessionId)) {
-					this.forgeProblems.add(record.sessionId);
-					await reporter.thought(`Commits are pushed to \`${record.branch}\`, but ${why}`);
+				const key = this.problemKey(ctx, ws);
+				if (!this.forgeProblems.has(key)) {
+					this.forgeProblems.add(key);
+					await reporter.thought(`Commits are pushed to \`${lane.branch}\`${lane === ctx.record ? "" : ` in \`${repo.name}\``}, but ${why}`);
 				}
 				return why;
 			}
@@ -846,19 +972,19 @@ export class EpicEngine {
 			let pr: { url: string; number?: number };
 			try {
 				pr = await forge.ensure(worktree, {
-					branch: record.branch,
+					branch: lane.branch,
 					baseBranch: repo.baseBranch,
 					title: prTitle(epic, text?.title),
 					body: prBody(epic, text?.body),
 				});
 			} catch (err) {
-				this.forgeProblems.add(record.sessionId);
+				this.forgeProblems.add(this.problemKey(ctx, ws));
 				const why = `Couldn't open a ${forge.term} with \`${forge.cli}\`: ${tail(String(err instanceof Error ? err.message : err), 1500)}`;
 				await reporter.error(why);
 				return why;
 			}
-			record.prUrl = pr.url;
-			record.prNumber = pr.number;
+			lane.prUrl = pr.url;
+			lane.prNumber = pr.number;
 			await ctx.persist();
 			await reporter.externalUrl(prLabel(pr.url), pr.url);
 			await reporter.thought(`Opened a ${opts.ready ? "" : "draft "}${forge.term}: ${pr.url}`);
@@ -866,29 +992,24 @@ export class EpicEngine {
 		// Rewrite the title and description only from a successful description: a failed one keeps what's there.
 		const text = opts.final && !created ? await describe() : undefined;
 		const edit = text ? { title: prTitle(epic, text.title), body: prBody(epic, text.body) } : {};
-		if (record.prUrl && (text || opts.ready)) await forge.update(worktree, { url: record.prUrl, number: record.prNumber }, { ...edit, ready: opts.ready });
+		if (lane.prUrl && (text || opts.ready)) await forge.update(worktree, { url: lane.prUrl, number: lane.prNumber }, { ...edit, ready: opts.ready });
 		return undefined;
 	}
 
 	/**
-	 * Title and description for the epic's PR/MR, written by a short read-only agent session from the
+	 * Title and description for a lane's PR/MR, written by a short read-only agent session from the
 	 * branch's changes. Undefined when disabled or when the session fails (callers fall back to a plain one).
 	 */
-	private async describePullRequest(
-		ctx: EngineRun,
-		epic: Epic,
-		repo: RepositoryConfig,
-		worktree: string,
-		forge: Forge,
-	): Promise<{ title: string; body: string } | undefined> {
+	private async describePullRequest(ctx: EngineRun, epic: Epic, ws: Workspace, forge: Forge): Promise<{ title: string; body: string } | undefined> {
 		const { config, runner, log } = this.deps;
 		const { record, reporter } = ctx;
-		if (!config.ralph.describePullRequest || !record.branch || ctx.abortSignal.aborted) return undefined;
+		const { repo, lane, worktree } = ws;
+		if (!config.ralph.describePullRequest || !lane.branch || ctx.abortSignal.aborted) return undefined;
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
-		await reporter.thought(`Writing the ${forge.term} title and description.`);
+		await reporter.thought(`Writing the ${forge.term} title and description${lane === record ? "" : ` for \`${repo.name}\``}.`);
 		const result = await runner
 			.run({
-				prompt: buildPullRequestPrompt({ epic, branch: record.branch, baseBranch: repo.baseBranch, prTerm: forge.term, progressFile }),
+				prompt: buildPullRequestPrompt({ epic, branch: lane.branch, baseBranch: repo.baseBranch, prTerm: forge.term, progressFile }),
 				cwd: worktree,
 				additionalDirectories: this.agentDirs(progressFile, epic),
 				model: repo.model ?? config.model,
@@ -910,18 +1031,48 @@ export class EpicEngine {
 		return text;
 	}
 
+	/**
+	 * Push a lane's branch (commits that never reached a remote, e.g. origin was added after the stories
+	 * ran) and open or update its PR/MR. Returns what went wrong, if anything.
+	 */
+	private async publishLane(ctx: EngineRun, epic: Epic, ws: Workspace, all: boolean): Promise<string | undefined> {
+		const { config, git, log } = this.deps;
+		const { reporter } = ctx;
+		const { repo, lane, worktree } = ws;
+		let problem: string | undefined;
+		if (config.ralph.pushPerStory && lane.branch) {
+			try {
+				if (await git.needsPush(worktree, repo.baseBranch)) await git.push(worktree, lane.branch);
+			} catch (err) {
+				problem = `Push failed: ${String(err)}`;
+				await reporter.error(problem);
+			}
+		}
+		try {
+			// A repository none of the stories committed to (they all went elsewhere) gets no PR/MR.
+			if (!lane.prUrl && !(await git.hasCommits(worktree, repo.baseBranch))) return problem;
+			// A PR/MR is only opened for a finished epic; a delegated story that leaves others open just pushes.
+			problem ??= await this.syncPullRequest(ctx, epic, ws, {
+				ready: all && config.ralph.markPrReadyWhenComplete,
+				open: all || config.ralph.openPullRequestEarly,
+				final: all,
+			});
+		} catch (err) {
+			log.warn(`PR sync failed: ${String(err)}`);
+		}
+		return problem;
+	}
+
 	private async finish(args: {
 		ctx: EngineRun;
 		epic: Epic;
-		repo: RepositoryConfig;
-		worktree: string;
 		inScope: (s: Story) => boolean;
 		exhausted: Set<string>;
 		hitCap: boolean;
 		/** Summary from a direct request session, posted as the outcome. */
 		requestOutput?: string;
 	}): Promise<SessionStatus> {
-		const { ctx, epic, repo, worktree, inScope, exhausted, hitCap, requestOutput } = args;
+		const { ctx, epic, inScope, exhausted, hitCap, requestOutput } = args;
 		const { config, linear, log } = this.deps;
 		const { record, reporter } = ctx;
 		await reporter.plan(planFor(epic, undefined, exhausted));
@@ -935,38 +1086,24 @@ export class EpicEngine {
 		const cost = record.totalCostUsd > 0 ? ` (≈$${record.totalCostUsd.toFixed(2)} of agent usage)` : "";
 		if (isEpicComplete(scoped)) {
 			const all = isEpicComplete(epic.stories);
-			// Commits that never reached a remote (e.g. origin was added after the stories ran).
-			let problem: string | undefined;
-			if (config.ralph.pushPerStory && record.branch) {
-				try {
-					if (await this.deps.git.needsPush(worktree, repo.baseBranch)) await this.deps.git.push(worktree, record.branch);
-				} catch (err) {
-					problem = `Push failed: ${String(err)}`;
-					await reporter.error(problem);
-				}
-			}
-			try {
-				// A PR/MR is only opened for a finished epic; a delegated story that leaves others open just pushes.
-				problem ??= await this.syncPullRequest(ctx, epic, repo, worktree, {
-					ready: all && config.ralph.markPrReadyWhenComplete,
-					open: all || config.ralph.openPullRequestEarly,
-					final: all,
-				});
-			} catch (err) {
-				log.warn(`PR sync failed: ${String(err)}`);
+			const spaces = await this.laneWorkspaces(ctx, epic, (l) => !!l.branch);
+			const problems: string[] = [];
+			for (const ws of spaces) {
+				const problem = await this.publishLane(ctx, epic, ws, all);
+				if (problem) problems.push(spaces.length > 1 ? `In \`${ws.repo.name}\`: ${problem}` : problem);
 			}
 			if (all && epic.kind !== "single" && (config.ralph.epicCompletedStateName || config.ralph.epicCompletedStateType)) {
 				await linear
 					.setIssueState(epic.issueId, { name: config.ralph.epicCompletedStateName, type: config.ralph.epicCompletedStateType ?? undefined })
 					.catch((e: unknown) => log.warn(String(e)));
 			}
-			if (problem) {
+			const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
+			if (problems.length) {
 				// The work is done but the PR/MR step isn't: stop and ask rather than report success.
-				const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
 				await reporter.elicitation(
 					[
 						requestOutput,
-						`Finished ${what} on \`${record.branch}\`${cost}, but the last step didn't happen. ${problem}`,
+						`Finished ${what} on \`${record.branch}\`${cost}, but the last step didn't happen. ${problems.join("\n\n")}`,
 						"Please fix that on the cyralph host, then reply here (for example `open the MR`) and I'll retry.",
 					]
 						.filter(Boolean)
@@ -975,23 +1112,19 @@ export class EpicEngine {
 				return "awaiting_input";
 			}
 			if (requestOutput) {
-				const link = record.prUrl && !requestOutput.includes(record.prUrl) ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : "";
-				await reporter.response(`${requestOutput}${link}`);
+				await reporter.response(this.withPullRequestLinks(record, requestOutput));
 				return "completed";
 			}
-			const what = scoped.length === 1 ? `**${scoped[0]?.storyId}**` : `all ${scoped.length} stories of **${epic.identifier}**`;
 			const deferred =
-				!record.prUrl && !all && config.ralph.createPullRequest && !config.ralph.openPullRequestEarly
+				!lanesOf(record).some((l) => l.prUrl) && !all && config.ralph.createPullRequest && !config.ralph.openPullRequestEarly
 					? " The pull/merge request will be opened once every story of the epic is complete."
 					: "";
-			await reporter.response(
-				`Finished ${what} on \`${record.branch}\`${cost}.${deferred}${record.prUrl ? `\n\n${prLabel(record.prUrl)}: ${record.prUrl}` : ""}`,
-			);
+			await reporter.response(this.withPullRequestLinks(record, `Finished ${what} on \`${record.branch}\`${cost}.${deferred}`));
 			return "completed";
 		}
 
 		if (requestOutput) await reporter.thought(requestOutput);
-		await this.adoptPullRequest(ctx, repo, worktree);
+		await this.adoptPullRequests(ctx, epic);
 
 		const byKey = new Map(epic.stories.map((s) => [s.key, s]));
 		const isOpen = (d: string) => {

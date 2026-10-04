@@ -13,21 +13,13 @@ export type SessionStatus = "queued" | "running" | "awaiting_input" | "blocked" 
  */
 export type SessionMode = "epic" | "request";
 
-export interface SessionRecord {
-	sessionId: string;
-	issueId: string;
-	identifier?: string;
-	status: SessionStatus;
-	mode: SessionMode;
-	/** Claude session of the last direct request, resumed for follow-ups so the agent keeps its history. */
-	requestClaudeSessionId?: string;
+/**
+ * One repository an epic works in: its branch, worktree and PR/MR, and the requests (review findings,
+ * CI failures) to work on there. The session record is the lane of its main repository; stories routed
+ * to other repositories get a lane each in `lanes`.
+ */
+export interface RepoLane {
 	repoId?: string;
-	/** How the repository was chosen (for the session log), e.g. "label `backend`". */
-	routedBy?: string;
-	/** Base branch from a `[repo=name#branch]` tag. */
-	baseBranchOverride?: string;
-	/** Repository ids offered in a pending "which repository?" elicitation. */
-	repoSelection?: string[];
 	branch?: string;
 	worktreePath?: string;
 	prUrl?: string;
@@ -44,6 +36,26 @@ export interface SessionRecord {
 	handledCiShas?: string[];
 	/** Failed CI pipelines acted on for this PR/MR (capped by `ci.maxFixRounds`). */
 	ciFixRounds?: number;
+	/** Claude session of the last direct request, resumed for follow-ups so the agent keeps its history. */
+	requestClaudeSessionId?: string;
+	/** Requests not yet acted on, run as a direct request session in this lane's worktree. */
+	pendingRequests?: string[];
+}
+
+export interface SessionRecord extends RepoLane {
+	sessionId: string;
+	issueId: string;
+	identifier?: string;
+	status: SessionStatus;
+	mode: SessionMode;
+	/** How the repository was chosen (for the session log), e.g. "label `backend`". */
+	routedBy?: string;
+	/** Base branch from a `[repo=name#branch]` tag. */
+	baseBranchOverride?: string;
+	/** Repository ids offered in a pending "which repository?" elicitation. */
+	repoSelection?: string[];
+	/** Repositories other than `repoId` that stories of the epic routed to, by repository id. */
+	lanes?: Record<string, RepoLane>;
 	/** Iterations spent per story key. */
 	attempts: Record<string, number>;
 	/** Stories whose agent reported `<promise>BLOCKED</promise>`: set aside without retries until a reply. */
@@ -71,6 +83,16 @@ export interface SessionRecord {
 	totalCostUsd: number;
 	createdAt: string;
 	updatedAt: string;
+}
+
+/** Every repository lane of a session: its main repository (the record itself) first. */
+export function lanesOf(record: SessionRecord): RepoLane[] {
+	return [record, ...Object.values(record.lanes ?? {})];
+}
+
+/** Whether any lane has requests waiting for a direct request session. */
+export function hasPendingRequests(record: SessionRecord): boolean {
+	return lanesOf(record).some((l) => (l.pendingRequests?.length ?? 0) > 0);
 }
 
 /** Statuses in which a session may be woken by a blocker resolving. */

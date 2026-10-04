@@ -65,6 +65,9 @@ function linearStory(issue: IssueSummary, body = parseStoryIssueBody(issue.descr
 		identifier: issue.identifier,
 		url: issue.url,
 		sourceText: stripLegacyMetadata(issue.description),
+		projectName: issue.projectName,
+		teamKey: issue.teamKey,
+		labels: issue.labels,
 	};
 }
 
@@ -103,6 +106,8 @@ function epicBase(issue: IssueSummary, prd: ParsedPrd | null): Omit<Epic, "kind"
 		description: issue.description || prd?.description || "",
 		url: issue.url,
 		teamId: issue.teamId,
+		projectName: issue.projectName,
+		teamKey: issue.teamKey,
 		branchName: prd?.branchName || issue.branchName,
 		qualityGates: prd?.qualityGates.length ? prd.qualityGates : parseQualityGates(issue.description),
 	};

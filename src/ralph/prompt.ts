@@ -49,6 +49,8 @@ export interface PromptContext {
 	attachments?: string;
 	/** The orchestrator files `<follow-up>` blocks as sub-issues of the epic (Linear-backed epics only). */
 	followUps?: boolean;
+	/** The story's repository, when it isn't the epic's main one. */
+	repository?: string;
 }
 
 export const DEFAULT_STORY_TEMPLATE = `You are working through a PRD epic from Linear, one user story per session.
@@ -73,6 +75,8 @@ Each session starts with a fresh context: the PRD, the progress log and the repo
 {{/if}}
 ## Your Task: {{storyId}} - {{storyTitle}}
 {{#if storyIdentifier}}Linear issue: {{storyIdentifier}}{{#if storyUrl}} ({{storyUrl}}){{/if}}
+{{/if}}
+{{#if repository}}Repository: \`{{repository}}\`. This story belongs in this repository rather than the epic's main one, and this worktree is a checkout of it: make every change here.
 {{/if}}
 {{#if storyDescription}}
 ### Description
@@ -194,7 +198,7 @@ export function formatStoryList(epic: Epic, current?: Story): string {
 			const deps = s.dependsOn.map((d) => dependencyLabel(epic, d));
 			const depText = deps.length ? ` (depends on ${deps.join(", ")})` : "";
 			const here = current?.key === s.key ? "  <- current" : "";
-			const manual = s.manual ? " (manual step for a person, not for you)" : "";
+			const manual = s.manual ? " (manual step for a person, not for you)" : s.repo ? ` (in ${s.repo.name})` : "";
 			return `- ${STATUS_MARK[s.status]} ${s.storyId}: ${s.title}${manual}${depText}${here}`;
 		})
 		.join("\n");
@@ -230,6 +234,7 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 		appendInstruction: ctx.appendInstruction,
 		attachments: ctx.attachments,
 		followUps: ctx.followUps ? "yes" : undefined,
+		repository: ctx.repository,
 	};
 	return renderTemplate(template, vars).trim();
 }

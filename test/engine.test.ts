@@ -47,12 +47,18 @@ class TestGit extends CliGitWorkspace {
 	/** Title and body each PR/MR was opened with. */
 	opened: Array<{ title: string; body: string }> = [];
 	updates: Array<{ title?: string; body?: string; ready?: boolean }> = [];
+	/** PR/MR number per `origin`: the first repository's is 7, another repository's 8, and so on. */
+	private numbers = new Map<string, number>();
+	private opens = new Set<string>();
 	override async forge(cwd: string, opts?: Parameters<CliGitWorkspace["forge"]>[1]): Promise<Forge | undefined> {
 		this.forgeOpts.push(opts);
 		const real = await super.forge(cwd, opts);
 		if (!real) return undefined;
-		const url = real.kind === "gitlab" ? "https://git.example.com/acme/app/-/merge_requests/7" : "https://github.com/acme/app/pull/7";
-		const found = () => (this.prs.length || this.externalPr ? { url, number: 7 } : undefined);
+		const origin = (await this.remoteUrl(cwd)) ?? cwd;
+		if (!this.numbers.has(origin)) this.numbers.set(origin, 7 + this.numbers.size);
+		const number = this.numbers.get(origin) ?? 7;
+		const url = real.kind === "gitlab" ? `https://git.example.com/acme/app/-/merge_requests/${number}` : `https://github.com/acme/app/pull/${number}`;
+		const found = () => (this.opens.has(origin) || this.externalPr ? { url, number } : undefined);
 		return {
 			kind: real.kind,
 			cli: real.cli,
@@ -62,9 +68,10 @@ class TestGit extends CliGitWorkspace {
 			find: async () => found(),
 			ensure: async (dir, o) => {
 				this.prs.push("created");
+				this.opens.add(origin);
 				this.opened.push({ title: o.title, body: o.body });
 				this.prOpenedAtCommits.push(Number(sh(dir, "rev-list", "--count", `origin/${o.baseBranch}..HEAD`).trim()));
-				return { url, number: 7 };
+				return { url, number };
 			},
 			update: async (_dir, _pr, o) => {
 				this.updates.push(o);
@@ -982,6 +989,126 @@ describe("repository routing in sessions", () => {
 		expect(rec).toMatchObject({ repoId: "api", baseBranchOverride: "release-2" });
 		expect(existsSync(join(rec?.worktreePath ?? "", "RELEASE"))).toBe(true);
 		expect(t.linear.bodies("thought").some((b) => b.includes("based on `release-2`"))).toBe(true);
+	});
+});
+
+describe("epics whose stories span repositories", () => {
+	/** `api` (project API) is the epic's repository; `web` (project Web) is a second one with its own origin. */
+	function crossRepo(extra: { ci?: CiClient; web?: boolean } = {}) {
+		const t = setup({}, {}, { ci: extra.ci });
+		const second = makeRepo();
+		const base = t.config.repositories[0]!;
+		t.config.repositories[0] = { ...base, id: "api", name: "platform/api", projectKeys: ["API"] };
+		if (extra.web !== false) {
+			t.config.repositories.push({ ...base, id: "web", name: "platform/web", repositoryPath: second.repo, projectKeys: ["Web"], workspaceBaseDir: join(second.root, "wt") });
+		}
+		const ids = ralphEpic(t.linear);
+		for (const i of [ids.epic, ids.s1, ids.s2, ids.s3]) t.linear.issues.get(i.id)!.projectName = "API";
+		t.linear.issues.get(ids.s2.id)!.projectName = "Web";
+		return { ...t, ...ids, second };
+	}
+	const taskOf = (c: RunRequest) => /## Your Task: (\S+)/.exec(c.prompt)?.[1];
+
+	it("works a story whose project routes to another repository there, on its own branch and PR", async () => {
+		const t = crossRepo();
+		await t.manager.handle({ kind: "created", sessionId: "x-1", issueId: t.epic.id });
+		await t.manager.idle();
+
+		const record = t.store.get("x-1");
+		expect(record?.status).toBe("completed");
+		const apiWt = record?.worktreePath ?? "";
+		const webWt = record?.lanes?.web?.worktreePath ?? "";
+		expect(webWt).toContain(join(t.second.root, "wt"));
+		expect(t.runner.calls.map((c) => [taskOf(c), c.cwd])).toEqual([
+			["ENG-2", apiWt],
+			["ENG-3", webWt],
+			["ENG-4", apiWt],
+		]);
+		const webPrompt = t.runner.calls[1]?.prompt ?? "";
+		expect(webPrompt).toContain("Repository: `platform/web`");
+		expect(t.runner.calls[0]?.prompt).not.toContain("Repository: `");
+		expect(t.runner.calls[0]?.prompt).toContain("ENG-3: Show badge (in platform/web)");
+
+		// Each repository's commits stay in its own branch and reach its own origin.
+		expect(existsSync(join(webWt, "ENG-3.txt"))).toBe(true);
+		expect(existsSync(join(apiWt, "ENG-3.txt"))).toBe(false);
+		expect(sh(webWt, "log", "--format=%s", "main..HEAD").trim()).toBe("feat(ENG-3): Show badge");
+		expect(sh(apiWt, "log", "--format=%s", "main..HEAD").trim().split("\n")).toEqual(["feat(ENG-4): Sort by priority", "feat(ENG-2): Add priority field"]);
+		expect(sh(t.second.repo, "ls-remote", "origin")).toContain("refs/heads/eng-1-task-priority");
+
+		expect(record?.prUrl).toBe("https://github.com/acme/app/pull/7");
+		expect(record?.lanes?.web?.prUrl).toBe("https://github.com/acme/app/pull/8");
+		expect(t.linear.urls.map((u) => u.url)).toEqual(["https://github.com/acme/app/pull/7", "https://github.com/acme/app/pull/8"]);
+		expect(t.linear.bodies("thought").some((b) => b.includes("**ENG-3** belongs in `platform/web` (routed by project Web), so I'll work it there"))).toBe(true);
+		expect(t.linear.comments.find((c) => c.issueId === t.s2.id)?.body).toContain("on `eng-1-task-priority` in `platform/web`");
+		const response = t.linear.bodies("response").at(-1) ?? "";
+		expect(response).toContain("Pull request (platform/api): https://github.com/acme/app/pull/7");
+		expect(response).toContain("Pull request (platform/web): https://github.com/acme/app/pull/8");
+		expect(t.linear.plans.at(-1)?.map((p) => p.content)).toContain("ENG-3: Show badge (in platform/web)");
+	});
+
+	it("opens no PR in the epic's repository when every story went to another one", async () => {
+		const t = crossRepo();
+		for (const s of [t.s1, t.s3]) t.linear.issues.get(s.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "created", sessionId: "x-2", issueId: t.epic.id });
+		await t.manager.idle();
+		const record = t.store.get("x-2");
+		expect(record?.status).toBe("completed");
+		expect(t.runner.calls.map(taskOf)).toEqual(["ENG-3"]);
+		expect(record?.prUrl).toBeUndefined();
+		expect(record?.lanes?.web?.prUrl).toBe("https://github.com/acme/app/pull/8");
+		expect(t.git.prs).toEqual(["created"]);
+	});
+
+	it("treats a story whose project no repository here covers like a manual step", async () => {
+		const t = crossRepo({ web: false });
+		t.linear.blocks.set(t.s3.id, [t.s2.id]); // ENG-4 needs ENG-3
+		await t.manager.handle({ kind: "created", sessionId: "x-3", issueId: t.epic.id });
+		await t.manager.idle();
+
+		expect(t.runner.calls.map(taskOf)).toEqual(["ENG-2"]);
+		const record = t.store.get("x-3");
+		expect(record?.status).toBe("blocked");
+		expect(record?.waitingOn).toEqual([{ id: t.s2.id, identifier: "ENG-3" }]);
+		expect(record?.lanes).toBeUndefined();
+		expect(t.linear.issues.get(t.s2.id)?.stateType).toBe("unstarted");
+		expect(
+			t.linear
+				.bodies("thought")
+				.some((b) => b.includes("**ENG-3** isn't in a repository I have (it's in project Web, which no repository here is set up for), so I'll treat it like a manual step")),
+		).toBe(true);
+		expect(t.linear.plans.at(-1)?.map((p) => p.content)).toContain("ENG-3: Show badge (manual: no repository here)");
+		expect(t.git.prs).toEqual([]);
+
+		// Someone does ENG-3 elsewhere: its dependent runs and the epic finishes.
+		t.linear.issues.get(t.s2.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "issue_state", issueId: t.s2.id, stateType: "completed", removed: false });
+		await t.manager.idle();
+		expect(t.runner.calls.map(taskOf)).toEqual(["ENG-2", "ENG-4"]);
+		expect(t.store.get("x-3")?.status).toBe("completed");
+		expect(t.git.prs).toEqual(["created"]);
+	});
+
+	it("hands each PR's failed CI to a request in that PR's own worktree", async () => {
+		const ci = new FakeCi();
+		const t = crossRepo({ ci });
+		await t.manager.handle({ kind: "created", sessionId: "x-4", issueId: t.epic.id });
+		await t.manager.idle();
+		const record = t.store.get("x-4");
+		const before = t.runner.calls.length;
+
+		ci.result = failed("head1");
+		ci.logs.set(1, "FAIL");
+		await t.manager.pollCi();
+		await t.manager.idle();
+		const requests = t.runner.calls.slice(before);
+		expect(requests.map((c) => c.cwd).sort()).toEqual([record?.worktreePath, record?.lanes?.web?.worktreePath].sort());
+		const web = requests.find((c) => c.cwd === record?.lanes?.web?.worktreePath)?.prompt ?? "";
+		expect(web).toContain("pull request #8 (https://github.com/acme/app/pull/8) failed on `head1`");
+		const after = t.store.get("x-4");
+		expect(after?.lanes?.web).toMatchObject({ ciFixRounds: 1, handledCiShas: ["head1"], pendingRequests: [] });
+		expect(after).toMatchObject({ ciFixRounds: 1, handledCiShas: ["head1"], pendingRequests: [] });
+		expect(t.linear.bodies("thought").some((b) => b.includes("Working on your request in `platform/web`."))).toBe(true);
 	});
 });
 
