@@ -174,7 +174,9 @@ What cyralph adds on top:
 
 - **Verification the orchestrator owns.** `verifyCommands` (and optionally the PRD's quality gates,
   via `runPrdQualityGates`) run after the agent claims completion. A failing command fails the
-  attempt, and its output goes into the retry.
+  attempt, and its output goes into the retry. Each check runs once: duplicates are dropped, and the
+  story prompt lists the commands the orchestrator runs (as `{{verifyCommands}}`) apart from the
+  quality gates the agent runs itself (`{{qualityGates}}`), so the agent doesn't repeat them.
 - **Git is also owned by the orchestrator.** The agent is told not to commit. cyralph commits once
   per story, pushes, and opens or updates the PR/MR with `gh` or `glab` (see *GitHub and GitLab*).
 - **Work found along the way becomes stories.** The epic's sub-issues are re-read from Linear before

@@ -30,7 +30,8 @@ export const RepositoryConfigSchema = z.object({
 	isActive: z.boolean().optional(),
 	/**
 	 * Commands the orchestrator runs itself after the agent signals completion.
-	 * A story only passes when all of these exit 0. PRD quality gates are always given to the agent.
+	 * A story only passes when all of these exit 0. They're listed in the story prompt as the orchestrator's
+	 * to run, and PRD quality gates that duplicate one aren't given to the agent to run again.
 	 */
 	verifyCommands: z.array(z.string()).optional(),
 	/** Also execute the PRD's own Quality Gates commands as verifyCommands. */
