@@ -426,10 +426,15 @@ story delegated on its own):
 
 If nothing matches, the session asks *"Which repository should I work in?"* with a picker (Linear's
 `select` elicitation) and continues once you answer. You can pick an option, or reply with a name or
-a number. With only one repository configured, it is used without asking. The choice is sticky for
-the issue, including on re-delegation, and the first thought says how the repo was chosen, e.g.
-*"Working in `platform/web` (routed by label `frontend`)…"*. Set `"isActive": false` to keep a
-repository configured but never route to it.
+a number. With only one repository configured, it is used without asking. The first thought says
+how the repo was chosen, e.g. *"Working in `platform/web` (routed by label `frontend`)…"*. Set
+`"isActive": false` to keep a repository configured but never route to it.
+
+Routing runs again on every run of the issue, including re-delegation, so fixing the config (or the
+issue's labels, project or tag) moves an epic that went to the wrong repository. The work already
+done there is left as it is: the session names its branch and PR/MR and won't touch them again.
+A repository you picked in the session stays picked while it's configured, and an issue stays in its
+current repository when routing alone can't decide.
 
 ```json
 {

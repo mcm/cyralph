@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentRunner, RunRequest, RunResult } from "../src/agent/runner.js";
-import { parseConfig } from "../src/config.js";
+import { type RepositoryConfig, parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
 import { SessionStore, newRecord } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
@@ -992,6 +992,57 @@ describe("repository routing in sessions", () => {
 		await t.manager.idle();
 		expect(t.store.get("rt-3")?.repoId).toBe("web");
 		expect(t.linear.activities.filter((a) => a.signal === "select")).toHaveLength(2);
+	});
+
+	it("routes a re-delegated epic again after the config changes, leaving the old repository's work alone", async () => {
+		const t = twoRepos();
+		const { epic } = ralphEpic(t.linear);
+		t.linear.issues.get(epic.id)!.labels = ["frontend"];
+		await t.manager.handle({ kind: "created", sessionId: "rt-5", issueId: epic.id });
+		await t.manager.idle();
+		const first = t.store.get("rt-5");
+		expect(first).toMatchObject({ repoId: "web", status: "completed" });
+		const oldBranch = first?.branch;
+		expect(oldBranch).toBeTruthy();
+
+		// `frontend` was the wrong label for web: the fixed config sends it to api.
+		const [api, web] = t.config.repositories as [RepositoryConfig, RepositoryConfig];
+		t.manager.setConfig({ ...t.config, repositories: [{ ...api, routingLabels: ["backend", "frontend"] }, { ...web, routingLabels: ["web"] }] });
+		await t.manager.handle({ kind: "created", sessionId: "rt-6", issueId: epic.id });
+		await t.manager.idle();
+		const moved = t.store.get("rt-6");
+		expect(moved).toMatchObject({ repoId: "api", routedBy: "label `frontend`" });
+		expect(moved?.worktreePath).not.toBe(first?.worktreePath);
+		expect(moved?.prUrl).not.toBe(first?.prUrl);
+		expect(moved?.lanes).toBeUndefined();
+		expect(t.linear.bodies("thought").some((b) => b.includes("Routing now sends this to `platform/api` instead of `platform/web`") && b.includes(`branch \`${oldBranch}\``))).toBe(true);
+	});
+
+	it("keeps a repository a human picked, and the current one when routing would have to ask", async () => {
+		const t = twoRepos();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "rt-7", issueId: epic.id });
+		await t.manager.idle();
+		await t.manager.handle({ kind: "prompted", sessionId: "rt-7", issueId: epic.id, body: "platform/web" });
+		await t.manager.idle();
+		expect(t.store.get("rt-7")).toMatchObject({ repoId: "web", status: "completed" });
+
+		// A label routing to api now matches, but the human's pick wins.
+		t.linear.issues.get(epic.id)!.labels = ["backend"];
+		await t.manager.handle({ kind: "created", sessionId: "rt-8", issueId: epic.id });
+		await t.manager.idle();
+		expect(t.store.get("rt-8")).toMatchObject({ repoId: "web", routedBy: "your selection" });
+
+		// Routed by label to api; once the label is gone routing can't decide, so it stays in api.
+		const other = t.linear.add({ title: "Other", identifier: "ENG-20", branchName: "eng-20-other", description: "do it", labels: ["backend"] });
+		await t.manager.handle({ kind: "created", sessionId: "rt-9", issueId: other.id });
+		await t.manager.idle();
+		expect(t.store.get("rt-9")?.repoId).toBe("api");
+		t.linear.issues.get(other.id)!.labels = [];
+		await t.manager.handle({ kind: "created", sessionId: "rt-10", issueId: other.id });
+		await t.manager.idle();
+		expect(t.store.get("rt-10")?.repoId).toBe("api");
+		expect(t.linear.activities.filter((a) => a.signal === "select")).toHaveLength(1);
 	});
 
 	it("applies a [repo=name#branch] base branch override to new epic branches", async () => {

@@ -44,7 +44,7 @@ import {
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
 import { describeRouting, routeIssue, routeStory, selectionValue } from "./routing.js";
-import { type RepoLane, type SessionRecord, type SessionStatus, hasPendingRequests, lanesOf } from "./store.js";
+import { ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStatus, hasPendingRequests, lanesOf, moveToRepository } from "./store.js";
 
 export interface EngineDeps {
 	config: Config;
@@ -75,6 +75,13 @@ export interface EngineRun {
 	setInjector?: (inject: ((text: string) => boolean) | undefined, repoId?: string) => void;
 	/** Worktrees prepared during this run, by repository id (set by the engine). */
 	workspaces?: Map<string, Workspace>;
+}
+
+/** Tell the user an epic moved to another repository, and where its earlier work stays. */
+export function leftBehindNote(left: RepoLane, oldName: string | undefined, newName: string): string {
+	const from = `\`${oldName ?? left.repoId}\``;
+	const work = [left.branch && `branch \`${left.branch}\``, left.prUrl && `${prLabel(left.prUrl)} ${left.prUrl}`].filter(Boolean);
+	return `Routing now sends this to \`${newName}\` instead of ${from}, so I'm working there.${work.length ? ` The earlier work in ${from} stays as it is (${work.join(", ")}); I won't touch it again.` : ""}`;
 }
 
 /** A repository the run works in: its config, its lane in the session record, and its worktree. */
@@ -281,21 +288,24 @@ export class EpicEngine {
 	}
 
 	/**
-	 * The repository for this session (Cyrus routing: tags, labels, project, team, catch-all). Sticky once
-	 * chosen. Returns undefined after asking the user to pick one when nothing matches.
+	 * The repository for this session (Cyrus routing: tags, labels, project, team, catch-all), routed
+	 * again on every run so a config or issue change moves the epic. A repository a human picked stays
+	 * while it's configured, and so does the current one when routing would otherwise have to ask.
+	 * Returns undefined after asking the user to pick one when nothing matches.
 	 */
 	private async resolveRepo(ctx: EngineRun, epicIssue: IssueSummary): Promise<RepositoryConfig | undefined> {
 		const { record, reporter } = ctx;
 		const repos = this.deps.config.repositories;
 		const withBase = (r: RepositoryConfig) => (record.baseBranchOverride ? { ...r, baseBranch: record.baseBranchOverride } : r);
-		const sticky = record.repoId && repos.find((r) => r.id === record.repoId);
-		if (sticky) return withBase(sticky);
+		const current = record.repoId ? repos.find((r) => r.id === record.repoId && r.isActive !== false) : undefined;
+		if (current && record.routedBy === ROUTED_BY_SELECTION) return withBase(current);
 
 		// The delegated issue first (a story may carry its own tag/labels), then its epic.
 		const delegated = record.issueId === epicIssue.id ? epicIssue : await this.deps.linear.getIssue(record.issueId);
 		const issues = delegated.id === epicIssue.id ? [epicIssue] : [delegated, epicIssue];
 		const routed = routeIssue(repos, issues);
 		if (routed.type === "needs_selection") {
+			if (current) return withBase(current);
 			record.repoSelection = routed.candidates.map((r) => r.id);
 			await ctx.persist();
 			await reporter.select(
@@ -304,7 +314,8 @@ export class EpicEngine {
 			);
 			return undefined;
 		}
-		record.repoId = routed.repo.id;
+		const left = moveToRepository(record, routed.repo.id);
+		if (left) await reporter.thought(leftBehindNote(left, this.repoById(left.repoId)?.name, routed.repo.name));
 		record.routedBy = describeRouting(routed);
 		record.baseBranchOverride = routed.baseBranch;
 		await ctx.persist();
