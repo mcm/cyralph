@@ -2278,6 +2278,35 @@ describe("preparation of manual stories", () => {
 		expect(existsSync(join(record?.worktreePath ?? "", "prepared.txt"))).toBe(false);
 	});
 
+	it("mentions rerun preparation in the finished message while a manual story with preparation is open", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		const manual = t.linear.add({ title: "Smoke test on staging", identifier: "ENG-5", parentId: epic.id, subIssueSortOrder: 3, labels: ["Manual"], description: withPrep() });
+		t.linear.blocks.set(manual.id, [s3.id]);
+		await t.manager.handle({ kind: "created", sessionId: "prep-6", issueId: s3.id });
+		await t.manager.idle();
+		expect(selects(t)).toHaveLength(1);
+
+		await t.manager.handle({ kind: "prompted", sessionId: "prep-6", issueId: s3.id, body: "I'll do it myself" });
+		await t.manager.idle();
+
+		expect(t.store.get("prep-6")?.status).toBe("completed");
+		const finished = t.linear.bodies("response").filter((b) => b.startsWith("Finished **ENG-4**"));
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).toMatch(/\n\nReply `rerun preparation` to be asked again about running the preparation commands of \*\*ENG-5\*\*\.$/);
+	});
+
+	it("doesn't mention rerun preparation in the finished message without a manual story with preparation", async () => {
+		const t = setup();
+		const { s3 } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "prep-7", issueId: s3.id });
+		await t.manager.idle();
+
+		const finished = t.linear.bodies("response").filter((b) => b.startsWith("Finished **ENG-4**"));
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).not.toContain("rerun preparation");
+	});
+
 	it("asks about one manual story at a time, in story order", async () => {
 		const t = setup();
 		const { epic, s2, s3 } = ralphEpic(t.linear);
@@ -2330,6 +2359,7 @@ describe("preparation of manual stories", () => {
 			"Preparation is disabled (`allowPreparation: false`), so I won't offer to run the preparation commands of **ENG-2**: they're yours to do, with the rest of the step.",
 		);
 		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**");
+		expect(t.linear.bodies("elicitation").at(-1)).not.toContain("rerun preparation");
 		expect(existsSync(join(record?.worktreePath ?? "", "prepared.txt"))).toBe(false);
 	});
 
@@ -2387,6 +2417,7 @@ describe("preparation of manual stories", () => {
 			expect(record?.status).toBe("blocked");
 			expect(record?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
 			expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**. I'll start automatically");
+			expect(t.linear.bodies("elicitation").at(-1)).toMatch(/Reply `start anyway`.*\n\nReply `rerun preparation` to be asked again about running the preparation commands of \*\*ENG-2\*\*\.$/s);
 			expect(selects(t)).toHaveLength(1);
 			expect(t.linear.issues.get(s1.id)?.stateType).toBe("unstarted");
 		});

@@ -1376,7 +1376,7 @@ export class EpicEngine {
 				await reporter.thought(outcome);
 				return this.askPreparation(ctx, epic, prepare, prepared);
 			}
-			await reporter.response(outcome);
+			await reporter.response([outcome, this.rerunPreparationHint(ctx, epic)].filter(Boolean).join("\n\n"));
 			return "completed";
 		}
 
@@ -1604,8 +1604,27 @@ export class EpicEngine {
 		await ctx.reporter.plan(planFor(epic));
 		const names = blockers.map((b) => `**${b.identifier}**`).join(", ");
 		await ctx.reporter.elicitation(
-			`${lead} on ${names}. I'll start automatically when ${blockers.length > 1 ? "any of them is" : "it's"} done or canceled.\n\nReply \`start anyway\` to ignore the blockers, or \`stop\` to cancel.`,
+			[
+				`${lead} on ${names}. I'll start automatically when ${blockers.length > 1 ? "any of them is" : "it's"} done or canceled.`,
+				"Reply `start anyway` to ignore the blockers, or `stop` to cancel.",
+				this.rerunPreparationHint(ctx, epic),
+			]
+				.filter(Boolean)
+				.join("\n\n"),
 		);
 		return "blocked";
+	}
+
+	/**
+	 * A pointer to `rerun preparation` for an epic with an open manual story that has preparation commands
+	 * (and preparation allowed), so a person knows how to be asked again after it ran or was declined.
+	 */
+	private rerunPreparationHint(ctx: EngineRun, epic: Epic): string | undefined {
+		// Before a repository is chosen (an epic parked on its own blockers), the `ralph` default applies.
+		if (!allowPreparationFor(this.deps.config, this.repoById(ctx.record.repoId) ?? {})) return undefined;
+		const stories = epic.stories.filter((s) => s.manual && !s.elsewhere && (s.preparation?.length ?? 0) > 0 && !isStoryDone(s));
+		if (stories.length === 0) return undefined;
+		const names = stories.map((s) => `**${s.storyId}**`).join(", ");
+		return `Reply \`rerun preparation\` to be asked again about running the preparation commands of ${names}.`;
 	}
 }
