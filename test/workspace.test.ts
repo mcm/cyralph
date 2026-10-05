@@ -57,3 +57,42 @@ describe("worktrees in empty repositories", () => {
 		expect(() => sh(repo, "rev-parse", "--verify", "refs/heads/develop")).toThrow();
 	});
 });
+
+describe("stash entries by SHA", () => {
+	it("finds its own entry among others, drops it after indexes shift, and pushes entries to a branch with their untracked files", async () => {
+		const root = mkdtempSync(join(tmpdir(), "cyralph-stash-"));
+		const origin = join(root, "origin.git");
+		const repo = join(root, "repo");
+		execFileSync("git", ["init", "--bare", "-b", "main", origin]);
+		execFileSync("git", ["clone", origin, repo], { stdio: "ignore" });
+		configure(repo);
+		writeFileSync(join(repo, "README.md"), "hi\n");
+		sh(repo, "add", ".");
+		sh(repo, "commit", "-m", "init");
+		sh(repo, "push", "-u", "origin", "main");
+		const git = new CliGitWorkspace();
+
+		expect(await git.stashAll(repo, "cyralph: E-1 S-1 blocked")).toBeUndefined();
+		writeFileSync(join(repo, "README.md"), "changed\n");
+		writeFileSync(join(repo, "new.txt"), "untracked\n");
+		const mine = await git.stashAll(repo, "cyralph: E-1 S-1 blocked");
+		writeFileSync(join(repo, "other.txt"), "other\n");
+		const other = await git.stashAll(repo, "cyralph: E-2 S-9 blocked");
+		const list = await git.listStashes(repo);
+		expect(list.map((e) => [e.sha, e.ref, e.label])).toEqual([
+			[other, "stash@{0}", "cyralph: E-2 S-9 blocked"],
+			[mine, "stash@{1}", "cyralph: E-1 S-1 blocked"],
+		]);
+
+		await git.pushStashes(repo, "cyralph/stash/e-1", list.filter((e) => e.sha === mine));
+		expect(sh(origin, "show", "cyralph/stash/e-1:README.md")).toBe("changed");
+		expect(sh(origin, "show", "cyralph/stash/e-1:new.txt")).toBe("untracked");
+		expect(sh(origin, "log", "-1", "--format=%s", "cyralph/stash/e-1")).toBe("cyralph: E-1 S-1 blocked");
+
+		// Dropping by SHA uses the entry's current index, which moved when the other one went first.
+		expect(await git.dropStash(repo, other ?? "")).toBe(true);
+		expect(await git.dropStash(repo, mine ?? "")).toBe(true);
+		expect(await git.dropStash(repo, mine ?? "")).toBe(false);
+		expect(await git.listStashes(repo)).toEqual([]);
+	});
+});

@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { extractCodebasePatterns, recentProgressEntries } from "../src/ralph/progress.js";
-import { BLOCKED_PATTERN, COMPLETE_PATTERN, buildPullRequestPrompt, buildStoryPrompt, parseFollowUps, parsePullRequestDescription, renderTemplate, uniqueCommands } from "../src/ralph/prompt.js";
+import {
+	PR_DESCRIPTION_SCHEMA,
+	REQUEST_OUTPUT_SCHEMA,
+	STORY_OUTPUT_SCHEMA,
+	buildPullRequestPrompt,
+	buildStoryPrompt,
+	readPullRequestDescription,
+	readRequestResult,
+	readStoryOutcome,
+	renderTemplate,
+	uniqueCommands,
+} from "../src/ralph/prompt.js";
 import { blockedStories, isEpicComplete, selectNextStory } from "../src/ralph/selection.js";
 import type { Epic, Story } from "../src/ralph/types.js";
 
@@ -127,11 +138,24 @@ describe("prompt", () => {
 		expect(renderTemplate("{{#if a}}A{{else}}none{{/if}}", {})).toBe("none");
 	});
 
-	it("detects the completion signal", () => {
-		expect(COMPLETE_PATTERN.test("done\n<promise> COMPLETE </promise>")).toBe(true);
-		expect(COMPLETE_PATTERN.test("not yet")).toBe(false);
-		expect(BLOCKED_PATTERN.test("can't reach the API\n<promise> blocked </promise>")).toBe(true);
-		expect(BLOCKED_PATTERN.test("<promise>COMPLETE</promise>")).toBe(false);
+	it("asks for a structured result instead of signals in the text", () => {
+		const p = buildStoryPrompt({ epic, story: epic.stories[1]!, progressFile: "/tmp/p.md", attempt: 1, maxAttempts: 3, followUps: true });
+		expect(p).not.toMatch(/<promise>|<follow-up/);
+		expect(p).toContain('`status: "blocked"`');
+		expect(p).toContain("`commit: { summary }`");
+		expect(p).toContain("Add one entry per item to `followUps`");
+		expect(buildStoryPrompt({ epic, story: epic.stories[1]!, progressFile: "/tmp/p.md", attempt: 1, maxAttempts: 3 })).toContain("Leave `followUps` empty.");
+	});
+
+	it("lists stash entries to review only when there are some", () => {
+		const base = { epic, story: epic.stories[1]!, progressFile: "/tmp/p.md", attempt: 2, maxAttempts: 3 };
+		expect(buildStoryPrompt(base)).not.toContain("## Stashed Work");
+		const p = buildStoryPrompt({ ...base, stashes: [{ sha: "a".repeat(40), label: "cyralph: E-1 US-002 blocked", date: "2026-10-05T10:00:00Z" }] });
+		expect(p).toContain("## Stashed Work From Earlier Sessions");
+		expect(p).toContain(`- \`${"a".repeat(40)}\` cyralph: E-1 US-002 blocked (2026-10-05T10:00:00Z)`);
+		expect(p).toContain("`git stash show -p --include-untracked <sha>`");
+		expect(p).toContain("`git stash apply <sha>`");
+		expect(p).toContain("`appliedStashes`");
 	});
 });
 
@@ -147,11 +171,15 @@ describe("PR/MR description", () => {
 		expect(p).not.toContain("US-001");
 	});
 
-	it("parses the last title and description blocks", () => {
-		const out = 'Draft: <pr-title>x</pr-title>\nFinal:\n<pr-title>\n "Add task  priorities" \n</pr-title>\n<pr-description>\n## Summary\nAdds priorities.\n</pr-description>';
-		expect(parsePullRequestDescription(out)).toEqual({ title: "Add task priorities", body: "## Summary\nAdds priorities." });
-		expect(parsePullRequestDescription("<pr-title>t</pr-title>")).toBeUndefined();
-		expect(parsePullRequestDescription("<pr-title> </pr-title><pr-description>b</pr-description>")).toBeUndefined();
+	it("reads the title and description from the structured result", () => {
+		expect(readPullRequestDescription({ title: '\n "Add task  priorities" ', body: "\n## Summary\nAdds priorities.\n" })).toEqual({
+			title: "Add task priorities",
+			body: "## Summary\nAdds priorities.",
+		});
+		expect(readPullRequestDescription({ title: "t" })).toBeUndefined();
+		expect(readPullRequestDescription({ title: " ", body: "b" })).toBeUndefined();
+		expect(readPullRequestDescription(undefined)).toBeUndefined();
+		expect(PR_DESCRIPTION_SCHEMA).toMatchObject({ type: "object", required: ["title", "body"] });
 	});
 });
 
@@ -179,29 +207,51 @@ describe("progress log", () => {
 	});
 });
 
-describe("parseFollowUps", () => {
-	it("reads follow-up blocks, drops repeats by title, and caps the count", () => {
-		const out = 'Found things.\n<follow-up title="Fix A">\nA is broken.\n- [ ] A works\n</follow-up>\n<follow-up title="fix a">dup</follow-up>\n<FOLLOW-UP title=" Fix B ">B</FOLLOW-UP>';
-		expect(parseFollowUps(out)).toEqual([
-			{ title: "Fix A", description: "A is broken.\n- [ ] A works" },
-			{ title: "Fix B", description: "B" },
-		]);
-		expect(parseFollowUps(Array.from({ length: 15 }, (_, i) => `<follow-up title="T${i}">x</follow-up>`).join(""))).toHaveLength(10);
-		expect(parseFollowUps("<promise>COMPLETE</promise>")).toEqual([]);
+describe("structured results", () => {
+	it("publishes JSON schemas for every kind of session", () => {
+		expect(STORY_OUTPUT_SCHEMA).toMatchObject({ type: "object", required: ["status", "summary", "followUps"] });
+		expect((STORY_OUTPUT_SCHEMA.properties as Record<string, { enum?: string[] }>).status?.enum).toEqual(["complete", "blocked", "incomplete"]);
+		expect(STORY_OUTPUT_SCHEMA).not.toHaveProperty("$schema");
+		expect(REQUEST_OUTPUT_SCHEMA).toMatchObject({ type: "object", required: ["summary"] });
 	});
 
-	it("reads the manual attribute, in any position", () => {
-		const out = [
-			'<follow-up title="Grant access" manual>Add the bot to the org.</follow-up>',
-			'<follow-up manual="true" title="Rotate the key">Rotate it.</follow-up>',
-			'<follow-up title="Not manual" manual="false">x</follow-up>',
-			'<follow-up title="Code fix">y</follow-up>',
-		].join("\n");
-		expect(parseFollowUps(out)).toEqual([
-			{ title: "Grant access", description: "Add the bot to the org.", manual: true },
-			{ title: "Rotate the key", description: "Rotate it.", manual: true },
-			{ title: "Not manual", description: "x" },
-			{ title: "Code fix", description: "y" },
-		]);
+	it("reads follow-ups, drops repeats by title, and caps the count", () => {
+		const read = readStoryOutcome({
+			status: "incomplete",
+			summary: "Found things.",
+			followUps: [
+				{ title: "Fix A", description: "A is broken.\n- [ ] A works\n", manual: false },
+				{ title: "fix a", description: "dup", manual: false },
+				{ title: " Fix B ", description: "B", manual: false },
+				{ title: " ", description: "no title", manual: false },
+				{ title: "Grant access", description: "Add the bot to the org.", manual: true },
+			],
+		});
+		expect(read).toEqual({
+			outcome: {
+				status: "incomplete",
+				summary: "Found things.",
+				followUps: [
+					{ title: "Fix A", description: "A is broken.\n- [ ] A works" },
+					{ title: "Fix B", description: "B" },
+					{ title: "Grant access", description: "Add the bot to the org.", manual: true },
+				],
+			},
+		});
+		const many = readStoryOutcome({ status: "complete", summary: "", followUps: Array.from({ length: 15 }, (_, i) => ({ title: `T${i}`, description: "x", manual: false })) });
+		expect("outcome" in many && many.outcome.followUps).toHaveLength(10);
+	});
+
+	it("keeps a blocked result's commit and applied stashes", () => {
+		const read = readStoryOutcome({ status: "blocked", summary: "No creds.", commit: { summary: " Add the  migration " }, appliedStashes: ["abc1234"], followUps: [] });
+		expect(read).toEqual({ outcome: { status: "blocked", summary: "No creds.", commit: { summary: "Add the migration" }, appliedStashes: ["abc1234"], followUps: [] } });
+	});
+
+	it("says what's wrong with a missing or invalid result", () => {
+		expect(readStoryOutcome(undefined)).toEqual({ problem: "no structured result" });
+		expect(readStoryOutcome({ status: "done", summary: "x", followUps: [] })).toMatchObject({ problem: expect.stringContaining("`status`") });
+		expect(readStoryOutcome({ status: "complete" })).toMatchObject({ problem: expect.stringContaining("invalid structured result") });
+		expect(readRequestResult({ summary: " Opened the PR. " })).toEqual({ summary: "Opened the PR." });
+		expect(readRequestResult("Opened the PR.")).toMatchObject({ problem: expect.stringContaining("invalid structured result") });
 	});
 });

@@ -29,7 +29,7 @@ export const RepositoryConfigSchema = z.object({
 	/** Set false to keep a repository configured but never route to it. */
 	isActive: z.boolean().optional(),
 	/**
-	 * Commands the orchestrator runs itself after the agent signals completion.
+	 * Commands the orchestrator runs itself after the agent reports the story complete.
 	 * A story only passes when all of these exit 0. They're listed in the story prompt as the orchestrator's
 	 * to run, and PRD quality gates that duplicate one aren't given to the agent to run again.
 	 */
@@ -67,10 +67,17 @@ export const RepositoryConfigSchema = z.object({
 	 */
 	respondToCiFailures: z.boolean().optional(),
 	/**
-	 * Once an epic's pull/merge request is merged, remove its worktree and local branch (only when
-	 * nothing uncommitted or unmerged would be lost). Defaults to true.
+	 * Once an epic's pull/merge request is merged, remove its worktree and local branch. Uncommitted
+	 * changes are stashed first, and a branch with commits the merge doesn't contain is kept until a
+	 * person decides (see `unmergedBranchTimeoutMinutes`); leftover stashes are offered to a person too.
+	 * Defaults to true.
 	 */
 	cleanupMergedWorktrees: z.boolean().optional(),
+	/**
+	 * After cleanup kept a branch with unmerged commits and asked what to do with it: minutes to wait for
+	 * an answer before the local branch is deleted. Defaults to 60.
+	 */
+	unmergedBranchTimeoutMinutes: z.number().positive().optional(),
 });
 export type RepositoryConfig = z.infer<typeof RepositoryConfigSchema>;
 

@@ -13,10 +13,21 @@ import { type ReviewSubmitted, buildReviewRequest, githubRepoSlug, isReviewBot, 
 import type { AgentWebhookEvent } from "../linear/webhook.js";
 import { isStartAnywayRequest, isStopRequest } from "../linear/webhook.js";
 import type { EngineDeps } from "./epic-engine.js";
-import { EpicEngine, leftBehindNote } from "./epic-engine.js";
+import { EpicEngine, leftBehindNote, stashLabel } from "./epic-engine.js";
 import { asksForPushOrPullRequest } from "../ralph/prompt.js";
+import type { StashEntry } from "../git/workspace.js";
+import {
+	DELETE_BRANCH,
+	DROP_STASHES,
+	PUSH_BRANCH,
+	PUSH_STASHES,
+	UNMERGED_BRANCH_TIMEOUT_MINUTES,
+	cleanupOptions,
+	matchCleanupAnswer,
+	stashBranch,
+} from "./cleanup.js";
 import { matchSelection, selectionValue } from "./routing.js";
-import { PARKED, ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStore, lanesOf, moveToRepository, newRecord } from "./store.js";
+import { type CleanupRequest, PARKED, ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStore, lanesOf, moveToRepository, newRecord } from "./store.js";
 
 /** A PR/MR cyralph opened: the session it belongs to and the repository lane it was opened from. */
 interface LaneRef {
@@ -181,8 +192,9 @@ export class SessionManager {
 	/**
 	 * Remove the worktree and local branch of each epic whose PR/MR was merged (for one issue, or all).
 	 * Runs when the issue is marked done, when a PR/MR is seen closed, and periodically as a fallback.
-	 * Work in progress is never lost: a busy session is checked again later, and a worktree with
-	 * uncommitted changes or unmerged commits is kept.
+	 * It never waits on a person and never leaves a worktree behind, yet loses nothing: a busy session is
+	 * checked again later, uncommitted changes are stashed, a branch with unmerged commits is kept, and
+	 * what to do with leftover stashes and such a branch is asked in the epic's session.
 	 */
 	async cleanupMerged(issueId?: string): Promise<void> {
 		const { ci, config, git, log } = this.deps;
@@ -213,17 +225,152 @@ export class SessionManager {
 					await this.forgetWorktree(path);
 					continue;
 				}
-				const kept = await git.removeWorkspace({ repositoryPath: repo.repositoryPath, path, branch, mergedSha: state.headSha });
-				if (kept) {
-					log.warn(`kept ${path} after ${ref.url} merged: ${kept}`);
-					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, but I kept the worktree \`${path}\` and the branch \`${branch}\`: ${kept}.`);
-				} else {
-					log.info(`removed ${path} and branch ${branch}: ${ref.url} was merged`);
-					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, so I removed its worktree and the local branch \`${branch}\`.`);
+				const epic = record.identifier ?? record.sessionId;
+				const removed = await git.removeWorkspace({
+					repositoryPath: repo.repositoryPath,
+					path,
+					branch,
+					mergedSha: state.headSha,
+					stashMessage: stashLabel(epic, "cleanup"),
+				});
+				if (removed.stashed) {
+					lane.stashes = [...(lane.stashes ?? []), { sha: removed.stashed, label: stashLabel(epic, "cleanup"), reason: "cleanup", createdAt: new Date().toISOString() }];
 				}
 				await this.forgetWorktree(path);
+				const stashedNote = removed.stashed ? ` Its uncommitted changes are stashed (\`${removed.stashed.slice(0, 10)}\`).` : "";
+				if (removed.unmerged) {
+					log.info(`removed ${path} after ${ref.url} merged; kept branch ${branch} (${removed.unmerged} unmerged commits)`);
+					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, so I removed its worktree, but kept the local branch \`${branch}\`.${stashedNote}`);
+				} else {
+					log.info(`removed ${path} and branch ${branch}: ${ref.url} was merged`);
+					await this.notify(record.sessionId, `The ${term} ${ref.url} was merged, so I removed its worktree and the local branch \`${branch}\`.${stashedNote}`);
+				}
+				await this.askAboutStashes(record, lane, repo);
+				if (removed.unmerged) await this.askAboutBranch(record, repo, branch, removed.unmerged);
 			} catch (err) {
 				log.warn(`cleanup after ${ref.url} merged failed: ${String(err)}`);
+			}
+		}
+	}
+
+	/**
+	 * Recorded stash entries of a lane that are still in its repository's stash list. Entries someone
+	 * dropped or applied by other means are forgotten.
+	 */
+	private async liveStashes(record: SessionRecord, lane: RepoLane, repo: RepositoryConfig): Promise<StashEntry[]> {
+		const recorded = lane.stashes ?? [];
+		if (recorded.length === 0) return [];
+		const live = await this.deps.git.listStashes(repo.repositoryPath);
+		const kept = recorded.filter((e) => live.some((l) => l.sha === e.sha));
+		if (kept.length !== recorded.length) {
+			lane.stashes = kept;
+			await this.store.save(record);
+		}
+		return live.filter((l) => kept.some((e) => e.sha === l.sha));
+	}
+
+	/** Post (or replace) a cleanup question in the session and keep it on the record until it's answered. */
+	private async ask(record: SessionRecord, request: CleanupRequest, body: string): Promise<void> {
+		const pending = (record.cleanupRequests ?? []).filter(
+			(r) => !(r.kind === request.kind && r.repoId === request.repoId && (r.kind !== "branch" || request.kind !== "branch" || r.branch === request.branch)),
+		);
+		record.cleanupRequests = [...pending, request];
+		await this.store.save(record);
+		await this.reporter(record.sessionId).select(body, cleanupOptions(request));
+	}
+
+	/** After cleanup: ask what to do with the epic's stash entries nobody applied. */
+	private async askAboutStashes(record: SessionRecord, lane: RepoLane, repo: RepositoryConfig): Promise<void> {
+		const entries = await this.liveStashes(record, lane, repo);
+		if (entries.length === 0) return;
+		const epic = record.identifier ?? record.sessionId;
+		const n = entries.length;
+		await this.ask(
+			record,
+			{ kind: "stashes", repoId: repo.id, shas: entries.map((e) => e.sha), askedAt: new Date().toISOString() },
+			[
+				`${n} stashed change${n === 1 ? "" : "s"} from ${epic} ${n === 1 ? "was" : "were"} never applied:`,
+				entries.map((e) => `- \`${e.sha.slice(0, 10)}\` ${e.label} (${e.date})`).join("\n"),
+				`**${PUSH_STASHES}** keeps them on \`${stashBranch(epic)}\` (one commit each) and drops them here; **${DROP_STASHES}** drops them. Until you answer they stay in \`${repo.name}\`'s stash.`,
+			].join("\n\n"),
+		);
+	}
+
+	/** After cleanup: ask what to do with a kept branch whose commits weren't merged; it's deleted without an answer. */
+	private async askAboutBranch(record: SessionRecord, repo: RepositoryConfig, branch: string, commits: number): Promise<void> {
+		const minutes = repo.unmergedBranchTimeoutMinutes ?? UNMERGED_BRANCH_TIMEOUT_MINUTES;
+		const now = Date.now();
+		await this.ask(
+			record,
+			{ kind: "branch", repoId: repo.id, branch, commits, askedAt: new Date(now).toISOString(), deadline: new Date(now + minutes * 60_000).toISOString() },
+			`\`${branch}\` has ${commits} commit${commits === 1 ? " that wasn't" : "s that weren't"} merged.\n\n**${PUSH_BRANCH}** pushes it to \`origin\` and then deletes it here; **${DELETE_BRANCH}** deletes it. Without an answer within ${minutes} minute${minutes === 1 ? "" : "s"} I'll delete it.`,
+		);
+	}
+
+	/** Carry out the chosen answer to a cleanup question and confirm it in the session. */
+	private async answerCleanup(record: SessionRecord, request: CleanupRequest, option: string): Promise<void> {
+		const { config, git, log } = this.deps;
+		const repo = config.repositories.find((r) => r.id === request.repoId);
+		const done = async (message: string) => {
+			record.cleanupRequests = (record.cleanupRequests ?? []).filter((r) => r !== request);
+			await this.store.save(record);
+			await this.notify(record.sessionId, message);
+		};
+		if (!repo) return done(`\`${request.repoId}\` isn't configured anymore, so I left everything as it is.`);
+		const cwd = repo.repositoryPath;
+		try {
+			if (request.kind === "stashes") {
+				const lanes = lanesOf(record).filter((l) => l.repoId === repo.id);
+				const entries = (await git.listStashes(cwd)).filter((e) => request.shas.includes(e.sha));
+				const epic = record.identifier ?? record.sessionId;
+				if (option === PUSH_STASHES) await git.pushStashes(cwd, stashBranch(epic), entries);
+				for (const e of entries) await git.dropStash(cwd, e.sha);
+				for (const l of lanes) l.stashes = (l.stashes ?? []).filter((e) => !request.shas.includes(e.sha));
+				const n = entries.length;
+				const what = `${n} stashed change${n === 1 ? "" : "s"}`;
+				return done(
+					option === PUSH_STASHES
+						? `Pushed ${what} to \`${stashBranch(epic)}\` on origin (one commit each) and dropped ${n === 1 ? "it" : "them"} here.`
+						: `Dropped ${what} from ${epic}.`,
+				);
+			}
+			if (option === PUSH_BRANCH) await git.push(cwd, request.branch);
+			await git.deleteBranch(cwd, request.branch);
+			return done(
+				option === PUSH_BRANCH
+					? `Pushed \`${request.branch}\` to origin and deleted the local branch.`
+					: `Deleted the local branch \`${request.branch}\` with its ${request.commits} unmerged commit${request.commits === 1 ? "" : "s"}.`,
+			);
+		} catch (err) {
+			log.warn(`cleanup answer "${option}" for ${record.identifier ?? record.sessionId} failed: ${String(err)}`);
+			await this.notify(record.sessionId, `I couldn't do that (${option}): ${String(err)}\n\nAnswer again to retry.`);
+		}
+	}
+
+	/**
+	 * Delete kept branches whose question about unmerged commits got no answer in time, and say so in their
+	 * sessions. Runs every minute; leftover stashes have no timeout.
+	 */
+	async expireCleanupRequests(now = Date.now()): Promise<void> {
+		const { config, git, log } = this.deps;
+		for (const record of this.store.all()) {
+			for (const request of record.cleanupRequests ?? []) {
+				if (request.kind !== "branch" || Date.parse(request.deadline) > now) continue;
+				const repo = config.repositories.find((r) => r.id === request.repoId);
+				const minutes = Math.round((Date.parse(request.deadline) - Date.parse(request.askedAt)) / 60_000);
+				try {
+					if (repo) await git.deleteBranch(repo.repositoryPath, request.branch);
+				} catch (err) {
+					// Retried on the next pass.
+					log.warn(`could not delete ${request.branch} after its question timed out: ${String(err)}`);
+					continue;
+				}
+				record.cleanupRequests = (record.cleanupRequests ?? []).filter((r) => r !== request);
+				await this.store.save(record);
+				await this.notify(
+					record.sessionId,
+					`Nobody answered within ${minutes} minute${minutes === 1 ? "" : "s"}, so I deleted the local branch \`${request.branch}\` with its ${request.commits} unmerged commit${request.commits === 1 ? "" : "s"}.`,
+				);
 			}
 		}
 	}
@@ -495,6 +642,8 @@ export class SessionManager {
 			record.reviewRounds ??= previous.reviewRounds;
 			record.handledCiShas ??= previous.handledCiShas;
 			record.ciFixRounds ??= previous.ciFixRounds;
+			// Stash entries of earlier sessions stay offered to their stories, and are cleaned up with the epic.
+			record.stashes ??= previous.stashes && structuredClone(previous.stashes);
 			// Branches and PRs/MRs in the other repositories the epic's stories routed to; their requests stay behind.
 			if (previous.lanes && !record.lanes) {
 				record.lanes = Object.fromEntries(
@@ -549,6 +698,13 @@ export class SessionManager {
 		}
 
 		const { text, wantsLoop } = parseInstruction(event.body);
+
+		// Answer to a question about a merged epic's leftovers (stashes, unmerged commits).
+		const answer = record.cleanupRequests?.length ? matchCleanupAnswer(text, record.cleanupRequests) : undefined;
+		if (answer) {
+			await this.answerCleanup(record, answer.request, answer.option);
+			return;
+		}
 
 		// Answer to "Which repository should I work in?"
 		if (record.repoSelection?.length) {

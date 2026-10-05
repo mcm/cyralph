@@ -1,12 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 type Msg = { uuid: string; message: { content: string } };
-let behaviour: "separate-turns" | "folded" = "separate-turns";
+let behaviour: "separate-turns" | "folded" | "no-structured-output" = "separate-turns";
+let lastOptions: Record<string, unknown> | undefined;
 
 // A fake SDK query: answers each streamed user message with a result frame.
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
-	query: ({ prompt }: { prompt: AsyncIterable<Msg> }) =>
+	query: ({ prompt, options }: { prompt: AsyncIterable<Msg>; options: Record<string, unknown> }) =>
 		(async function* () {
+			lastOptions = options;
 			const it = prompt[Symbol.asyncIterator]();
 			const first = await it.next();
 			if (first.done) return;
@@ -22,9 +24,14 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 					const extra = await Promise.race([it.next(), new Promise<null>((r) => setTimeout(() => r(null), 5))]);
 					if (extra && !extra.done) batch.push(extra.value);
 				}
+				if (behaviour === "no-structured-output") {
+					yield { type: "result", subtype: "error_max_structured_output_retries", is_error: true, session_id: "claude-1", total_cost_usd: 0.01, num_turns: 5, terminal_reason: "structured_output_retry_exhausted" };
+					return;
+				}
 				yield {
 					type: "result",
 					subtype: "success",
+					structured_output: options.outputFormat ? { answered: batch.map((m) => m.message.content) } : undefined,
 					is_error: false,
 					result: `answered ${batch.map((m) => m.message.content).join(" + ")}`,
 					session_id: "claude-1",
@@ -40,9 +47,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 
 const { ClaudeAgentRunner } = await import("../src/agent/runner.js");
 
-function start(runner: InstanceType<typeof ClaudeAgentRunner>) {
+function start(runner: InstanceType<typeof ClaudeAgentRunner>, outputSchema?: Record<string, unknown>) {
 	let inject: ((t: string) => boolean) | undefined;
 	const done = runner.run({
+		outputSchema,
 		prompt: "story",
 		cwd: process.cwd(),
 		permissionMode: "bypassPermissions",
@@ -80,5 +88,34 @@ describe("ClaudeAgentRunner streaming input", () => {
 		behaviour = "separate-turns";
 		const result = await start(new ClaudeAgentRunner()).done;
 		expect(result.output).toBe("answered story");
+	});
+
+});
+
+describe("ClaudeAgentRunner structured output", () => {
+	const schema = { type: "object", properties: { answered: { type: "array" } } };
+
+	it("asks for the JSON schema and returns the last turn's structured result, also with injected messages", async () => {
+		behaviour = "separate-turns";
+		const r = start(new ClaudeAgentRunner(), schema);
+		await new Promise((res) => setTimeout(res, 5));
+		r.inject("guidance");
+		const result = await r.done;
+		expect(lastOptions?.outputFormat).toEqual({ type: "json_schema", schema });
+		expect(result.structured).toEqual({ answered: ["guidance"] });
+		expect(result.isError).toBe(false);
+	});
+
+	it("passes no output format without a schema", async () => {
+		behaviour = "separate-turns";
+		const result = await start(new ClaudeAgentRunner()).done;
+		expect(lastOptions).not.toHaveProperty("outputFormat");
+		expect(result.structured).toBeUndefined();
+	});
+
+	it("reports an agent that never produced valid structured output as an error", async () => {
+		behaviour = "no-structured-output";
+		const result = await start(new ClaudeAgentRunner(), schema).done;
+		expect(result).toMatchObject({ isError: true, errorMessage: "error_max_structured_output_retries", structured: undefined });
 	});
 });

@@ -136,6 +136,10 @@ async function cmdStart(configPath: string, args: string[]) {
 			manager.cleanupMerged().catch((e: unknown) => log.warn(`merged worktree cleanup failed: ${String(e)}`)),
 		]);
 	void reconcile();
+	// Branches kept after a merge for unmerged commits are deleted once their question goes unanswered.
+	const expireCleanup = () => manager.expireCleanupRequests().catch((e: unknown) => log.warn(`cleanup question expiry failed: ${String(e)}`));
+	void expireCleanup();
+	const cleanupTimer = setInterval(expireCleanup, 60_000);
 	// Without a GitHub webhook, poll cyralph's open pull requests for automated reviews.
 	const pollReviews = () => manager.pollReviews().catch((e: unknown) => log.warn(`review poll failed: ${String(e)}`));
 	const pollsReviews = (c: Config) => !c.github.webhookSecret && c.repositories.some((r) => r.respondToReviews !== false);
@@ -181,6 +185,7 @@ async function cmdStart(configPath: string, args: string[]) {
 	let updateTimer: NodeJS.Timeout | undefined;
 	const stopTimers = () => {
 		clearInterval(timer);
+		clearInterval(cleanupTimer);
 		for (const t of polls) clearInterval(t);
 		reloader.stop();
 		clearInterval(updateTimer);

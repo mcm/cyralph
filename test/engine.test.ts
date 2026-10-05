@@ -8,7 +8,7 @@ import { type RepositoryConfig, parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
 import { SessionStore, newRecord } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
-import { PR_DESCRIPTION_HEADING } from "../src/ralph/prompt.js";
+import { PR_DESCRIPTION_HEADING, PR_DESCRIPTION_SCHEMA, STORY_OUTPUT_SCHEMA, type StoryOutcome } from "../src/ralph/prompt.js";
 import { buildStoryIssueBody } from "../src/ralph/story-body.js";
 import { silentLogger } from "../src/logger.js";
 import type { AttachmentFetcher } from "../src/linear/attachments.js";
@@ -96,9 +96,11 @@ class ScriptedRunner implements AgentRunner {
 	calls: RunRequest[] = [];
 	/** Sessions that wrote a PR/MR title and description (kept out of `calls`). */
 	describeCalls: RunRequest[] = [];
-	/** Final message of a describe session; undefined = it fails. */
-	description: string | undefined =
-		"Looked at the diff.\n<pr-title>Add task priorities with badges and sorting</pr-title>\n<pr-description>\nTasks get a priority.\n\n**Breaking changes**: none.\n</pr-description>";
+	/** Structured result of a describe session; undefined = it fails. */
+	description: { title: string; body: string } | undefined = {
+		title: "Add task priorities with badges and sorting",
+		body: "Tasks get a priority.\n\n**Breaking changes**: none.",
+	};
 	failFirst = new Set<string>();
 	neverComplete = new Set<string>();
 	/** Custom behaviour per story id, by how many times that story has run (1 = first); undefined = the default. */
@@ -107,7 +109,7 @@ class ScriptedRunner implements AgentRunner {
 		if (req.prompt.includes(PR_DESCRIPTION_HEADING)) {
 			this.describeCalls.push(req);
 			if (this.description === undefined) return { output: "", isError: true, aborted: false, errorMessage: "error_during_execution" };
-			return { output: this.description, isError: false, aborted: false, costUsd: 0.05 };
+			return { output: "Looked at the diff.", structured: this.description, isError: false, aborted: false, costUsd: 0.05 };
 		}
 		this.calls.push(req);
 		const id = /## Your Task: (\S+)/.exec(req.prompt)?.[1] ?? "unknown";
@@ -117,12 +119,17 @@ class ScriptedRunner implements AgentRunner {
 		req.onEvent?.({ type: "tool", name: "Write", input: { file_path: `${id}.txt` } });
 		if (this.neverComplete.has(id) || this.failFirst.delete(id)) {
 			writeFileSync(join(req.cwd, `${id}.partial`), "wip\n");
-			return { output: "I got stuck on the migration.", isError: false, aborted: false, costUsd: 0.1 };
+			return { ...outcome("incomplete", "I got stuck on the migration."), costUsd: 0.1 };
 		}
 		writeFileSync(join(req.cwd, `${id}.txt`), `${id}\n`);
 		// Git config for commits made by the engine inside the worktree.
-		return { output: `Implemented ${id}.\n<promise>COMPLETE</promise>`, isError: false, aborted: false, costUsd: 0.25 };
+		return { ...outcome("complete", `Implemented ${id}.`), costUsd: 0.25 };
 	}
+}
+
+/** A story session that ended with this structured result (its summary doubles as the final message). */
+function outcome(status: StoryOutcome["status"], summary: string, extra: Partial<StoryOutcome> = {}): RunResult {
+	return { output: summary, structured: { status, summary, followUps: [], ...extra }, isError: false, aborted: false };
 }
 
 function setup(
@@ -238,11 +245,16 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		const ask = t.linear.bodies("elicitation").at(-1) ?? "";
 		expect(ask).toContain("ENG-2: Add priority field** failed 2 attempts");
 		expect(ask).toContain("**ENG-3** is blocked by ENG-2");
-		// Partial work of the exhausted story was stashed, so it doesn't leak into ENG-4's commit
-		// (ENG-4's own partial work from its failed first attempt is kept for the retry).
+		// Partial work of every unfinished attempt was stashed, so none of it leaks into ENG-4's commit.
+		// ENG-4's own stash from its failed first attempt was offered to the retry and dropped once it committed.
 		const wt = t.store.get("sess-2")?.worktreePath ?? "";
 		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("ENG-2");
-		expect(sh(wt, "stash", "list")).toContain("cyralph: incomplete ENG-2 (ENG-1)");
+		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("ENG-4.partial");
+		expect(t.runner.calls[3]?.prompt).toContain("cyralph: ENG-1 ENG-4 incomplete");
+		const stashes = sh(wt, "stash", "list");
+		expect(stashes).toContain("cyralph: ENG-1 ENG-2 incomplete");
+		expect(stashes).toContain("cyralph: ENG-1 ENG-2 exhausted");
+		expect(stashes).not.toContain("ENG-4");
 
 		// Human replies with guidance; the loop resumes with a fresh attempt budget.
 		t.runner.neverComplete.clear();
@@ -255,15 +267,15 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(t.linear.issues.get(s2.id)?.stateType).toBe("completed");
 	});
 
-	it("sets a story that reports <promise>BLOCKED</promise> aside without retrying, until a reply", async () => {
+	it("sets a story that reports it is blocked aside without retrying, until a reply", async () => {
 		const t = setup({ maxAttemptsPerStory: 3 });
 		const { epic, s1 } = ralphEpic(t.linear);
 		t.runner.script.set("ENG-2", (req, run) => {
 			if (run > 1) return undefined;
-			expect(req.prompt).toContain("<promise>BLOCKED</promise>");
+			expect(req.outputSchema).toBe(STORY_OUTPUT_SCHEMA);
 			writeFileSync(join(req.cwd, "ENG-2.partial"), "wip\n");
-			// Blocked wins over a stray completion signal.
-			return { output: "The database credentials are missing.\n<promise>COMPLETE</promise>\n<promise>BLOCKED</promise>", isError: false, aborted: false };
+			// The result decides, not signals quoted in the message text.
+			return { ...outcome("blocked", "The database credentials are missing."), output: "The database credentials are missing.\n<promise>COMPLETE</promise>" };
 		});
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-b", issueId: epic.id });
@@ -291,6 +303,9 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(resumed.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["ENG-2", "ENG-3"]);
 		expect(resumed[0]?.prompt).toContain("The previous session reported it was blocked");
 		expect(resumed[0]?.prompt).toContain("- Credentials are in .env now.");
+		// Its partial work was stashed under its label, offered to the next run, and dropped once ENG-2 committed.
+		expect(resumed[0]?.prompt).toContain("cyralph: ENG-1 ENG-2 blocked");
+		expect(sh(wt, "stash", "list")).toBe("");
 	});
 
 	it("doesn't mark a story done when its commit fails, and retries it with the hook's output", async () => {
@@ -299,7 +314,7 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		writeFileSync(join(t.repo, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f ENG-2.lint ]; then echo "lint: ENG-2 is not formatted" >&2; exit 1; fi\n', { mode: 0o755 });
 		t.runner.script.set("ENG-2", (req, run) => {
 			if (run === 1) writeFileSync(join(req.cwd, "ENG-2.lint"), "unformatted\n");
-			else rmSync(join(req.cwd, "ENG-2.lint"));
+			else rmSync(join(req.cwd, "ENG-2.lint"), { force: true });
 			return undefined;
 		});
 
@@ -333,7 +348,7 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		);
 		t.runner.script.set("ENG-2", (req, run) => {
 			writeFileSync(join(req.cwd, "ENG-2.txt"), `ENG-2 run ${run}\n`);
-			return { output: "Implemented ENG-2.\n<promise>COMPLETE</promise>", isError: false, aborted: false };
+			return outcome("complete", "Implemented ENG-2.");
 		});
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-d", issueId: epic.id });
@@ -351,7 +366,7 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		// The leftovers were stashed, so ENG-4's commit doesn't sweep them in.
 		const wt = t.store.get("sess-d")?.worktreePath ?? "";
 		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("coverage.out");
-		expect(sh(wt, "stash", "list")).toContain("cyralph: incomplete ENG-2 (ENG-1)");
+		expect(sh(wt, "stash", "list")).toContain("cyralph: ENG-1 ENG-2 exhausted");
 		expect(sh(wt, "status", "--porcelain")).toBe("");
 	});
 
@@ -458,6 +473,7 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		await t.manager.idle();
 		expect(t.runner.describeCalls).toHaveLength(1);
 		const describe = t.runner.describeCalls[0]!;
+		expect(describe.outputSchema).toBe(PR_DESCRIPTION_SCHEMA);
 		expect(describe.prompt).toContain("git diff origin/main...HEAD");
 		expect(describe.prompt).toContain("Do NOT list the user stories");
 		expect(describe.prompt).not.toContain("US-001");
@@ -689,7 +705,7 @@ describe("mentions, delegation and replies (Cyrus semantics)", () => {
 		t.runner.run = async (req) => {
 			if (!isRequest(req)) return original(req);
 			t.runner.calls.push(req);
-			return { output, isError: false, aborted: false, sessionId: `claude-req-${++n}` };
+			return { output, structured: { summary: output }, isError: false, aborted: false, sessionId: `claude-req-${++n}` };
 		};
 	}
 
@@ -1661,35 +1677,146 @@ describe("cleanup after a merge", () => {
 		expect(branchExists(later.repo, "eng-1-task-priority")).toBe(false);
 	});
 
-	it("keeps the worktree when the PR was closed unmerged, work would be lost, or the repository opted out", async () => {
+	it("keeps the worktree only when the PR was closed unmerged or the repository opted out", async () => {
 		const closed = await mergedEpic();
 		closed.ci.result = { ...closed.ci.result, open: false };
 		await closed.manager.cleanupMerged();
 		expect(existsSync(closed.path)).toBe(true);
 		expect(closed.store.get("ci-1")?.prMerged).toBe(false);
 
-		const dirty = await mergedEpic();
-		dirty.ci.mergedAt = dirty.head;
-		writeFileSync(join(dirty.path, "notes.txt"), "wip\n");
-		await dirty.manager.cleanupMerged(dirty.epicId);
-		expect(existsSync(join(dirty.path, "notes.txt"))).toBe(true);
-		expect(dirty.linear.bodies("response").some((b) => b.includes("I kept the worktree") && b.includes("uncommitted changes"))).toBe(true);
-		expect(dirty.store.get("ci-1")?.worktreePath).toBeUndefined(); // said once, not on every pass
-
-		const ahead = await mergedEpic();
-		ahead.ci.mergedAt = ahead.head;
-		writeFileSync(join(ahead.path, "more.txt"), "more\n");
-		sh(ahead.path, "add", ".");
-		sh(ahead.path, "-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-m", "after merge");
-		await ahead.manager.cleanupMerged();
-		expect(existsSync(ahead.path)).toBe(true);
-		expect(branchExists(ahead.repo, "eng-1-task-priority")).toBe(true);
-		expect(ahead.linear.bodies("response").some((b) => b.includes("has commits that weren't merged"))).toBe(true);
-
 		const off = await mergedEpic({ repo: { cleanupMergedWorktrees: false } });
 		off.ci.mergedAt = off.head;
 		await off.manager.cleanupMerged();
 		expect(existsSync(off.path)).toBe(true);
+	});
+
+	const selects = (t: { linear: FakeLinear }) => t.linear.activities.filter((a) => a.signal === "select");
+	const optionsOf = (a: ReturnType<typeof selects>[number] | undefined) => (a?.signalMetadata?.options as Array<{ value: string }> | undefined)?.map((o) => o.value);
+	const bodyOf = (a: ReturnType<typeof selects>[number] | undefined) => (a && "body" in a.content ? a.content.body : "");
+
+	it("stashes a dirty worktree, removes it, and asks about the stash: no answer keeps it, Push stores it on origin", async () => {
+		const t = await mergedEpic();
+		t.ci.mergedAt = t.head;
+		writeFileSync(join(t.path, "notes.txt"), "wip\n");
+		await t.manager.cleanupMerged(t.epicId);
+		expect(existsSync(t.path)).toBe(false);
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(false);
+		expect(sh(t.repo, "stash", "list")).toContain("cyralph: ENG-1 cleanup");
+		expect(t.linear.bodies("response").some((b) => b.includes("removed its worktree and the local branch") && b.includes("uncommitted changes are stashed"))).toBe(true);
+
+		const ask = selects(t).at(-1);
+		expect(bodyOf(ask)).toContain("1 stashed change from ENG-1 was never applied");
+		expect(optionsOf(ask)).toEqual(["Push to a branch on origin", "Drop"]);
+		expect(t.store.get("ci-1")?.cleanupRequests).toMatchObject([{ kind: "stashes", repoId: "app" }]);
+
+		// No answer: nothing happens, however long it takes.
+		await t.manager.expireCleanupRequests(Date.now() + 365 * 24 * 60 * 60_000);
+		expect(sh(t.repo, "stash", "list")).toContain("cyralph: ENG-1 cleanup");
+		// A reply that isn't an answer is handled as usual and leaves the question open.
+		await t.manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "Please push the stash to the branch and also update the docs" });
+		await t.manager.idle();
+		expect(t.store.get("ci-1")?.cleanupRequests).toHaveLength(1);
+
+		await t.manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "Push to a branch on origin" });
+		expect(sh(t.repo, "stash", "list")).not.toContain("cyralph: ENG-1 cleanup");
+		expect(sh(t.origin, "log", "--format=%B", "cyralph/stash/eng-1")).toContain("cyralph: ENG-1 cleanup");
+		expect(sh(t.origin, "show", "cyralph/stash/eng-1:notes.txt")).toBe("wip\n");
+		expect(t.store.get("ci-1")?.cleanupRequests).toEqual([]);
+		expect(t.store.get("ci-1")?.stashes?.some((e) => e.reason === "cleanup")).toBe(false);
+		expect(t.linear.bodies("response").at(-1)).toContain("Pushed 1 stashed change to `cyralph/stash/eng-1` on origin");
+	});
+
+	it("drops leftover stashes of the epic when told to, and never touches other entries", async () => {
+		const t = await mergedEpic();
+		t.ci.mergedAt = t.head;
+		writeFileSync(join(t.repo, "other.txt"), "someone else's\n");
+		sh(t.repo, "stash", "push", "--include-untracked", "-m", "cyralph: ENG-9 ENG-10 blocked");
+		writeFileSync(join(t.path, "notes.txt"), "wip\n");
+		await t.manager.cleanupMerged(t.epicId);
+		expect(bodyOf(selects(t).at(-1))).toContain("1 stashed change from ENG-1 was never applied");
+
+		await t.manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "drop" });
+		const left = sh(t.repo, "stash", "list");
+		expect(left).not.toContain("cyralph: ENG-1 cleanup");
+		expect(left).toContain("cyralph: ENG-9 ENG-10 blocked");
+		expect(sh(t.origin, "branch", "--list", "cyralph/stash/*").trim()).toBe("");
+		expect(t.linear.bodies("response").at(-1)).toContain("Dropped 1 stashed change from ENG-1.");
+	});
+
+	/** A merged epic whose branch got another commit after the merge. */
+	async function aheadEpic(extra: { repo?: Record<string, unknown> } = {}) {
+		const t = await mergedEpic(extra);
+		t.ci.mergedAt = t.head;
+		writeFileSync(join(t.path, "more.txt"), "more\n");
+		sh(t.path, "add", ".");
+		sh(t.path, "-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-m", "after merge");
+		const tip = sh(t.path, "rev-parse", "HEAD").trim();
+		await t.manager.cleanupMerged();
+		expect(existsSync(t.path)).toBe(false);
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(true);
+		expect(t.linear.bodies("response").some((b) => b.includes("removed its worktree, but kept the local branch `eng-1-task-priority`"))).toBe(true);
+		return { ...t, tip };
+	}
+
+	it("removes the worktree of a branch with unmerged commits, keeps the branch, and pushes it when told to", async () => {
+		const t = await aheadEpic();
+		const ask = selects(t).at(-1);
+		expect(bodyOf(ask)).toContain("`eng-1-task-priority` has 1 commit that wasn't merged");
+		expect(optionsOf(ask)).toEqual(["Push to origin", "Delete"]);
+
+		await t.manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "Push to origin" });
+		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(t.tip);
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(false);
+		expect(t.linear.bodies("response").at(-1)).toContain("Pushed `eng-1-task-priority` to origin and deleted the local branch.");
+	});
+
+	it("deletes the kept branch when told to, or once nobody answers in time", async () => {
+		const told = await aheadEpic();
+		await told.manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: told.epicId, body: "Delete" });
+		expect(branchExists(told.repo, "eng-1-task-priority")).toBe(false);
+		expect(sh(told.origin, "rev-parse", "eng-1-task-priority").trim()).not.toBe(told.tip);
+
+		const quiet = await aheadEpic();
+		await quiet.manager.expireCleanupRequests(Date.now() + 59 * 60_000);
+		expect(branchExists(quiet.repo, "eng-1-task-priority")).toBe(true);
+		await quiet.manager.expireCleanupRequests(Date.now() + 61 * 60_000);
+		expect(branchExists(quiet.repo, "eng-1-task-priority")).toBe(false);
+		expect(quiet.store.get("ci-1")?.cleanupRequests).toEqual([]);
+		expect(quiet.linear.bodies("response").at(-1)).toContain("Nobody answered within 60 minutes, so I deleted the local branch `eng-1-task-priority`");
+
+		const custom = await aheadEpic({ repo: { unmergedBranchTimeoutMinutes: 5 } });
+		expect(bodyOf(selects(custom).at(-1))).toContain("within 5 minutes");
+		await custom.manager.expireCleanupRequests(Date.now() + 4 * 60_000);
+		expect(branchExists(custom.repo, "eng-1-task-priority")).toBe(true);
+		await custom.manager.expireCleanupRequests(Date.now() + 6 * 60_000);
+		expect(branchExists(custom.repo, "eng-1-task-priority")).toBe(false);
+		expect(custom.linear.bodies("response").at(-1)).toContain("Nobody answered within 5 minutes");
+	});
+
+	it("keeps pending cleanup questions across a restart and still answers them", async () => {
+		const t = await mergedEpic();
+		t.ci.mergedAt = t.head;
+		writeFileSync(join(t.path, "notes.txt"), "wip\n");
+		writeFileSync(join(t.path, "more.txt"), "more\n");
+		sh(t.path, "add", "more.txt");
+		sh(t.path, "-c", "user.email=t@example.com", "-c", "user.name=Test", "commit", "-m", "after merge");
+		await t.manager.cleanupMerged();
+		expect(t.store.get("ci-1")?.cleanupRequests?.map((r) => r.kind)).toEqual(["stashes", "branch"]);
+		await t.store.flush();
+
+		// A new process reads the questions back from disk.
+		const store = new SessionStore(join(t.root, "sessions.json"));
+		await store.load();
+		const manager = new SessionManager({ config: t.config, linear: t.linear, runner: t.runner, git: t.git, shell: runShell, log: silentLogger, ci: t.ci }, store);
+		// "Push" alone is ambiguous with both questions open; the option values aren't.
+		await manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "Drop" });
+		expect(sh(t.repo, "stash", "list")).not.toContain("cyralph: ENG-1 cleanup");
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(true);
+		await manager.handle({ kind: "prompted", sessionId: "ci-1", issueId: t.epicId, body: "Push to origin" });
+		expect(branchExists(t.repo, "eng-1-task-priority")).toBe(false);
+		expect(sh(t.origin, "log", "--format=%s", "eng-1-task-priority")).toContain("after merge");
+		expect(store.get("ci-1")?.cleanupRequests).toEqual([]);
+		await manager.idle();
 	});
 });
 
@@ -1720,7 +1847,7 @@ describe("config reload", () => {
 
 describe("issues filed during a run", () => {
 	const order = (t: ReturnType<typeof setup>) => t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
-	const done = (output: string): RunResult => ({ output: `${output}\n<promise>COMPLETE</promise>`, isError: false, aborted: false });
+	const done = (summary: string, followUps: StoryOutcome["followUps"] = []): RunResult => outcome("complete", summary, { followUps });
 
 	it("works sub-issues a validation story filed itself, then re-runs the validation story", async () => {
 		const t = setup();
@@ -1732,7 +1859,7 @@ describe("issues filed during a run", () => {
 				const issue = t.linear.add({ title: `Fix ${id}`, identifier: id, parentId: epic.id, priority: 3 });
 				t.linear.blocks.set(s3.id, [...(t.linear.blocks.get(s3.id) ?? []), issue.id]);
 			}
-			return { output: "Validation found two problems; filed UI-21 and UI-22.", isError: false, aborted: false };
+			return outcome("incomplete", "Validation found two problems; filed UI-21 and UI-22.");
 		});
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-f1", issueId: epic.id });
@@ -1748,15 +1875,19 @@ describe("issues filed during a run", () => {
 		expect(t.linear.bodies("response").at(-1)).toContain("all 5 stories of **ENG-1**");
 	});
 
-	it("files <follow-up> blocks as sub-issues that block the story, works them, and re-runs the story", async () => {
+	it("files the result's follow-ups as sub-issues that block the story, works them, and re-runs the story", async () => {
 		const t = setup();
 		const { epic, s3 } = ralphEpic(t.linear);
 		t.runner.script.set("ENG-4", (req, run) => {
 			if (run > 1) return undefined;
-			expect(req.prompt).toContain('<follow-up title="Short imperative title">');
+			expect(req.prompt).toContain("Add one entry per item to `followUps`");
 			return {
-				output: 'Two things are broken.\n<follow-up title="Fix the badge colour">\nWrong colour.\n- [ ] badge is red\n</follow-up>\n<follow-up title="Handle empty lists">\nCrashes.\n</follow-up>',
-				isError: false,
+				...outcome("incomplete", "Two things are broken.", {
+					followUps: [
+						{ title: "Fix the badge colour", description: "Wrong colour.\n- [ ] badge is red", manual: false },
+						{ title: "Handle empty lists", description: "Crashes.", manual: false },
+					],
+				}),
 				aborted: false,
 			};
 		});
@@ -1783,10 +1914,11 @@ describe("issues filed during a run", () => {
 		const { epic, s3 } = ralphEpic(t.linear);
 		t.runner.script.set("ENG-4", (req, run) => {
 			if (run > 1) return undefined;
-			expect(req.prompt).toContain('<follow-up title="…" manual>');
+			expect(req.prompt).toContain("set `manual: true`");
 			return {
-				output: 'I need access.\n<follow-up title="Grant the bot access to the registry" manual>\nAdd cyralph to the registry.\n</follow-up>',
-				isError: false,
+				...outcome("blocked", "I need access.", {
+					followUps: [{ title: "Grant the bot access to the registry", description: "Add cyralph to the registry.", manual: true }],
+				}),
 				aborted: false,
 			};
 		});
@@ -1821,7 +1953,7 @@ describe("issues filed during a run", () => {
 		t.runner.script.set("ENG-2", (req, run) => {
 			if (run > 1) return undefined;
 			writeFileSync(join(req.cwd, "ENG-2.txt"), "x\n");
-			return done('Done.\n<follow-up title="Add an index on priority">\nSlow queries.\n</follow-up>');
+			return done("Done.", [{ title: "Add an index on priority", description: "Slow queries.", manual: false }]);
 		});
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-f3", issueId: epic.id });
@@ -1856,7 +1988,7 @@ describe("issues filed during a run", () => {
 		const t = setup();
 		const { epic, s1 } = ralphEpic(t.linear);
 		t.runner.script.set("ENG-2", (_req, run) =>
-			run === 1 ? { output: '<follow-up title="Fix the migration tool">\nIt drops columns.\n</follow-up>', isError: false, aborted: false } : undefined,
+			run === 1 ? outcome("incomplete", "Blocked by the migration tool.", { followUps: [{ title: "Fix the migration tool", description: "It drops columns.", manual: false }] }) : undefined,
 		);
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-f5", issueId: s1.id });
@@ -1870,7 +2002,7 @@ describe("issues filed during a run", () => {
 	it("stops pausing a story that keeps turning up more work and counts its attempts", async () => {
 		const t = setup({ maxAttemptsPerStory: 1 });
 		const { epic } = ralphEpic(t.linear);
-		t.runner.script.set("ENG-4", (_req, run) => ({ output: `<follow-up title="Problem ${run}">\nMore.\n</follow-up>`, isError: false, aborted: false }));
+		t.runner.script.set("ENG-4", (_req, run) => outcome("incomplete", "More work.", { followUps: [{ title: `Problem ${run}`, description: "More.", manual: false }] }));
 
 		await t.manager.handle({ kind: "created", sessionId: "sess-f6", issueId: epic.id });
 		await t.manager.idle();
@@ -1880,5 +2012,180 @@ describe("issues filed during a run", () => {
 		expect(t.store.get("sess-f6")?.status).toBe("awaiting_input");
 		expect(t.linear.bodies("elicitation").at(-1)).toContain("ENG-4: Sort by priority** failed 1 attempts");
 		expect((await t.linear.getChildren(epic.id)).filter((c) => c.title.startsWith("Problem "))).toHaveLength(4);
+	});
+});
+
+describe("never losing blocked work", () => {
+	const ids = (t: ReturnType<typeof setup>) => t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+	const wtOf = (t: ReturnType<typeof setup>, sessionId: string) => t.store.get(sessionId)?.worktreePath ?? "";
+	const filesOf = (wt: string, ref: string) => sh(wt, "show", "--name-only", "--format=", ref).trim().split("\n");
+	const shaFor = (prompt: string, label: string) => new RegExp(`\`([0-9a-f]{40})\` ${label}`).exec(prompt)?.[1];
+
+	it("stashes a story's work when it ends blocked after filing a follow-up (the TOOL-31 case), and offers it back", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-4", (req, run) => {
+			if (run > 1) return undefined;
+			writeFileSync(join(req.cwd, "ENG-4.fix"), "half a fix\n");
+			return outcome("blocked", "Needs the migration tool fixed first.", {
+				followUps: [{ title: "Fix the migration tool", description: "It drops columns.", manual: false }],
+			});
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "tool-31", issueId: epic.id });
+		await t.manager.idle();
+
+		const followUp = (await t.linear.getChildren(epic.id)).find((c) => c.title === "Fix the migration tool");
+		expect(ids(t)).toEqual(["ENG-2", "ENG-3", "ENG-4", followUp?.identifier, "ENG-4"]);
+		const wt = wtOf(t, "tool-31");
+		// The follow-up's commit holds only its own work, not ENG-4's leftovers.
+		const log = sh(wt, "log", "--format=%H %s", "main..HEAD").trim().split("\n");
+		const followUpCommit = log.find((l) => l.includes(followUp?.identifier ?? "?"))?.split(" ")[0] ?? "";
+		expect(filesOf(wt, followUpCommit)).toEqual([`${followUp?.identifier}.txt`]);
+		// ENG-4's second run was offered the stash; once ENG-4 committed, the entry was dropped.
+		const second = t.runner.calls.at(-1)?.prompt ?? "";
+		expect(shaFor(second, "cyralph: ENG-1 ENG-4 follow-up")).toBeDefined();
+		expect(sh(wt, "stash", "list")).toBe("");
+		expect(sh(wt, "status", "--porcelain")).toBe("");
+		expect(t.store.get("tool-31")?.status).toBe("completed");
+	});
+
+	it("commits a blocked story's work as wip when it asks to and the checks pass, pushes it, and keeps the story blocked", async () => {
+		const t = setup({}, {}, { repo: { verifyCommands: ["test -f ENG-2.partial"] } });
+		const { epic, s1 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req) => {
+			writeFileSync(join(req.cwd, "ENG-2.partial"), "wip\n");
+			return outcome("blocked", "The database credentials are missing.", { commit: { summary: "Add the priority column migration" } });
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "wip-1", issueId: epic.id });
+		await t.manager.idle();
+
+		const wt = wtOf(t, "wip-1");
+		const commits = sh(wt, "log", "--format=%s%n%b---", "main..HEAD");
+		expect(commits.match(/^wip\(/gm)).toHaveLength(1);
+		expect(commits).toContain("wip(ENG-2): Add the priority column migration\nEpic: ENG-1 Task Priority System\n");
+		expect(filesOf(wt, sh(wt, "log", "--format=%H", "--grep=^wip(ENG-2)", "main..HEAD").trim())).toEqual(["ENG-2.partial"]);
+		// Pushed like a completed story, and the story is still blocked.
+		expect(sh(t.origin, "rev-parse", "eng-1-task-priority").trim()).toBe(sh(wt, "rev-parse", "HEAD").trim());
+		expect(t.linear.issues.get(s1.id)?.stateType).not.toBe("completed");
+		expect(t.store.get("wip-1")?.blockedKeys).toEqual([s1.id]);
+		expect(t.linear.bodies("thought").join("\n")).toContain("ENG-2 is blocked; setting it aside without retrying (work so far committed as");
+		expect(sh(wt, "stash", "list")).toBe("");
+		expect(sh(wt, "status", "--porcelain")).toBe("");
+	});
+
+	it("stashes a blocked story's work instead when a check fails, and says which one", async () => {
+		const t = setup({}, {}, { repo: { verifyCommands: ["test ! -f ENG-2.partial"] } });
+		const { epic } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req) => {
+			writeFileSync(join(req.cwd, "ENG-2.partial"), "wip\n");
+			return outcome("blocked", "The database credentials are missing.", { commit: { summary: "Add the priority column migration" } });
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "wip-2", issueId: epic.id });
+		await t.manager.idle();
+
+		const wt = wtOf(t, "wip-2");
+		expect(sh(wt, "log", "--format=%s", "main..HEAD")).not.toContain("wip(");
+		expect(sh(wt, "stash", "list")).toContain("cyralph: ENG-1 ENG-2 blocked");
+		expect(t.linear.bodies("thought").join("\n")).toContain("ENG-2's work so far didn't pass `test ! -f ENG-2.partial` (exit 1), so I stashed it");
+		expect(sh(wt, "status", "--porcelain")).toBe("");
+	});
+
+	it("uses up an attempt when a session ends without a valid structured result, and says why", async () => {
+		const t = setup({ maxAttemptsPerStory: 3 });
+		const { epic, s1 } = ralphEpic(t.linear);
+		t.runner.script.set("ENG-2", (req, run) => {
+			if (run === 1) return { output: "Done.\n<promise>COMPLETE</promise>", isError: false, aborted: false };
+			if (run === 2) return { output: "", isError: true, aborted: false, errorMessage: "error_max_structured_output_retries" };
+			if (run === 3) expect(req.prompt).toContain("never produced a structured result matching the JSON schema (error_max_structured_output_retries)");
+			return undefined;
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "so-1", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(ids(t).slice(0, 3)).toEqual(["ENG-2", "ENG-2", "ENG-2"]);
+		expect(t.runner.calls[1]?.prompt).toContain("ended without a valid structured result (no structured result)");
+		expect(t.store.get("so-1")?.attempts[s1.id]).toBe(3);
+		expect(t.linear.issues.get(s1.id)?.stateType).toBe("completed");
+	});
+
+	it("stashes a dirty worktree before any session with a pre-run label, so the next commit holds only its story", async () => {
+		const t = setup({ maxIterationsPerRun: 1 });
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pre-1", issueId: epic.id });
+		await t.manager.idle();
+		const wt = wtOf(t, "pre-1");
+		writeFileSync(join(wt, "stray.txt"), "left behind\n");
+
+		await t.manager.handle({ kind: "prompted", sessionId: "pre-1", issueId: epic.id, body: "keep going" });
+		await t.manager.idle();
+		expect(ids(t)).toEqual(["ENG-2", "ENG-3"]);
+		expect(sh(wt, "stash", "list")).toContain("cyralph: ENG-1 ENG-3 pre-run");
+		expect(filesOf(wt, "HEAD")).toEqual(["ENG-3.txt"]);
+		// Not the story's own work, so it isn't offered to it (or dropped with it).
+		expect(t.runner.calls[1]?.prompt).not.toContain("## Stashed Work");
+		expect(t.store.get("pre-1")?.stashes).toMatchObject([{ label: "cyralph: ENG-1 ENG-3 pre-run", reason: "pre-run" }]);
+		expect(t.store.get("pre-1")?.stashes?.[0]).not.toHaveProperty("storyKey");
+
+	});
+
+	it("stashes a dirty worktree before a request session too", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		await t.manager.handle({ kind: "created", sessionId: "pre-2", issueId: epic.id });
+		await t.manager.idle();
+		const wt = wtOf(t, "pre-2");
+		writeFileSync(join(wt, "stray.txt"), "left behind\n");
+
+		await t.manager.handle({ kind: "created", sessionId: "pre-3", issueId: epic.id, commentBody: "@cyralph rename the badge component" });
+		await t.manager.idle();
+		const request = t.runner.calls.find((c) => c.prompt.includes("## Request from your team"));
+		expect(request?.outputSchema).toBeDefined();
+		const stashes = sh(wt, "stash", "list");
+		expect(stashes).toContain("cyralph: ENG-1 request pre-run");
+		// What the request session itself left uncommitted is stashed afterwards.
+		expect(stashes).toContain("cyralph: ENG-1 request unfinished");
+		expect(sh(wt, "status", "--porcelain")).toBe("");
+	});
+
+	it("offers a story only its own stash entries, and drops only those once it commits", async () => {
+		const t = setup();
+		const { epic } = ralphEpic(t.linear);
+		// Another epic's entry in the stash list every worktree of the repository shares.
+		writeFileSync(join(t.repo, "other.txt"), "another epic\n");
+		sh(t.repo, "stash", "push", "--include-untracked", "-m", "cyralph: ENG-9 ENG-10 blocked");
+		t.runner.neverComplete.add("ENG-2");
+		t.runner.failFirst.add("ENG-4");
+		t.runner.script.set("ENG-4", (req, run) => {
+			if (run === 1) return undefined;
+			const sha = shaFor(req.prompt, "cyralph: ENG-1 ENG-4 incomplete") ?? "";
+			execFileSync("git", ["stash", "apply", sha], { cwd: req.cwd, stdio: "ignore" });
+			writeFileSync(join(req.cwd, "ENG-4.txt"), "ENG-4\n");
+			return outcome("complete", "Implemented ENG-4 on top of the stash.", { appliedStashes: [sha.slice(0, 12)] });
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "offer-1", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(ids(t)).toEqual(["ENG-2", "ENG-2", "ENG-4", "ENG-4"]);
+		const eng2 = t.runner.calls[1]?.prompt ?? "";
+		const eng4 = t.runner.calls[3]?.prompt ?? "";
+		expect(eng2).toContain("cyralph: ENG-1 ENG-2 incomplete");
+		expect(eng2).not.toContain("ENG-9");
+		expect(eng4).toContain("cyralph: ENG-1 ENG-4 incomplete");
+		expect(eng4).not.toContain("cyralph: ENG-1 ENG-2");
+		expect(eng4).not.toContain("ENG-9");
+
+		const wt = wtOf(t, "offer-1");
+		expect(filesOf(wt, "HEAD").sort()).toEqual(["ENG-4.partial", "ENG-4.txt"]);
+		const left = sh(wt, "stash", "list");
+		expect(left).not.toContain("ENG-4");
+		expect(left).toContain("cyralph: ENG-1 ENG-2 incomplete");
+		expect(left).toContain("cyralph: ENG-1 ENG-2 exhausted");
+		expect(left).toContain("cyralph: ENG-9 ENG-10 blocked");
+		expect(t.store.get("offer-1")?.stashes?.map((e) => e.reason)).toEqual(["incomplete", "exhausted"]);
 	});
 });
