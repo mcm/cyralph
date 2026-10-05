@@ -51,6 +51,33 @@ export function isManualIssue(issue: Pick<IssueSummary, "labels">, manualLabels:
 	return issue.labels.some((l) => wanted.has(l.toLowerCase()));
 }
 
+const PREPARE_INFO = "cyralph-prepare";
+
+/**
+ * The commands in every ```cyralph-prepare fenced block of a markdown text, in order: one per non-empty
+ * line, trimmed. Fences follow CommonMark (``` or ~~~, at least three, closed by the same character at
+ * least as long); an unclosed block runs to the end of the text.
+ */
+export function parsePreparation(text: string): string[] {
+	const commands: string[] = [];
+	let fence: { char: string; length: number; prepare: boolean } | undefined;
+	for (const line of text.split(/\r?\n/)) {
+		if (!fence) {
+			const open = /^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)/.exec(line);
+			if (open?.[1]) fence = { char: open[1][0] ?? "`", length: open[1].length, prepare: open[2]?.toLowerCase() === PREPARE_INFO };
+			continue;
+		}
+		const close = /^ {0,3}(`{3,}|~{3,})\s*$/.exec(line);
+		if (close?.[1] && close[1][0] === fence.char && close[1].length >= fence.length) {
+			fence = undefined;
+			continue;
+		}
+		const command = line.trim();
+		if (fence.prepare && command) commands.push(command);
+	}
+	return commands;
+}
+
 /** The fields of a story that come straight from its Linear issue. */
 function linearStory(issue: IssueSummary, body = parseStoryIssueBody(issue.description)) {
 	return {
@@ -89,11 +116,15 @@ async function storyFromIssue(
 			external[b.id] = b.identifier;
 		}
 	}
+	const manual = isManualIssue(issue, manualLabels);
+	// Preparation is only ever offered for manual stories: blocks anywhere else are plain text.
+	const preparation = manual ? parsePreparation(stripLegacyMetadata(issue.description)) : [];
 	return {
 		...linearStory(issue, body),
 		dependsOn,
 		status: statusFromStateType(issue.stateType),
-		...(isManualIssue(issue, manualLabels) && { manual: true }),
+		...(manual && { manual: true }),
+		...(preparation.length > 0 && { preparation }),
 	};
 }
 

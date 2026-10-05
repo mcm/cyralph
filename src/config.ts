@@ -54,6 +54,8 @@ export const RepositoryConfigSchema = z.object({
 	appendInstruction: z.string().optional(),
 	/** Per-repository override of `ralph.historyRewrite`. */
 	historyRewrite: z.enum(["when-asked", "never"]).optional(),
+	/** Per-repository override of `ralph.allowPreparation`. */
+	allowPreparation: z.boolean().optional(),
 	/** Custom story prompt template (Handlebars subset, see src/ralph/prompt.ts). */
 	promptTemplatePath: z.string().optional(),
 	/**
@@ -127,6 +129,11 @@ export const RalphConfigSchema = z.object({
 	 * agent merges instead and explains. The base branch and other branches are never force-pushed.
 	 */
 	historyRewrite: z.enum(["when-asked", "never"]).default("when-asked"),
+	/**
+	 * Offer to run the ```cyralph-prepare blocks of a manual story once it is unblocked: cyralph asks in the
+	 * epic's session and runs the commands only when a person approves. False: never offered.
+	 */
+	allowPreparation: z.boolean().default(true),
 	/**
 	 * Story issues carrying any of these labels (case-insensitive) are manual steps for a person: cyralph
 	 * never works them, and stories that depend on them wait until they are done, like an outside blocker.
@@ -232,6 +239,11 @@ export function parseConfig(raw: unknown, configPath: string): Config {
 			promptTemplatePath: r.promptTemplatePath ? resolve(baseDir, r.promptTemplatePath) : undefined,
 		})),
 	};
+}
+
+/** Whether manual stories' preparation commands may be offered for a repository (`ralph.allowPreparation` unless overridden). */
+export function allowPreparationFor(config: Pick<Config, "ralph">, repo: Pick<RepositoryConfig, "allowPreparation">): boolean {
+	return repo.allowPreparation ?? config.ralph.allowPreparation;
 }
 
 export async function loadConfig(configPath = defaultConfigPath()): Promise<Config> {

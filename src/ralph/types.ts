@@ -31,6 +31,11 @@ export interface Story {
 	 * cyralph has no access to (e.g. "project `Docs`, which no repository here is set up for").
 	 */
 	elsewhere?: string;
+	/**
+	 * Preparation commands from the ```cyralph-prepare blocks of a manual story's description, one per
+	 * command, in order. Run only with a person's approval; never set on non-manual stories.
+	 */
+	preparation?: string[];
 	/** A repository other than the epic's that the story routed to (its own worktree, branch and PR/MR). */
 	repo?: { id: string; name: string; routedBy: string };
 	/** The story issue's routing fields: its Linear project, team and labels. */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadEpic } from "../src/linear/epic-loader.js";
+import { loadEpic, parsePreparation } from "../src/linear/epic-loader.js";
 import { sortStories } from "../src/ralph/selection.js";
 import { FakeLinear } from "./fakes.js";
 
@@ -44,5 +44,58 @@ describe("loadEpic (Linear metadata only)", () => {
 		expect(loaded.epic.identifier).toBe("ENG-30");
 		expect(loaded.focusStoryKey).toBe(story.id);
 		expect(loaded.epic.stories).toHaveLength(2);
+	});
+});
+
+describe("preparation blocks", () => {
+	const fence = "```";
+	const manualStory = (description: string) => async () => {
+		const linear = new FakeLinear();
+		const epic = linear.add({
+			title: "Epic",
+			identifier: "ENG-40",
+			description: `Context\n\n${fence}cyralph-prepare\necho epic-level\n${fence}`,
+		});
+		linear.add({ title: "Smoke test", identifier: "ENG-41", parentId: epic.id, labels: ["Manual"], description });
+		linear.add({ title: "Agent work", identifier: "ENG-42", parentId: epic.id, description });
+		const { epic: loaded } = await loadEpic(linear, epic.id, { materializeStories: false, manualLabels: ["manual"] });
+		return { manual: loaded.stories.find((s) => s.identifier === "ENG-41"), agent: loaded.stories.find((s) => s.identifier === "ENG-42") };
+	};
+
+	it("reads one block from a manual story, dropping blank lines", async () => {
+		const { manual } = await manualStory(
+			`## Description\nPush to staging first.\n\n${fence}cyralph-prepare\ngit fetch origin\n\n   \ngit push --force origin HEAD:staging\n${fence}\n\nThen check the site.`,
+		)();
+		expect(manual?.manual).toBe(true);
+		expect(manual?.preparation).toEqual(["git fetch origin", "git push --force origin HEAD:staging"]);
+	});
+
+	it("joins every block in order and ignores other code blocks", async () => {
+		const { manual } = await manualStory(
+			`${fence}cyralph-prepare\nfirst\n${fence}\n\n${fence}sh\nnot a command\n${fence}\n\n~~~~cyralph-prepare\nsecond\n${fence}\nthird\n~~~~`,
+		)();
+		expect(manual?.preparation).toEqual(["first", "second", fence, "third"]);
+	});
+
+	it("ignores blocks in non-manual stories and the epic description", async () => {
+		const { agent } = await manualStory(`${fence}cyralph-prepare\nrm -rf build\n${fence}`)();
+		expect(agent?.manual).toBeUndefined();
+		expect(agent).not.toHaveProperty("preparation");
+	});
+
+	it("leaves preparation unset for a manual story without a block", async () => {
+		const { manual } = await manualStory(`Check the site by hand.\n\n${fence}sh\necho hi\n${fence}`)();
+		expect(manual?.manual).toBe(true);
+		expect(manual).not.toHaveProperty("preparation");
+	});
+});
+
+describe("parsePreparation", () => {
+	it("returns nothing for text without blocks", () => {
+		expect(parsePreparation("plain text\n```\ncode\n```")).toEqual([]);
+	});
+
+	it("runs an unclosed block to the end of the text", () => {
+		expect(parsePreparation("```cyralph-prepare\r\na\r\nb")).toEqual(["a", "b"]);
 	});
 });
