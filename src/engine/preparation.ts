@@ -12,6 +12,23 @@ export const PREPARATION_MYSELF = "I'll do it myself";
 export const PREPARATION_LATER = "Not yet";
 export const PREPARATION_OPTIONS = [PREPARATION_RUN, PREPARATION_MYSELF, PREPARATION_LATER];
 
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * Match a reply to the pending preparation question: an option's value (what Linear sends for a picked
+ * option) or its 1-based number. Anything else isn't an answer.
+ */
+export function matchPreparationAnswer(reply: string): string | undefined {
+	const text = norm(reply);
+	if (/^[123]$/.test(text)) return PREPARATION_OPTIONS[Number(text) - 1];
+	return PREPARATION_OPTIONS.find((o) => norm(o) === text);
+}
+
+/** A reply asking to offer a manual story's preparation again, even after it ran or was declined. */
+export function isRerunPreparationRequest(reply: string): boolean {
+	return norm(reply) === "rerun preparation";
+}
+
 /** Hash of a story's parsed commands, so an approval is bound to the commands that were shown. */
 export function preparationHash(commands: string[]): string {
 	return createHash("sha256").update(JSON.stringify(commands)).digest("hex");
@@ -39,21 +56,20 @@ export function eligiblePreparations(epic: Epic, record: Pick<SessionRecord, "pr
 	);
 }
 
-/** A fence that no backtick run inside the commands can close. */
-function fenceFor(text: string): string {
+/** `text` in a Markdown code block that no backtick run inside it can close. */
+export function fenced(text: string, info = ""): string {
 	const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map((m) => m[0].length));
-	return "`".repeat(Math.max(3, longest + 1));
+	const fence = "`".repeat(Math.max(3, longest + 1));
+	return `${fence}${info}\n${text}\n${fence}`;
 }
 
 /** The body of the approval picker. */
 export function preparationQuestion(story: Story, request: Pick<PreparationRequest, "branch" | "headSha">, commands: string[], lead?: string): string {
 	const name = `**${story.storyId}: ${story.title}**`;
-	const text = commands.join("\n");
-	const fence = fenceFor(text);
 	return [
 		lead,
 		`${name} is a manual step with preparation commands. Should I run them now, in the epic's worktree on \`${request.branch}\` at \`${request.headSha.slice(0, 7)}\`?`,
-		`${fence}sh\n${text}\n${fence}`,
+		fenced(commands.join("\n"), "sh"),
 		`**${PREPARATION_RUN}** runs them one at a time and stops at the first failure; **${PREPARATION_MYSELF}** leaves them to you; **${PREPARATION_LATER}** keeps the question open. Either way, the rest of ${story.storyId} stays with a person.`,
 	]
 		.filter(Boolean)

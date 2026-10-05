@@ -26,6 +26,7 @@ import {
 	matchCleanupAnswer,
 	stashBranch,
 } from "./cleanup.js";
+import { PREPARATION_LATER, PREPARATION_MYSELF, PREPARATION_RUN, isRerunPreparationRequest, matchPreparationAnswer } from "./preparation.js";
 import { matchSelection, selectionValue } from "./routing.js";
 import { type CleanupRequest, PARKED, ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStore, lanesOf, moveToRepository, newRecord } from "./store.js";
 
@@ -706,6 +707,24 @@ export class SessionManager {
 			return;
 		}
 
+		// Answer to "Should I run the preparation commands of this manual step?"
+		const preparation = record.preparationRequest && matchPreparationAnswer(text);
+		if (preparation) {
+			await this.answerPreparation(record, preparation);
+			return;
+		}
+		if (record.mode === "epic" && isRerunPreparationRequest(text)) {
+			record.preparationRerun = true;
+			await this.store.save(record);
+			if (this.active.has(record.sessionId)) {
+				await reporter.thought("Got it. I'll ask about the preparation again once the current step finishes.");
+				return;
+			}
+			await reporter.thought("Looking for a manual step whose preparation can run again…");
+			this.enqueue(record);
+			return;
+		}
+
 		// Answer to "Which repository should I work in?"
 		if (record.repoSelection?.length) {
 			const candidates = this.deps.config.repositories.filter((r) => record.repoSelection?.includes(r.id));
@@ -761,6 +780,35 @@ export class SessionManager {
 		await this.store.save(record);
 		await reporter.thought("On it.");
 		this.enqueue(record);
+	}
+
+	/**
+	 * Carry out an answer to the pending preparation question. "Run it" and "I'll do it myself" continue
+	 * the epic (the run checks and runs an approval, then asks about the next one or parks); "Not yet"
+	 * leaves the question open. A manual story's Linear state is never touched.
+	 */
+	private async answerPreparation(record: SessionRecord, option: string): Promise<void> {
+		const request = record.preparationRequest;
+		if (!request) return;
+		const reporter = this.reporter(record.sessionId);
+		if (option === PREPARATION_LATER) {
+			await this.notify(record.sessionId, `OK, I won't run anything for **${request.storyId}** yet. The question stays open: answer it whenever you're ready.`);
+			return;
+		}
+		if (option === PREPARATION_RUN) {
+			request.approvedAt = new Date().toISOString();
+		} else if (option === PREPARATION_MYSELF) {
+			record.preparationHandled = [...new Set([...(record.preparationHandled ?? []), request.storyKey])];
+			record.preparationRequest = undefined;
+		}
+		await this.store.save(record);
+		const running = this.active.has(record.sessionId);
+		const what =
+			option === PREPARATION_RUN
+				? `I'll run the preparation of **${request.storyId}**${running ? " once the current step finishes" : ""}, if its commands and \`${request.branch}\` haven't changed.`
+				: `OK, the preparation of **${request.storyId}** is yours to do, and I won't ask about it again (reply \`rerun preparation\` if you change your mind).`;
+		await reporter.thought(what);
+		if (!running) this.enqueue(record);
 	}
 
 	/** Deliver text into a live agent session working on this issue, if there is one. */
@@ -837,6 +885,8 @@ export class SessionManager {
 		this.busyIssues.set(record.issueId, record.sessionId);
 		const pending = () => lanesOf(record).flatMap((l) => l.pendingRequests ?? []);
 		const pendingAtStart = new Set(pending());
+		const approvedAtStart = record.preparationRequest?.approvedAt;
+		const rerunAtStart = record.preparationRerun;
 		const done = (async () => {
 			try {
 				await this.store.save(record);
@@ -871,7 +921,10 @@ export class SessionManager {
 				for (const [path, owner] of this.busyWorktrees) if (owner === record.sessionId) this.busyWorktrees.delete(path);
 				// Requests that arrived after this run's request step ("I'll handle this as soon as the current
 				// step finishes") get a run of their own instead of waiting for the next message.
-				const arrived = pending().some((r) => !pendingAtStart.has(r));
+				// So do preparation answers given during the run that it didn't get to.
+				const approved = record.preparationRequest?.approvedAt;
+				const arrived =
+					pending().some((r) => !pendingAtStart.has(r)) || (!!approved && approved !== approvedAtStart) || (!!record.preparationRerun && !rerunAtStart);
 				if (arrived && !abort.signal.aborted && record.status !== "failed" && record.status !== "stopped") this.enqueue(record);
 				this.pump();
 			}

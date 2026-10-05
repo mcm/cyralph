@@ -49,7 +49,7 @@ import {
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
-import { PREPARATION_OPTIONS, eligiblePreparations, preparationHash, preparationQuestion } from "./preparation.js";
+import { PREPARATION_OPTIONS, eligiblePreparations, fenced, preparationHash, preparationQuestion } from "./preparation.js";
 import { describeRouting, routeIssue, routeStory, selectionValue } from "./routing.js";
 import { ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStatus, hasPendingRequests, lanesOf, moveToRepository } from "./store.js";
 
@@ -1334,7 +1334,9 @@ export class EpicEngine {
 			return "stopped";
 		}
 
-		// A manual story whose preparation can run now is asked about instead of parking or finishing.
+		// Preparation someone said "Run it" to runs first; then a manual story whose preparation can run now
+		// is asked about instead of parking or finishing.
+		const prepared = await this.runApprovedPreparation(ctx, epic);
 		const prepare = await this.nextPreparation(ctx, epic);
 		const scoped = epic.stories.filter(inScope);
 		const cost = record.totalCostUsd > 0 ? ` (≈$${record.totalCostUsd.toFixed(2)} of agent usage)` : "";
@@ -1372,7 +1374,7 @@ export class EpicEngine {
 			const outcome = this.withPullRequestLinks(record, requestOutput ?? `Finished ${what} on \`${record.branch}\`${cost}.${deferred}`);
 			if (prepare) {
 				await reporter.thought(outcome);
-				return this.askPreparation(ctx, epic, prepare);
+				return this.askPreparation(ctx, epic, prepare, prepared);
 			}
 			await reporter.response(outcome);
 			return "completed";
@@ -1430,12 +1432,12 @@ export class EpicEngine {
 				// Still parked on the manual steps: marking one done wakes the session as usual.
 				await ctx.reporter.plan(planFor(epic));
 				const names = record.waitingOn.map((b) => `**${b.identifier}**`).join(", ");
-				return this.askPreparation(ctx, epic, prepare, `${lead} on ${names}.`);
+				return this.askPreparation(ctx, epic, prepare, [prepared, `${lead} on ${names}.`].filter(Boolean).join("\n\n"));
 			}
 			return this.park(ctx, epic, record.waitingOn, lead);
 		}
 
-		const lines: string[] = [];
+		const lines: string[] = prepared ? [prepared] : [];
 		if (hitCap) lines.push(`I reached the per-run iteration cap (${config.ralph.maxIterationsPerRun}).`);
 		for (const s of stuck) {
 			const problem = tail(record.lastFeedback[s.key] ?? "unknown", 1500);
@@ -1471,12 +1473,76 @@ export class EpicEngine {
 	}
 
 	/**
+	 * Run the preparation someone said "Run it" to, if the story's commands (as read from Linear in this run)
+	 * and the worktree `HEAD` are still the ones shown. Commands run one at a time in the epic worktree and
+	 * stop at the first non-zero exit. On success the story counts as prepared at that `HEAD` and isn't asked
+	 * about again. Returns a note to lead the question asked again with (changed values, or a failure).
+	 */
+	private async runApprovedPreparation(ctx: EngineRun, epic: Epic): Promise<string | undefined> {
+		const { git, shell } = this.deps;
+		const { record, reporter } = ctx;
+		const request = record.preparationRequest;
+		if (!request?.approvedAt) return undefined;
+		const story = eligiblePreparations(epic, record).find((s) => s.key === request.storyKey);
+		// Not runnable anymore (done, blocked again): `nextPreparation` drops the question.
+		if (!story) return undefined;
+		// An approval runs at most once: a failure is asked about again, never retried on its own.
+		request.approvedAt = undefined;
+		await ctx.persist();
+		const repo = this.repoById(record.repoId);
+		if (!repo) return undefined;
+		const ws = await this.workspaceFor(ctx, epic, repo);
+		if (!("worktree" in ws)) return `I couldn't get the epic worktree ready, so I didn't run the preparation of **${story.storyId}**.`;
+		const commands = story.preparation ?? [];
+		const head = await git.headSha(ws.worktree);
+		const changed = [
+			preparationHash(commands) !== request.commandsHash ? "its commands" : "",
+			head !== request.headSha ? `\`${ws.lane.branch ?? epic.branchName}\` (now at \`${head.slice(0, 7)}\`)` : "",
+		].filter(Boolean);
+		if (changed.length > 0) {
+			return `${changed.join(" and ")} changed since I asked about the preparation of **${story.storyId}**, so I ran nothing. Here it is again as it is now.`;
+		}
+		for (const [i, command] of commands.entries()) {
+			await reporter.action("Prepare", command);
+			const r = await shell(command, ws.worktree);
+			const output = tail(`${r.stdout}\n${r.stderr}`.trim(), 4000);
+			const block = output ? `\n\n${fenced(output)}` : "";
+			if (r.code !== 0) {
+				await reporter.thought(`Preparation of **${story.storyId}** failed at \`${command}\` (exit ${r.code}).${block}`);
+				const skipped = commands.length - i - 1;
+				return `\`${command}\` failed with exit ${r.code}, so I stopped there${skipped ? ` and didn't run the ${skipped} command${skipped === 1 ? "" : "s"} after it` : ""}. Nothing is retried on its own.`;
+			}
+			await reporter.thought(`\`${command}\` (exit 0)${block}`);
+		}
+		record.preparationRequest = undefined;
+		record.preparationHandled = [...new Set([...(record.preparationHandled ?? []), story.key])];
+		record.preparedShas = { ...record.preparedShas, [story.key]: head };
+		await ctx.persist();
+		await reporter.thought(
+			`Ran the preparation of **${story.storyId}** at \`${head.slice(0, 7)}\`. The rest of ${story.storyId} is up to a person, who marks it done.`,
+		);
+		return undefined;
+	}
+
+	/**
 	 * The manual story whose preparation to ask about next, in story order, keeping the one already asked
 	 * about while it can still run. A question whose story can't run anymore (done, blocked again) is
 	 * dropped. With `allowPreparation: false` every such story is left to a person and nothing is asked.
+	 * After `rerun preparation`, the earliest open one is asked about again even if it ran or was declined.
 	 */
 	private async nextPreparation(ctx: EngineRun, epic: Epic): Promise<Story | undefined> {
 		const { record, reporter } = ctx;
+		if (record.preparationRerun) {
+			record.preparationRerun = undefined;
+			const again = eligiblePreparations(epic, { preparationHandled: [] })[0];
+			if (again) {
+				record.preparationHandled = (record.preparationHandled ?? []).filter((k) => k !== again.key);
+				if (record.preparationRequest?.storyKey !== again.key) record.preparationRequest = undefined;
+			} else {
+				await reporter.thought("No open manual story with preparation commands can run now, so there's nothing to ask about again.");
+			}
+			await ctx.persist();
+		}
 		const eligible = eligiblePreparations(epic, record);
 		const pending = record.preparationRequest;
 		if (pending && !eligible.some((s) => s.key === pending.storyKey)) {
