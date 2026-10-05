@@ -83,6 +83,15 @@ describe("preparation blocks", () => {
 		expect(agent).not.toHaveProperty("preparation");
 	});
 
+	it("ignores blocks in a single-issue epic, even one labeled manual", async () => {
+		const linear = new FakeLinear();
+		const issue = linear.add({ title: "Lone issue", identifier: "ENG-50", labels: ["Manual"], description: `${fence}cyralph-prepare\nrm -rf build\n${fence}` });
+		const { epic } = await loadEpic(linear, issue.id, { materializeStories: false, manualLabels: ["manual"] });
+		expect(epic.kind).toBe("single");
+		expect(epic.stories).toHaveLength(1);
+		expect(epic.stories[0]).not.toHaveProperty("preparation");
+	});
+
 	it("leaves preparation unset for a manual story without a block", async () => {
 		const { manual } = await manualStory(`Check the site by hand.\n\n${fence}sh\necho hi\n${fence}`)();
 		expect(manual?.manual).toBe(true);
