@@ -736,6 +736,13 @@ export class EpicEngine {
 			}
 		}
 
+		let sha: string | undefined;
+		if (!feedback && config.ralph.commitPerStory) {
+			const committed = await this.commitStory(epic, story, worktree);
+			if (committed.feedback) feedback = committed.feedback;
+			else sha = committed.sha;
+		}
+
 		if (feedback) {
 			record.lastFeedback[story.key] = feedback;
 			if (blocked) {
@@ -759,7 +766,39 @@ export class EpicEngine {
 			return;
 		}
 
-		await this.completeStory({ ctx, epic, story, ws, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
+		await this.completeStory({ ctx, epic, story, ws, sha, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
+	}
+
+	/**
+	 * Commit a verified story, then make sure the worktree is clean. A commit that fails (say a git hook
+	 * rejects it) or files left over afterwards (changed by a hook, inside a nested repository, or simply
+	 * uncommittable) mean the story isn't done: it gets feedback like a failed verification instead, so
+	 * nothing is marked Done while work sits uncommitted in the worktree.
+	 */
+	private async commitStory(epic: Epic, story: Story, worktree: string): Promise<{ sha?: string; feedback?: string }> {
+		const { git } = this.deps;
+		const ref = story.identifier && story.identifier !== story.storyId ? ` [${story.identifier}]` : "";
+		const subject = epic.kind === "single" ? `${epic.identifier}: ${story.title}` : `feat(${story.storyId}): ${story.title}${ref}`;
+		let sha: string | undefined;
+		try {
+			sha = await git.commitAll(worktree, `${subject}\n\nEpic: ${epic.identifier} ${epic.title}`);
+		} catch (e) {
+			return {
+				feedback: `The agent signalled completion and verification passed, but committing the work failed:\n\n\`\`\`\n${tail(String(e), MAX_FEEDBACK)}\n\`\`\`\n\nFix what stops the commit (for example a git hook that rejects it). Don't commit yourself: the orchestrator commits once the story completes.`,
+			};
+		}
+		let left: string[];
+		try {
+			left = await git.uncommittedChanges(worktree);
+		} catch (e) {
+			return { sha, feedback: `The story's work was committed, but checking the worktree for uncommitted files failed: ${String(e)}` };
+		}
+		if (left.length === 0) return { sha };
+		const shown = left.slice(0, 50).join("\n") + (left.length > 50 ? `\n… and ${left.length - 50} more` : "");
+		return {
+			sha,
+			feedback: `The agent signalled completion, but after the orchestrator committed the story these files were still uncommitted (\`git status --porcelain\`):\n\n\`\`\`\n${shown}\n\`\`\`\n\nThe worktree must be clean when the story is done. Files that belong to the story must be committable (not inside a nested git repository, not rewritten by a git hook after staging); anything else should be deleted, or added to \`.gitignore\` if it's generated. Don't commit yourself: the orchestrator commits once the story completes.`,
+		};
 	}
 
 	/**
@@ -921,21 +960,11 @@ export class EpicEngine {
 		await reporter.plan(planFor(epic, undefined, new Set(epic.stories.filter((s) => (record.attempts[s.key] ?? 0) >= max).map((s) => s.key))));
 	}
 
-	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; ws: Workspace; summary: string }) {
-		const { ctx, epic, story, ws, summary } = args;
+	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; ws: Workspace; sha?: string; summary: string }) {
+		const { ctx, epic, story, ws, sha, summary } = args;
 		const { worktree, lane } = ws;
 		const { config, linear, git, log } = this.deps;
 		const { record, reporter } = ctx;
-
-		let sha: string | undefined;
-		if (config.ralph.commitPerStory) {
-			const ref = story.identifier && story.identifier !== story.storyId ? ` [${story.identifier}]` : "";
-			const subject = epic.kind === "single" ? `${epic.identifier}: ${story.title}` : `feat(${story.storyId}): ${story.title}${ref}`;
-			sha = await git.commitAll(worktree, `${subject}\n\nEpic: ${epic.identifier} ${epic.title}`).catch(async (e: unknown) => {
-				await reporter.error(`Commit failed: ${String(e)}`);
-				return undefined;
-			});
-		}
 
 		story.status = "completed";
 		delete record.lastFeedback[story.key];
