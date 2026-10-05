@@ -107,6 +107,8 @@ export interface GitWorkspace {
 	commitAll(cwd: string, message: string): Promise<string | undefined>;
 	/** Paths `git status` still reports as changed or untracked (ignored files excluded). */
 	uncommittedChanges(cwd: string): Promise<string[]>;
+	/** Full SHA of the worktree's `HEAD`. */
+	headSha(cwd: string): Promise<string>;
 	/** URL of the `origin` remote, if one is configured. */
 	remoteUrl(cwd: string): Promise<string | undefined>;
 	/** True when `origin` exists and the branch has commits it doesn't have yet. */
@@ -207,6 +209,10 @@ export class CliGitWorkspace implements GitWorkspace {
 		const r = await git(["status", "--porcelain", "--untracked-files=all"], cwd);
 		if (r.code !== 0) throw new Error(`git status failed: ${r.stderr.trim() || r.stdout.trim()}`);
 		return r.stdout.split("\n").filter((l) => l.trim());
+	}
+
+	headSha(cwd: string): Promise<string> {
+		return gitOrThrow(["rev-parse", "HEAD"], cwd);
 	}
 
 	async remoteUrl(cwd: string): Promise<string | undefined> {

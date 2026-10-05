@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { AgentRunner, RunRequest, RunResult } from "../src/agent/runner.js";
 import { type RepositoryConfig, parseConfig } from "../src/config.js";
 import { SessionManager } from "../src/engine/session-manager.js";
+import { preparationHash } from "../src/engine/preparation.js";
 import { SessionStore, newRecord } from "../src/engine/store.js";
 import { CliGitWorkspace, type Forge, runShell } from "../src/git/workspace.js";
 import { PR_DESCRIPTION_HEADING, PR_DESCRIPTION_SCHEMA, STORY_OUTPUT_SCHEMA, type StoryOutcome } from "../src/ralph/prompt.js";
@@ -2187,5 +2188,163 @@ describe("never losing blocked work", () => {
 		expect(left).toContain("cyralph: ENG-1 ENG-2 exhausted");
 		expect(left).toContain("cyralph: ENG-9 ENG-10 blocked");
 		expect(t.store.get("offer-1")?.stashes?.map((e) => e.reason)).toEqual(["incomplete", "exhausted"]);
+	});
+});
+
+describe("preparation of manual stories", () => {
+	const PREP = "echo prepared > prepared.txt\ngit push --force origin HEAD:staging";
+	const COMMANDS = ["echo prepared > prepared.txt", "git push --force origin HEAD:staging"];
+	const withPrep = (text = PREP) => `Do the smoke test.\n\n\`\`\`cyralph-prepare\n${text}\n\`\`\`\n`;
+	const selects = (t: ReturnType<typeof setup>) => t.linear.activities.filter((a) => a.signal === "select");
+	const optionsOf = (a: ReturnType<typeof selects>[number] | undefined) =>
+		(a?.signalMetadata?.options as Array<{ value: string }> | undefined)?.map((o) => o.value);
+	const bodyOf = (a: ReturnType<typeof selects>[number] | undefined) => (a && "body" in a.content ? a.content.body : "");
+	const ids = (t: ReturnType<typeof setup>) => t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+
+	it("asks before parking on an unblocked manual story with preparation, pushes first, and survives a restart", async () => {
+		// Without per-story pushes, origin only gets the branch from the push before asking.
+		const t = setup({ pushPerStory: false });
+		const { epic, s1 } = ralphEpic(t.linear);
+		Object.assign(t.linear.issues.get(s1.id)!, { labels: ["Manual"], description: withPrep() });
+
+		await t.manager.handle({ kind: "created", sessionId: "prep-1", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(ids(t)).toEqual(["ENG-4"]);
+		const record = t.store.get("prep-1");
+		expect(record?.status).toBe("awaiting_input");
+		// Still waiting on the manual step: a person marking it done wakes the session as before.
+		expect(record?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
+		const wt = record?.worktreePath ?? "";
+		const head = sh(wt, "rev-parse", "HEAD").trim();
+		expect(record?.preparationRequest).toMatchObject({
+			storyKey: s1.id,
+			storyId: "ENG-2",
+			repoId: "app",
+			branch: "eng-1-task-priority",
+			headSha: head,
+			commandsHash: preparationHash(COMMANDS),
+		});
+		expect(sh(t.origin, "rev-parse", "refs/heads/eng-1-task-priority").trim()).toBe(head);
+
+		const asks = selects(t);
+		expect(asks).toHaveLength(1);
+		expect(optionsOf(asks[0])).toEqual(["Run it", "I'll do it myself", "Not yet"]);
+		const body = bodyOf(asks[0]);
+		expect(body).toContain("1/3 stories are done; the rest are waiting on **ENG-2**.");
+		expect(body).toContain("**ENG-2: Add priority field**");
+		expect(body).toContain(`\`eng-1-task-priority\` at \`${head.slice(0, 7)}\``);
+		expect(body).toContain(`\`\`\`sh\n${COMMANDS.join("\n")}\n\`\`\``);
+		// Nothing ran, and there's no plain park message besides the question.
+		expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+		expect(t.linear.bodies("elicitation").filter((b) => b.includes("I'll start automatically"))).toEqual([]);
+
+		await t.store.flush();
+		const reloaded = new SessionStore(join(t.root, "sessions.json"));
+		await reloaded.load();
+		expect(reloaded.get("prep-1")?.status).toBe("awaiting_input");
+		expect(reloaded.get("prep-1")?.preparationRequest).toEqual(record?.preparationRequest);
+
+		// The person does the step without answering: the question is dropped and the epic finishes.
+		t.linear.issues.get(s1.id)!.stateType = "completed";
+		await t.manager.handle({ kind: "issue_state", issueId: s1.id, identifier: "ENG-2", stateType: "completed", removed: false });
+		await t.manager.idle();
+		expect(ids(t)).toEqual(["ENG-4", "ENG-3"]);
+		expect(t.store.get("prep-1")?.status).toBe("completed");
+		expect(t.store.get("prep-1")?.preparationRequest).toBeUndefined();
+		expect(selects(t)).toHaveLength(1);
+	});
+
+	it("asks instead of finishing when the run's stories are done and a manual story is unblocked", async () => {
+		const t = setup();
+		const { epic, s3 } = ralphEpic(t.linear);
+		const manual = t.linear.add({ title: "Smoke test on staging", identifier: "ENG-5", parentId: epic.id, subIssueSortOrder: 3, labels: ["Manual"], description: withPrep() });
+		t.linear.blocks.set(manual.id, [s3.id]);
+
+		// Delegating ENG-4 works only ENG-4; that unblocks the manual ENG-5.
+		await t.manager.handle({ kind: "created", sessionId: "prep-2", issueId: s3.id });
+		await t.manager.idle();
+
+		expect(ids(t)).toEqual(["ENG-4"]);
+		const record = t.store.get("prep-2");
+		expect(record?.status).toBe("awaiting_input");
+		expect(record?.preparationRequest?.storyKey).toBe(manual.id);
+		expect(t.linear.bodies("thought").some((b) => b.startsWith("Finished **ENG-4**"))).toBe(true);
+		expect(t.linear.bodies("response")).toEqual([]);
+		const asks = selects(t);
+		expect(asks).toHaveLength(1);
+		expect(bodyOf(asks[0])).toContain("**ENG-5: Smoke test on staging**");
+		expect(bodyOf(asks[0])).toContain(`at \`${record?.preparationRequest?.headSha.slice(0, 7)}\``);
+		expect(existsSync(join(record?.worktreePath ?? "", "prepared.txt"))).toBe(false);
+	});
+
+	it("asks about one manual story at a time, in story order", async () => {
+		const t = setup();
+		const { epic, s2, s3 } = ralphEpic(t.linear);
+		// ENG-3 and ENG-4 are manual with preparation; ENG-3 comes first. ENG-2 runs.
+		t.linear.blocks.delete(s2.id);
+		Object.assign(t.linear.issues.get(s3.id)!, { labels: ["Manual"], description: withPrep("echo four") });
+		Object.assign(t.linear.issues.get(s2.id)!, { labels: ["Manual"], description: withPrep("echo three") });
+
+		await t.manager.handle({ kind: "created", sessionId: "prep-3", issueId: epic.id });
+		await t.manager.idle();
+		expect(ids(t)).toEqual(["ENG-2"]);
+		expect(t.store.get("prep-3")?.preparationRequest?.storyKey).toBe(s2.id);
+		expect(selects(t)).toHaveLength(1);
+		expect(bodyOf(selects(t)[0])).toContain("echo three");
+		expect(bodyOf(selects(t)[0])).not.toContain("echo four");
+
+		// A reply that isn't an answer asks about the same story again.
+		await t.manager.handle({ kind: "prompted", sessionId: "prep-3", issueId: epic.id, body: "what's this?" });
+		await t.manager.idle();
+		expect(t.store.get("prep-3")?.preparationRequest?.storyKey).toBe(s2.id);
+		expect(bodyOf(selects(t)[1])).toContain("**ENG-3: Show badge**");
+
+		// Once ENG-3's preparation is answered, ENG-4 is next.
+		const record = t.store.get("prep-3");
+		if (record) record.preparationHandled = [s2.id];
+		await t.manager.handle({ kind: "prompted", sessionId: "prep-3", issueId: epic.id, body: "continue" });
+		await t.manager.idle();
+		expect(t.store.get("prep-3")?.preparationRequest?.storyKey).toBe(s3.id);
+		expect(bodyOf(selects(t)[2])).toContain("**ENG-4: Sort by priority**");
+		expect(bodyOf(selects(t)[2])).toContain("echo four");
+	});
+
+	it.each([
+		["globally", { allowPreparation: false }, {}],
+		["for the repository", {}, { allowPreparation: false }],
+	])("doesn't ask when preparation is disabled %s, and leaves the step to a person", async (_how, ralph, repo) => {
+		const t = setup(ralph, {}, { repo });
+		const { epic, s1 } = ralphEpic(t.linear);
+		Object.assign(t.linear.issues.get(s1.id)!, { labels: ["Manual"], description: withPrep() });
+
+		await t.manager.handle({ kind: "created", sessionId: "prep-4", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(selects(t)).toEqual([]);
+		const record = t.store.get("prep-4");
+		expect(record?.status).toBe("blocked");
+		expect(record?.preparationRequest).toBeUndefined();
+		expect(record?.preparationHandled).toEqual([s1.id]);
+		expect(t.linear.bodies("thought")).toContain(
+			"Preparation is disabled (`allowPreparation: false`), so I won't offer to run the preparation commands of **ENG-2**: they're yours to do, with the rest of the step.",
+		);
+		expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**");
+		expect(existsSync(join(record?.worktreePath ?? "", "prepared.txt"))).toBe(false);
+	});
+
+	it("doesn't ask about a manual story without a cyralph-prepare block, or one still blocked", async () => {
+		const t = setup();
+		const { epic, s1, s2 } = ralphEpic(t.linear);
+		t.linear.issues.get(s1.id)!.labels = ["Manual"];
+		// ENG-3 has preparation but waits on the manual ENG-2.
+		Object.assign(t.linear.issues.get(s2.id)!, { labels: ["Manual"], description: withPrep() });
+
+		await t.manager.handle({ kind: "created", sessionId: "prep-5", issueId: epic.id });
+		await t.manager.idle();
+
+		expect(selects(t)).toEqual([]);
+		expect(t.store.get("prep-5")?.status).toBe("blocked");
+		expect(t.store.get("prep-5")?.preparationRequest).toBeUndefined();
 	});
 });

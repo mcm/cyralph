@@ -14,7 +14,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ActivityReporter } from "../agent/activity.js";
 import { type AgentRunner, requestSystemAppend } from "../agent/runner.js";
-import type { Config, RepositoryConfig } from "../config.js";
+import { type Config, type RepositoryConfig, allowPreparationFor } from "../config.js";
 import type { CiClient } from "../git/ci.js";
 import type { CommandResult, Forge, GitWorkspace } from "../git/workspace.js";
 import type { GitHubReviewClient } from "../github/reviews.js";
@@ -49,6 +49,7 @@ import {
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
 import { type Epic, type Story, dependencyLabel, externalIdOf } from "../ralph/types.js";
+import { PREPARATION_OPTIONS, eligiblePreparations, preparationHash, preparationQuestion } from "./preparation.js";
 import { describeRouting, routeIssue, routeStory, selectionValue } from "./routing.js";
 import { ROUTED_BY_SELECTION, type RepoLane, type SessionRecord, type SessionStatus, hasPendingRequests, lanesOf, moveToRepository } from "./store.js";
 
@@ -1333,6 +1334,8 @@ export class EpicEngine {
 			return "stopped";
 		}
 
+		// A manual story whose preparation can run now is asked about instead of parking or finishing.
+		const prepare = await this.nextPreparation(ctx, epic);
 		const scoped = epic.stories.filter(inScope);
 		const cost = record.totalCostUsd > 0 ? ` (≈$${record.totalCostUsd.toFixed(2)} of agent usage)` : "";
 		if (isEpicComplete(scoped)) {
@@ -1362,15 +1365,16 @@ export class EpicEngine {
 				);
 				return "awaiting_input";
 			}
-			if (requestOutput) {
-				await reporter.response(this.withPullRequestLinks(record, requestOutput));
-				return "completed";
-			}
 			const deferred =
 				!lanesOf(record).some((l) => l.prUrl) && !all && config.ralph.createPullRequest && !config.ralph.openPullRequestEarly
 					? " The pull/merge request will be opened once every story of the epic is complete."
 					: "";
-			await reporter.response(this.withPullRequestLinks(record, `Finished ${what} on \`${record.branch}\`${cost}.${deferred}`));
+			const outcome = this.withPullRequestLinks(record, requestOutput ?? `Finished ${what} on \`${record.branch}\`${cost}.${deferred}`);
+			if (prepare) {
+				await reporter.thought(outcome);
+				return this.askPreparation(ctx, epic, prepare);
+			}
+			await reporter.response(outcome);
 			return "completed";
 		}
 
@@ -1421,7 +1425,14 @@ export class EpicEngine {
 		const stuck = scoped.filter((s) => exhausted.has(s.key));
 		if (!hitCap && stuck.length === 0 && record.waitingOn.length > 0) {
 			const done = scoped.filter(isStoryDone).length;
-			return this.park(ctx, epic, record.waitingOn, `${done}/${scoped.length} stories are done; the rest are waiting`);
+			const lead = `${done}/${scoped.length} stories are done; the rest are waiting`;
+			if (prepare) {
+				// Still parked on the manual steps: marking one done wakes the session as usual.
+				await ctx.reporter.plan(planFor(epic));
+				const names = record.waitingOn.map((b) => `**${b.identifier}**`).join(", ");
+				return this.askPreparation(ctx, epic, prepare, `${lead} on ${names}.`);
+			}
+			return this.park(ctx, epic, record.waitingOn, lead);
 		}
 
 		const lines: string[] = [];
@@ -1456,6 +1467,67 @@ export class EpicEngine {
 				.filter(Boolean)
 				.join("\n\n"),
 		);
+		return "awaiting_input";
+	}
+
+	/**
+	 * The manual story whose preparation to ask about next, in story order, keeping the one already asked
+	 * about while it can still run. A question whose story can't run anymore (done, blocked again) is
+	 * dropped. With `allowPreparation: false` every such story is left to a person and nothing is asked.
+	 */
+	private async nextPreparation(ctx: EngineRun, epic: Epic): Promise<Story | undefined> {
+		const { record, reporter } = ctx;
+		const eligible = eligiblePreparations(epic, record);
+		const pending = record.preparationRequest;
+		if (pending && !eligible.some((s) => s.key === pending.storyKey)) {
+			record.preparationRequest = undefined;
+			await ctx.persist();
+		}
+		const repo = this.repoById(record.repoId);
+		if (!repo || eligible.length === 0) return undefined;
+		if (!allowPreparationFor(this.deps.config, repo)) {
+			record.preparationHandled = [...(record.preparationHandled ?? []), ...eligible.map((s) => s.key)];
+			record.preparationRequest = undefined;
+			await ctx.persist();
+			for (const s of eligible) {
+				await reporter.thought(
+					`Preparation is disabled (\`allowPreparation: false\`), so I won't offer to run the preparation commands of **${s.storyId}**: they're yours to do, with the rest of the step.`,
+				);
+			}
+			return undefined;
+		}
+		return eligible.find((s) => s.key === record.preparationRequest?.storyKey) ?? eligible[0];
+	}
+
+	/**
+	 * Ask in the session whether to run a manual story's preparation commands, bound to the commands and
+	 * the worktree `HEAD` shown. The epic branch is pushed first, so `origin` has the commit shown.
+	 */
+	private async askPreparation(ctx: EngineRun, epic: Epic, story: Story, lead?: string): Promise<SessionStatus> {
+		const { git } = this.deps;
+		const { record, reporter } = ctx;
+		const repo = this.repoById(record.repoId);
+		if (!repo) return "awaiting_input";
+		const ws = await this.workspaceFor(ctx, epic, repo);
+		if (!("worktree" in ws)) return ws.status;
+		const branch = ws.lane.branch ?? epic.branchName;
+		try {
+			if (await git.needsPush(ws.worktree, ws.repo.baseBranch)) await git.push(ws.worktree, branch);
+		} catch (err) {
+			await reporter.error(`Push failed before asking about the preparation of ${story.storyId}: ${String(err)}`);
+		}
+		const commands = story.preparation ?? [];
+		record.preparationRequest = {
+			storyKey: story.key,
+			storyId: story.storyId,
+			repoId: repo.id,
+			branch,
+			headSha: await git.headSha(ws.worktree),
+			commandsHash: preparationHash(commands),
+			askedAt: new Date().toISOString(),
+		};
+		await ctx.persist();
+		await reporter.select(preparationQuestion(story, record.preparationRequest, commands, lead), PREPARATION_OPTIONS);
 		return "awaiting_input";
 	}
 
