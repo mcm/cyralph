@@ -2547,6 +2547,38 @@ describe("preparation of manual stories", () => {
 			expect(readFileSync(join(wt, "again.txt"), "utf8")).toBe("again\nagain\n");
 		});
 
+		it("rerun preparation: asks about the earliest open manual story with preparation", async () => {
+			const t = setup();
+			const { epic, s1, s2, s3 } = ralphEpic(t.linear);
+			// ENG-3 and ENG-4 are manual with preparation; ENG-2 runs.
+			t.linear.blocks.delete(s2.id);
+			Object.assign(t.linear.issues.get(s3.id)!, { labels: ["Manual"], description: withPrep("echo four") });
+			Object.assign(t.linear.issues.get(s2.id)!, { labels: ["Manual"], description: withPrep("echo three") });
+			await t.manager.handle({ kind: "created", sessionId: "rerun-2", issueId: epic.id });
+			await t.manager.idle();
+			const reply = async (body: string) => {
+				await t.manager.handle({ kind: "prompted", sessionId: "rerun-2", issueId: epic.id, body });
+				await t.manager.idle();
+				return t.store.get("rerun-2");
+			};
+			expect(t.store.get("rerun-2")?.preparationRequest?.storyKey).toBe(s2.id);
+
+			// Both declined: nothing left to ask about.
+			await reply("I'll do it myself");
+			let record = await reply("I'll do it myself");
+			expect(record?.preparationHandled).toEqual([s2.id, s3.id]);
+			expect(record?.preparationRequest).toBeUndefined();
+			expect(selects(t)).toHaveLength(2);
+
+			record = await reply("rerun preparation");
+			expect(record?.preparationRequest?.storyKey).toBe(s2.id);
+			expect(record?.preparationHandled).toEqual([s3.id]);
+			expect(bodyOf(selects(t)[2])).toContain("**ENG-3: Show badge**");
+			expect(t.linear.issues.get(s1.id)?.stateType).toBe("completed");
+			expect(t.linear.issues.get(s2.id)?.stateType).toBe("unstarted");
+			expect(t.linear.issues.get(s3.id)?.stateType).toBe("unstarted");
+		});
+
 		it("handles any other reply as today and keeps the question pending", async () => {
 			const { t, s1, wt, reply } = await asked();
 			const record = await reply("please use the staging config");
