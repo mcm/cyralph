@@ -2347,4 +2347,187 @@ describe("preparation of manual stories", () => {
 		expect(t.store.get("prep-5")?.status).toBe("blocked");
 		expect(t.store.get("prep-5")?.preparationRequest).toBeUndefined();
 	});
+
+	describe("answers", () => {
+		/** ENG-2 is manual with preparation; the epic asks about it and parks on it. */
+		async function asked(prep = PREP, sessionId = "ans") {
+			const t = setup();
+			const { epic, s1 } = ralphEpic(t.linear);
+			Object.assign(t.linear.issues.get(s1.id)!, { labels: ["Manual"], description: withPrep(prep) });
+			await t.manager.handle({ kind: "created", sessionId, issueId: epic.id });
+			await t.manager.idle();
+			expect(selects(t)).toHaveLength(1);
+			const wt = t.store.get(sessionId)?.worktreePath ?? "";
+			const reply = async (body: string) => {
+				await t.manager.handle({ kind: "prompted", sessionId, issueId: epic.id, body });
+				await t.manager.idle();
+				return t.store.get(sessionId);
+			};
+			return { t, epic, s1, wt, reply };
+		}
+		const preparedThoughts = (t: ReturnType<typeof setup>) => t.linear.bodies("thought").filter((b) => b.startsWith("Ran the preparation of"));
+
+		it("Run it: runs the commands in order in the epic worktree, posts their output, records the SHA and parks as before", async () => {
+			const { t, s1, wt, reply } = await asked();
+			const head = sh(wt, "rev-parse", "HEAD").trim();
+			const record = await reply("Run it");
+
+			expect(readFileSync(join(wt, "prepared.txt"), "utf8")).toBe("prepared\n");
+			expect(sh(t.origin, "rev-parse", "refs/heads/staging").trim()).toBe(head);
+			const thoughts = t.linear.bodies("thought");
+			expect(thoughts).toContain("`echo prepared > prepared.txt` (exit 0)");
+			expect(thoughts.some((b) => b.startsWith("`git push --force origin HEAD:staging` (exit 0)\n\n```\n") && b.includes("staging"))).toBe(true);
+			expect(preparedThoughts(t)).toEqual([
+				`Ran the preparation of **ENG-2** at \`${head.slice(0, 7)}\`. The rest of ENG-2 is up to a person, who marks it done.`,
+			]);
+			expect(record?.preparedShas).toEqual({ [s1.id]: head });
+			expect(record?.preparationHandled).toEqual([s1.id]);
+			expect(record?.preparationRequest).toBeUndefined();
+			// Parked on the manual step as today, not asked again; the step's Linear state is the person's.
+			expect(record?.status).toBe("blocked");
+			expect(record?.waitingOn).toEqual([{ id: s1.id, identifier: "ENG-2" }]);
+			expect(t.linear.bodies("elicitation").at(-1)).toContain("1/3 stories are done; the rest are waiting on **ENG-2**. I'll start automatically");
+			expect(selects(t)).toHaveLength(1);
+			expect(t.linear.issues.get(s1.id)?.stateType).toBe("unstarted");
+		});
+
+		it("Run it after HEAD moved: runs nothing and asks again with the new SHA", async () => {
+			const { t, wt, reply } = await asked();
+			sh(wt, "commit", "--allow-empty", "-m", "moved");
+			const moved = sh(wt, "rev-parse", "HEAD").trim();
+			const record = await reply("Run it");
+
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+			expect(preparedThoughts(t)).toEqual([]);
+			expect(record?.preparationRequest).toMatchObject({ headSha: moved, commandsHash: preparationHash(COMMANDS) });
+			expect(record?.preparationRequest?.approvedAt).toBeUndefined();
+			const again = selects(t);
+			expect(again).toHaveLength(2);
+			expect(optionsOf(again[1])).toEqual(["Run it", "I'll do it myself", "Not yet"]);
+			expect(bodyOf(again[1])).toContain(`\`eng-1-task-priority\` (now at \`${moved.slice(0, 7)}\`) changed since I asked about the preparation of **ENG-2**, so I ran nothing.`);
+			expect(bodyOf(again[1])).toContain(`at \`${moved.slice(0, 7)}\``);
+			// The branch was pushed again before asking.
+			expect(sh(t.origin, "rev-parse", "refs/heads/eng-1-task-priority").trim()).toBe(moved);
+
+			// Approving what is shown now runs it.
+			await reply("Run it");
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(true);
+			expect(preparedThoughts(t)).toHaveLength(1);
+		});
+
+		it("Run it after the commands were edited: runs nothing and asks again with the new commands", async () => {
+			const { t, s1, wt, reply } = await asked();
+			t.linear.issues.get(s1.id)!.description = withPrep("echo edited > edited.txt");
+			const record = await reply("Run it");
+
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+			expect(existsSync(join(wt, "edited.txt"))).toBe(false);
+			expect(record?.preparationRequest?.commandsHash).toBe(preparationHash(["echo edited > edited.txt"]));
+			const again = selects(t);
+			expect(again).toHaveLength(2);
+			expect(bodyOf(again[1])).toContain("its commands changed since I asked about the preparation of **ENG-2**, so I ran nothing.");
+			expect(bodyOf(again[1])).toContain("```sh\necho edited > edited.txt\n```");
+		});
+
+		it("stops at the first failing command, posts it, and asks again without retrying", async () => {
+			// one.txt sits next to the worktree: a reply's direct request stashes untracked files in it.
+			const { t, s1, wt, reply } = await asked("echo one >> ../one.txt\nsh -c 'echo boom >&2; exit 3'\necho never > never.txt");
+			const one = join(wt, "..", "one.txt");
+			const record = await reply("Run it");
+
+			expect(readFileSync(one, "utf8")).toBe("one\n");
+			expect(existsSync(join(wt, "never.txt"))).toBe(false);
+			expect(t.linear.bodies("thought")).toContain("Preparation of **ENG-2** failed at `sh -c 'echo boom >&2; exit 3'` (exit 3).\n\n```\nboom\n```");
+			const again = selects(t);
+			expect(again).toHaveLength(2);
+			expect(optionsOf(again[1])).toEqual(["Run it", "I'll do it myself", "Not yet"]);
+			expect(bodyOf(again[1])).toContain(
+				"`sh -c 'echo boom >&2; exit 3'` failed with exit 3, so I stopped there and didn't run the 1 command after it. Nothing is retried on its own.",
+			);
+			expect(record?.preparationRequest?.storyKey).toBe(s1.id);
+			expect(record?.preparationRequest?.approvedAt).toBeUndefined();
+			expect(record?.preparationHandled ?? []).toEqual([]);
+			expect(record?.preparedShas).toBeUndefined();
+			expect(record?.status).toBe("awaiting_input");
+
+			// Waking up again (another reply) doesn't run anything by itself.
+			await reply("thanks");
+			expect(readFileSync(one, "utf8")).toBe("one\n");
+			// Answering "Run it" again does.
+			await reply("Run it");
+			expect(readFileSync(one, "utf8")).toBe("one\none\n");
+		});
+
+		it("I'll do it myself: records the decline, runs nothing, never asks again and parks as before", async () => {
+			const { t, s1, wt, reply } = await asked();
+			// Typed with a curly apostrophe.
+			const record = await reply("I’ll do it myself");
+
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+			expect(record?.preparationHandled).toEqual([s1.id]);
+			expect(record?.preparationRequest).toBeUndefined();
+			expect(record?.preparedShas).toBeUndefined();
+			expect(record?.status).toBe("blocked");
+			expect(t.linear.bodies("elicitation").at(-1)).toContain("the rest are waiting on **ENG-2**. I'll start automatically");
+			await reply("any news?");
+			expect(selects(t)).toHaveLength(1);
+			expect(t.linear.issues.get(s1.id)?.stateType).toBe("unstarted");
+		});
+
+		it("Not yet: runs nothing and leaves the question open", async () => {
+			const { t, wt, reply } = await asked();
+			const before = t.store.get("ans");
+			const pending = structuredClone(before?.preparationRequest);
+			const calls = t.runner.calls.length;
+			const record = await reply("Not yet");
+
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+			expect(record?.preparationRequest).toEqual(pending);
+			expect(record?.status).toBe("awaiting_input");
+			expect(t.runner.calls).toHaveLength(calls);
+			expect(selects(t)).toHaveLength(1);
+			expect(t.linear.bodies("response").at(-1)).toBe("OK, I won't run anything for **ENG-2** yet. The question stays open: answer it whenever you're ready.");
+
+			// It can still be answered later.
+			await reply("Run it");
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(true);
+		});
+
+		it("rerun preparation: asks again about a story whose preparation already ran or was declined", async () => {
+			const { t, s1, wt, reply } = await asked("echo again >> again.txt");
+			await reply("Run it");
+			expect(readFileSync(join(wt, "again.txt"), "utf8")).toBe("again\n");
+			expect(selects(t)).toHaveLength(1);
+
+			let record = await reply("rerun preparation");
+			expect(selects(t)).toHaveLength(2);
+			expect(bodyOf(selects(t)[1])).toContain("**ENG-2: Add priority field**");
+			expect(record?.preparationRequest?.storyKey).toBe(s1.id);
+			expect(record?.preparationHandled).toEqual([]);
+			expect(record?.guidance).toEqual([]);
+			await reply("Run it");
+			expect(readFileSync(join(wt, "again.txt"), "utf8")).toBe("again\nagain\n");
+
+			await reply("rerun preparation");
+			record = await reply("I'll do it myself");
+			expect(record?.preparationHandled).toEqual([s1.id]);
+			await reply("Rerun preparation.");
+			expect(selects(t)).toHaveLength(4);
+			expect(readFileSync(join(wt, "again.txt"), "utf8")).toBe("again\nagain\n");
+		});
+
+		it("handles any other reply as today and keeps the question pending", async () => {
+			const { t, s1, wt, reply } = await asked();
+			const record = await reply("please use the staging config");
+
+			expect(existsSync(join(wt, "prepared.txt"))).toBe(false);
+			expect(record?.guidance).toEqual(["please use the staging config"]);
+			expect(t.linear.bodies("thought")).toContain("On it.");
+			expect(record?.preparationRequest?.storyKey).toBe(s1.id);
+			expect(record?.preparationRequest?.approvedAt).toBeUndefined();
+			expect(selects(t)).toHaveLength(2);
+			expect(bodyOf(selects(t)[1])).toContain("**ENG-2: Add priority field**");
+			expect(record?.status).toBe("awaiting_input");
+		});
+	});
 });

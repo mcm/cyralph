@@ -63,6 +63,8 @@ export interface PreparationRequest {
 	/** `preparationHash` of the commands shown. */
 	commandsHash: string;
 	askedAt: string;
+	/** Set when someone answered "Run it": the next run runs the commands if they and `HEAD` are unchanged. */
+	approvedAt?: string;
 }
 
 /**
@@ -138,6 +140,10 @@ export interface SessionRecord extends RepoLane {
 	preparationRequest?: PreparationRequest;
 	/** Manual stories whose preparation was answered (run, or left to a person): never asked about again. */
 	preparationHandled?: string[];
+	/** Story key -> the worktree `HEAD` SHA its preparation last ran successfully at. */
+	preparedShas?: Record<string, string>;
+	/** Someone replied `rerun preparation`: the next run asks again about the earliest open manual story with preparation. */
+	preparationRerun?: boolean;
 	/** Questions about a merged epic's leftovers (stashes, unmerged commits) still waiting for an answer. */
 	cleanupRequests?: CleanupRequest[];
 	totalCostUsd: number;
