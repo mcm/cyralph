@@ -84,6 +84,8 @@ export interface GitWorkspace {
 	prepare(opts: { repositoryPath: string; workspaceBaseDir: string; branch: string; baseBranch: string }): Promise<PreparedWorkspace>;
 	/** Stage everything and commit; returns the commit sha, or undefined when there was nothing to commit. */
 	commitAll(cwd: string, message: string): Promise<string | undefined>;
+	/** Paths `git status` still reports as changed or untracked (ignored files excluded). */
+	uncommittedChanges(cwd: string): Promise<string[]>;
 	/** URL of the `origin` remote, if one is configured. */
 	remoteUrl(cwd: string): Promise<string | undefined>;
 	/** True when `origin` exists and the branch has commits it doesn't have yet. */
@@ -164,6 +166,12 @@ export class CliGitWorkspace implements GitWorkspace {
 		if ((await git(["diff", "--cached", "--quiet"], cwd)).code === 0) return undefined;
 		await gitOrThrow(["commit", "-m", message], cwd);
 		return gitOrThrow(["rev-parse", "HEAD"], cwd);
+	}
+
+	async uncommittedChanges(cwd: string): Promise<string[]> {
+		const r = await git(["status", "--porcelain", "--untracked-files=all"], cwd);
+		if (r.code !== 0) throw new Error(`git status failed: ${r.stderr.trim() || r.stdout.trim()}`);
+		return r.stdout.split("\n").filter((l) => l.trim());
 	}
 
 	async remoteUrl(cwd: string): Promise<string | undefined> {

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -291,6 +291,68 @@ describe("epic engine (end to end with fakes + real git)", () => {
 		expect(resumed.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1])).toEqual(["ENG-2", "ENG-3"]);
 		expect(resumed[0]?.prompt).toContain("The previous session reported it was blocked");
 		expect(resumed[0]?.prompt).toContain("- Credentials are in .env now.");
+	});
+
+	it("doesn't mark a story done when its commit fails, and retries it with the hook's output", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		writeFileSync(join(t.repo, ".git", "hooks", "pre-commit"), '#!/bin/sh\nif [ -f ENG-2.lint ]; then echo "lint: ENG-2 is not formatted" >&2; exit 1; fi\n', { mode: 0o755 });
+		t.runner.script.set("ENG-2", (req, run) => {
+			if (run === 1) writeFileSync(join(req.cwd, "ENG-2.lint"), "unformatted\n");
+			else rmSync(join(req.cwd, "ENG-2.lint"));
+			return undefined;
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-c", issueId: epic.id });
+		await t.manager.idle();
+
+		const ids = t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+		expect(ids).toEqual(["ENG-2", "ENG-2", "ENG-3", "ENG-4"]);
+		expect(t.runner.calls[1]?.prompt).toContain("committing the work failed");
+		expect(t.runner.calls[1]?.prompt).toContain("lint: ENG-2 is not formatted");
+		// Marked Done once, after the commit that went through.
+		expect(t.linear.comments.filter((c) => c.body.startsWith("✅ Completed by cyralph"))).toHaveLength(3);
+		expect(t.linear.issues.get(s1.id)?.stateType).toBe("completed");
+		const wt = t.store.get("sess-c")?.worktreePath ?? "";
+		expect(sh(wt, "log", "--format=%s", "main..HEAD").trim().split("\n")).toEqual([
+			"feat(ENG-4): Sort by priority",
+			"feat(ENG-3): Show badge",
+			"feat(ENG-2): Add priority field",
+		]);
+		expect(sh(wt, "status", "--porcelain")).toBe("");
+	});
+
+	it("doesn't mark a story done while files stay uncommitted after its commit, and sets it aside once out of attempts", async () => {
+		const t = setup();
+		const { epic, s1 } = ralphEpic(t.linear);
+		// A hook that writes a file after staging, so every commit of ENG-2 leaves the worktree dirty.
+		writeFileSync(
+			join(t.repo, ".git", "hooks", "pre-commit"),
+			"#!/bin/sh\nif git diff --cached --name-only | grep -qx ENG-2.txt; then date +%s%N > coverage.out; fi\n",
+			{ mode: 0o755 },
+		);
+		t.runner.script.set("ENG-2", (req, run) => {
+			writeFileSync(join(req.cwd, "ENG-2.txt"), `ENG-2 run ${run}\n`);
+			return { output: "Implemented ENG-2.\n<promise>COMPLETE</promise>", isError: false, aborted: false };
+		});
+
+		await t.manager.handle({ kind: "created", sessionId: "sess-d", issueId: epic.id });
+		await t.manager.idle();
+
+		const ids = t.runner.calls.map((c) => /## Your Task: (\S+)/.exec(c.prompt)?.[1]);
+		// ENG-2 exhausts its attempts, ENG-3 waits on it, ENG-4 still runs.
+		expect(ids).toEqual(["ENG-2", "ENG-2", "ENG-4"]);
+		expect(t.runner.calls[1]?.prompt).toContain("these files were still uncommitted");
+		expect(t.runner.calls[1]?.prompt).toContain("coverage.out");
+		expect(t.linear.issues.get(s1.id)?.stateType).not.toBe("completed");
+		expect(t.linear.comments.some((c) => c.body.startsWith("✅ Completed by cyralph") && c.issueId === s1.id)).toBe(false);
+		expect(t.store.get("sess-d")?.status).toBe("awaiting_input");
+		expect(t.linear.bodies("elicitation").at(-1) ?? "").toContain("ENG-2: Add priority field** failed 2 attempts");
+		// The leftovers were stashed, so ENG-4's commit doesn't sweep them in.
+		const wt = t.store.get("sess-d")?.worktreePath ?? "";
+		expect(sh(wt, "show", "--stat", "--format=", "HEAD")).not.toContain("coverage.out");
+		expect(sh(wt, "stash", "list")).toContain("cyralph: incomplete ENG-2 (ENG-1)");
+		expect(sh(wt, "status", "--porcelain")).toBe("");
 	});
 
 	it("materializes a PRD in the description into sub-issues with Linear metadata", async () => {

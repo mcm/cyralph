@@ -179,6 +179,11 @@ What cyralph adds on top:
   quality gates the agent runs itself (`{{qualityGates}}`), so the agent doesn't repeat them.
 - **Git is also owned by the orchestrator.** The agent is told not to commit. cyralph commits once
   per story, pushes, and opens or updates the PR/MR with `gh` or `glab` (see *GitHub and GitLab*).
+  A story is only marked Done once its commit went through and the worktree is clean afterwards
+  (`git status`, ignored files aside). A commit a git hook rejects, or files still uncommitted after
+  it (rewritten by a hook, inside a nested repository), fail the attempt like a failed verification:
+  the details go into the retry, and once attempts run out the leftovers are stashed and the story
+  is set aside.
 - **Work found along the way becomes stories.** The epic's sub-issues are re-read from Linear before
   every story, so issues added to the epic during a run (by a person, or by the agent) join it, and
   new blocks relations count. A story agent that finds work outside its story (a validation story
