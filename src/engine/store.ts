@@ -48,6 +48,24 @@ export type CleanupRequest =
 	  };
 
 /**
+ * A manual story's preparation commands offered in a "Run it?" picker, waiting for an answer. An answer
+ * only runs them while the story's commands and the worktree `HEAD` are still the ones shown.
+ */
+export interface PreparationRequest {
+	storyKey: string;
+	/** The story's identifier, e.g. "ENG-12". */
+	storyId: string;
+	/** Repository whose epic worktree the commands run in. */
+	repoId?: string;
+	branch: string;
+	/** Full SHA of the worktree's `HEAD` when asked. */
+	headSha: string;
+	/** `preparationHash` of the commands shown. */
+	commandsHash: string;
+	askedAt: string;
+}
+
+/**
  * One repository an epic works in: its branch, worktree and PR/MR, and the requests (review findings,
  * CI failures) to work on there. The session record is the lane of its main repository; stories routed
  * to other repositories get a lane each in `lanes`.
@@ -116,6 +134,10 @@ export interface SessionRecord extends RepoLane {
 	waitingOn: Array<{ id: string; identifier: string }>;
 	/** A human said to start despite open blockers. */
 	ignoreBlockers?: boolean;
+	/** The manual story preparation currently asked about (one at a time). */
+	preparationRequest?: PreparationRequest;
+	/** Manual stories whose preparation was answered (run, or left to a person): never asked about again. */
+	preparationHandled?: string[];
 	/** Questions about a merged epic's leftovers (stashes, unmerged commits) still waiting for an answer. */
 	cleanupRequests?: CleanupRequest[];
 	totalCostUsd: number;
