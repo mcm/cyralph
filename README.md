@@ -18,10 +18,10 @@ Linear: delegate ENG-1 "Task Priority System" to @cyralph
        └─ loop:
             next ready story (in-progress first → Linear priority → sub-issue order; deps done)
             → fresh Claude Agent SDK session with PRD + progress log + one story
-            → final message ends with <promise>COMPLETE</promise>?  → run verifyCommands
+            → structured result says "complete"?  → run verifyCommands
             → commit "feat(ENG-3): …" → push → sub-issue ► Done
-            → <promise>BLOCKED</promise>? → set aside at once (no retries) until you reply
-            → otherwise retry with the failure fed back (max N attempts, then set aside)
+            → "blocked"? → commit or stash its work, set aside at once (no retries) until you reply
+            → otherwise stash its work, retry with the failure fed back (max N attempts, then set aside)
        └─ all done → open PR (ready for review) → response in the session
           stuck    → elicitation in the session; your reply becomes guidance and resumes the loop
 ```
@@ -82,7 +82,7 @@ These follow Cyrus:
 - **An @mention** does only what the comment asks, with the epic as context: its stories and
   their status, the branch, `origin`, the PR and the PRD. It doesn't start the story loop, change
   Linear issue states or create story issues, and blockers don't apply. That one agent session may
-  commit, push the epic branch and use the forge CLI (`gh` or `glab`), and its final message becomes the response. For
+  commit, push the epic branch and use the forge CLI (`gh` or `glab`), and the `summary` of its structured result becomes the response. For
   example:
   > @cyralph there is now a git remote, git@github.com:me/app.git, can you push and create a PR?
 
@@ -156,15 +156,19 @@ triggers a wake:
 - **Progress log.** The log lives at `<stateDir>/epics/<EPIC-ID>/progress.md`, with a
   `## Codebase Patterns` section at the top. The agent appends learnings after each story. Patterns
   and the last 5 entries are injected into each prompt.
-- **Completion requires `<promise>COMPLETE</promise>`** in the agent's *final* message. A zero exit
-  code is not enough, and neither is mentioning the tag partway through.
+- **Completion is a structured result.** Every agent session (story, direct request, PR/MR
+  description) runs with a JSON schema as its output format (`outputFormat`), and the result decides
+  the outcome, not tags in the message text. A story session reports
+  `{ status: "complete" | "blocked" | "incomplete", summary, commit?, appliedStashes?, followUps }`;
+  `summary` is what's posted to Linear. A zero exit code is not enough, and a session that ends
+  without a valid result (including the SDK's `error_max_structured_output_retries`) uses up an
+  attempt, with the reason in the retry's feedback.
 - **An explicit "blocked".** When an obstacle won't go away on a retry (missing credentials, a
-  service that's down, a decision only a person can make), the agent ends with
-  `<promise>BLOCKED</promise>` and says why. The story is set aside right away instead of using up
-  its remaining attempts, and the pause message quotes the reason. Your reply resumes it.
+  service that's down, a decision only a person can make), the agent reports `status: "blocked"` and
+  says why. The story is set aside right away instead of using up its remaining attempts, and the
+  pause message quotes the reason. Your reply resumes it.
 - **Error strategy.** A failed story is retried with feedback, then skipped after
-  `maxAttemptsPerStory`. Its partial work is `git stash`ed so the next story starts clean. Stories
-  that depend on it are reported as blocked.
+  `maxAttemptsPerStory`. Stories that depend on it are reported as blocked.
 - **The prompt template** follows ralph-tui's JSON tracker template (PRD, then patterns, then one
   story, then workflow, then stop condition). You can override it with `promptTemplatePath`, which
   supports a Handlebars subset: `{{var}}` and `{{#if}}…{{else}}…{{/if}}`. See `src/ralph/prompt.ts`
@@ -184,26 +188,43 @@ What cyralph adds on top:
   it (rewritten by a hook, inside a nested repository), fail the attempt like a failed verification:
   the details go into the retry, and once attempts run out the leftovers are stashed and the story
   is set aside.
+- **Blocked work is never lost.** A blocked agent that made changes worth keeping adds
+  `commit: { summary }` to its result. cyralph then runs the verify commands and, when they all pass,
+  commits everything as `wip(<storyId>): <summary>` (body `Epic: <epic> <title>`) and pushes it and
+  updates the PR/MR like a completed story (following `pushPerStory`). If a check fails, the work is
+  stashed instead and the session says which command failed. The story stays blocked either way.
+- **Every session starts from a clean tree.** Before any agent session (story, request or PR/MR
+  description), uncommitted changes in the worktree are stashed (`git stash push --include-untracked`)
+  as `cyralph: <epic> <story or session> pre-run`. Any session that ends without its work committed
+  (incomplete, blocked, an error, a pause for follow-ups, stopped, out of attempts) stashes what it
+  left as `cyralph: <epic> <story> <reason>`. So one story's leftovers never end up in another
+  story's commit. Entries are recorded by commit SHA on the session (the stash list is shared by
+  every worktree of the repository, and indexes shift), and nothing is hard-reset or `git clean`ed.
+  With `commitPerStory` off, stories' work stays uncommitted on purpose, so nothing is stashed.
+- **Stash recovery.** When a story runs again, its prompt lists its own unapplied stash entries (SHA,
+  label, date; never other stories' or other epics'). The agent reviews them with
+  `git stash show -p --include-untracked <sha>`, applies what's still relevant with
+  `git stash apply <sha>`, and reports what it applied in `appliedStashes`. Once the story's work is
+  committed (completed, or blocked with a commit), all of its entries are dropped: that work is in
+  the commit or was deliberately left out. Entries no story owns (`pre-run`, request sessions) wait
+  for the cleanup after the merge.
 - **Work found along the way becomes stories.** The epic's sub-issues are re-read from Linear before
   every story, so issues added to the epic during a run (by a person, or by the agent) join it, and
   new blocks relations count. A story agent that finds work outside its story (a validation story
-  that turns up bugs, say) ends its final message with one block per item:
+  that turns up bugs, say) lists them in its result's `followUps`, each with a `title`, a
+  `description` (what is wrong and what done looks like, with `- [ ]` acceptance criteria) and
+  `manual`.
 
-  ```
-  <follow-up title="Fix the empty-list crash">
-  What is wrong and what done looks like, with `- [ ]` acceptance criteria.
-  </follow-up>
-  ```
-
-  cyralph files each as a sub-issue of the epic. Without the completion signal they block the story
-  that found them: it pauses without using up an attempt, the follow-ups are worked next, and then
-  the story runs again. With the completion signal they are just added as new stories. The same pause
+  cyralph files each as a sub-issue of the epic. When the story isn't complete they block the story
+  that found them: it pauses without using up an attempt (its work is stashed and offered back), the
+  follow-ups are worked next, and then the story runs again. When it is complete they are just added
+  as new stories. The same pause
   applies when the agent files blocking issues itself; one that isn't a sub-issue of the epic is
   waited on like any outside blocker. A directly delegated story works its own follow-ups too. After
   three such pauses, a story's next round counts as a normal failed attempt.
 
   Work only a person can do (granting access, changing an outside service's settings, a decision) is
-  marked manual: `<follow-up title="Grant the bot registry access" manual>`. It is filed with the
+  marked `manual: true`. It is filed with the
   first label in `ralph.manualLabels`, so no agent turn is spent on it; a story it blocks is parked
   on it like any manual step and runs again once a person moves it to Done.
 
@@ -321,15 +342,30 @@ flaky test, an outage) is reported in the session instead of "fixed".
 
 When an epic's pull/merge request is merged (and Linear moves the issue to Done), cyralph removes
 the epic's worktree and its local branch, and says so in the session. The remote branch is left to
-the forge.
+the forge. Cleanup never waits on a person and never leaves a worktree behind, and nothing on the
+agent's machine needs cleaning up by hand: what it can't decide alone becomes a question in the
+epic's Linear session.
 
 - **Triggers.** The issue's *Issues* webhook moving it to a completed state, a review or CI poll
   seeing the PR/MR closed, and the periodic `blockerPollMinutes` reconcile (also run at startup) as
   a fallback. Each checks with the forge CLI (`gh api` / `glab api`) that the PR/MR was merged; a
   PR/MR closed without merging is left alone.
-- **Nothing is lost.** A worktree with uncommitted changes, or a branch with commits the merged head
-  doesn't contain, is kept (the session says why). A session still running or queued for the issue is
-  checked again later. Only worktrees cyralph created under its worktree directory are removed.
+- **Uncommitted changes are stashed** (`cyralph: <epic> cleanup`) before the worktree is removed.
+- **Leftover stashes.** If the epic still has stash entries nobody applied, the session asks
+  "N stashed changes from <epic> were never applied" with the options **Push to a branch on origin**
+  (stores them on `cyralph/stash/<epic-identifier-lowercase>`, one commit per entry with its tracked
+  and untracked files and its label as the message, then drops them locally) and **Drop**. Without an
+  answer nothing happens: the entries stay, and nothing else waits on them.
+- **Unmerged commits.** If the branch has commits the merged head doesn't contain, the worktree is
+  still removed but the local branch is kept, and the session asks "`<branch>` has N commits that
+  weren't merged" with **Push to origin** (pushes the branch, then deletes it locally) and **Delete**.
+  Without an answer within `unmergedBranchTimeoutMinutes` (per repository, default 60) the local
+  branch is deleted and the session says so.
+- Pending questions are kept on the session record, so they survive restarts. Pick an option in
+  Linear (or reply with its name); the answer is carried out and confirmed in the session. Any other
+  reply is handled as usual.
+- A session still running or queued for the issue is checked again later. Only worktrees cyralph
+  created under its worktree directory are removed.
 - `cleanupMergedWorktrees` turns this off per repository (it defaults to on).
 
 ## Setup

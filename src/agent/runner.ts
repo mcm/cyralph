@@ -33,6 +33,8 @@ export interface RunRequest {
 	 * the session can no longer take input). The function returns false if it was too late.
 	 */
 	onInjector?: (inject: ((text: string) => boolean) | undefined) => void;
+	/** JSON schema the session's result must match (`outputFormat`); the result arrives as `structured`. */
+	outputSchema?: Record<string, unknown>;
 }
 
 /** If an injected message never gets answered, stop waiting for it after this long. */
@@ -86,11 +88,13 @@ function userMessage(text: string, uuid: string, priority?: "next"): SDKUserMess
 }
 
 export interface RunResult {
-	/**
-	 * The agent's final message. The completion signal is only honoured here, so an agent
-	 * that merely mentions `<promise>COMPLETE</promise>` mid-run does not end the story.
-	 */
+	/** The agent's final message. */
 	output: string;
+	/**
+	 * The final turn's result matching `outputSchema` (unvalidated: callers check its shape). Missing when
+	 * the agent never produced one, e.g. `errorMessage` "error_max_structured_output_retries".
+	 */
+	structured?: unknown;
 	isError: boolean;
 	aborted: boolean;
 	sessionId?: string;
@@ -107,7 +111,7 @@ export interface AgentRunner {
 export const RALPH_SYSTEM_APPEND = `You are "cyralph", an autonomous engineer working a Linear epic one user story at a time (the Ralph loop).
 - Work only on the single story you are given; other stories get their own sessions.
 - Never run git commit, git push, or open pull requests: the orchestrator handles version control and Linear updates. If guidance asks for a push or a PR/MR, skip that part without comment; the orchestrator does it.
-- Be precise and verifiable. Only emit <promise>COMPLETE</promise> when the story truly meets its acceptance criteria.`;
+- Be precise and verifiable. Only report the status "complete" in your structured result when the story truly meets its acceptance criteria.`;
 
 export type HistoryRewritePolicy = "when-asked" | "never";
 
@@ -121,7 +125,7 @@ export function requestSystemAppend(historyRewrite: HistoryRewritePolicy = "when
 - Do what the request asks. You may use git (commit, push) and the repository's forge CLI (gh for GitHub, glab for GitLab, as named in the prompt) when the request calls for it.
 - Only push the epic branch you are on. Never push to, or force-push, the base branch or any other branch.
 ${rewrite}
-- Your final message is posted to the Linear thread: summarise what you did, with links (e.g. the PR/MR URL).`;
+- The \`summary\` of your structured result is posted to the Linear thread: summarise what you did, with links (e.g. the PR/MR URL).`;
 }
 
 export const REQUEST_SYSTEM_APPEND = requestSystemAppend("when-asked");
@@ -156,6 +160,7 @@ export class ClaudeAgentRunner implements AgentRunner {
 			systemPrompt: { type: "preset", preset: "claude_code", append: req.systemAppend ?? RALPH_SYSTEM_APPEND },
 			settingSources: ["project", "local"],
 			...(req.resume && { resume: req.resume }),
+			...(req.outputSchema && { outputFormat: { type: "json_schema", schema: req.outputSchema } }),
 		};
 
 		// Streaming input: the session stays open until every message we sent has been answered.
@@ -213,6 +218,8 @@ export class ClaudeAgentRunner implements AgentRunner {
 				} else if (msg.type === "result") {
 					result = {
 						output: msg.subtype === "success" ? msg.result : (texts[texts.length - 1] ?? ""),
+						// Every turn ends in a result (an injected message starts another): the last one counts.
+						structured: msg.subtype === "success" ? msg.structured_output : undefined,
 						isError: msg.is_error,
 						aborted: false,
 						sessionId: msg.session_id,

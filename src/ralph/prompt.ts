@@ -4,11 +4,8 @@
  *
  * Custom templates use a Handlebars-compatible subset: `{{var}}`, `{{#if var}}...{{else}}...{{/if}}`.
  */
+import { z } from "zod";
 import { type Epic, type Story, dependencyLabel } from "./types.js";
-
-export const COMPLETE_PATTERN = /<promise>\s*COMPLETE\s*<\/promise>/i;
-/** The agent hit an obstacle a retry can't get past: the story is set aside without further attempts. */
-export const BLOCKED_PATTERN = /<promise>\s*BLOCKED\s*<\/promise>/i;
 
 /** At most this many follow-up issues are filed from one story session. */
 export const MAX_FOLLOW_UPS = 10;
@@ -36,26 +33,99 @@ function normalizeCommand(cmd: string): string {
 export interface FollowUp {
 	title: string;
 	description: string;
-	/** Work for a person (`manual` attribute): filed with the manual label so no agent attempts it. */
+	/** Work for a person: filed with the manual label so no agent attempts it. */
 	manual?: boolean;
 }
 
+/** A JSON schema for `outputFormat`, from a zod schema. */
+function jsonSchema(schema: z.ZodType): Record<string, unknown> {
+	const { $schema: _, ...rest } = z.toJSONSchema(schema) as Record<string, unknown>;
+	return rest;
+}
+
+/** Why a structured result doesn't match its schema (or that there was none). */
+function problemWith(error: z.ZodError | undefined): string {
+	if (!error) return "no structured result";
+	const issue = error.issues[0];
+	return `invalid structured result: ${issue?.path.length ? `\`${issue.path.join(".")}\` ` : ""}${issue?.message ?? "doesn't match the schema"}`;
+}
+
+const StoryOutcomeSchema = z.object({
+	status: z
+		.enum(["complete", "blocked", "incomplete"])
+		.describe("complete: every acceptance criterion is met. blocked: a retry can't get past an obstacle. incomplete: unfinished; try again."),
+	summary: z.string().describe("Posted to Linear: what you did, or precisely what is in the way and what would unblock it."),
+	commit: z
+		.object({ summary: z.string().describe("One line describing the work in progress worth keeping.") })
+		.optional()
+		.describe("Blocked only: commit the work so far (if the checks pass) instead of stashing it."),
+	appliedStashes: z.array(z.string()).optional().describe("SHAs of the offered stash entries you applied with `git stash apply`."),
+	followUps: z
+		.array(
+			z.object({
+				title: z.string().describe("Short imperative title."),
+				description: z.string().describe("What is wrong, where, and what done looks like (acceptance criteria as `- [ ]` checkboxes)."),
+				manual: z.boolean().describe("True for work only a person can do (access, outside settings, a decision)."),
+			}),
+		)
+		.describe("Work outside this story's scope for the orchestrator to file as new stories. Empty when there is none."),
+});
+export type StoryOutcome = Omit<z.infer<typeof StoryOutcomeSchema>, "followUps"> & { followUps: FollowUp[] };
+
+/** `outputFormat` schema of a story session: its result decides the story's outcome. */
+export const STORY_OUTPUT_SCHEMA = jsonSchema(StoryOutcomeSchema);
+
 /**
- * Follow-up issues a story agent asks the orchestrator to file, written in its final message as
- * `<follow-up title="…">description</follow-up>` blocks, with a `manual` (or `manual="true"`)
- * attribute for work only a person can do.
+ * A story session's structured result, with follow-ups trimmed, deduplicated by title and capped. A result
+ * that is missing or doesn't match the schema gives the problem instead.
  */
-export function parseFollowUps(output: string): FollowUp[] {
-	const out: FollowUp[] = [];
-	for (const m of output.matchAll(/<follow-up((?:\s+[\w-]+(?:\s*=\s*"[^"]*")?)*)\s*>([\s\S]*?)<\/follow-up>/gi)) {
-		const attrs = new Map<string, string>();
-		for (const a of (m[1] ?? "").matchAll(/([\w-]+)(?:\s*=\s*"([^"]*)")?/g)) attrs.set((a[1] ?? "").toLowerCase(), a[2] ?? "");
-		const title = (attrs.get("title") ?? "").trim();
-		if (!title || out.some((f) => f.title.toLowerCase() === title.toLowerCase())) continue;
-		const manual = attrs.has("manual") && !/^(false|no|0)$/i.test((attrs.get("manual") ?? "").trim());
-		out.push({ title, description: (m[2] ?? "").trim(), ...(manual && { manual: true }) });
+export function readStoryOutcome(structured: unknown): { outcome: StoryOutcome } | { problem: string } {
+	const parsed = structured === undefined ? undefined : StoryOutcomeSchema.safeParse(structured);
+	if (!parsed?.success) return { problem: problemWith(parsed?.error) };
+	const followUps: FollowUp[] = [];
+	for (const f of parsed.data.followUps) {
+		const title = f.title.replace(/\s+/g, " ").trim();
+		if (!title || followUps.some((x) => x.title.toLowerCase() === title.toLowerCase())) continue;
+		followUps.push({ title, description: f.description.trim(), ...(f.manual && { manual: true }) });
 	}
-	return out.slice(0, MAX_FOLLOW_UPS);
+	const commit = parsed.data.commit?.summary.trim() ? { summary: parsed.data.commit.summary.replace(/\s+/g, " ").trim() } : undefined;
+	return { outcome: { ...parsed.data, commit, followUps: followUps.slice(0, MAX_FOLLOW_UPS) } };
+}
+
+const RequestResultSchema = z.object({ summary: z.string().describe("Posted to the Linear thread: what you did, with links (e.g. the PR/MR URL).") });
+
+/** `outputFormat` schema of a direct request session. */
+export const REQUEST_OUTPUT_SCHEMA = jsonSchema(RequestResultSchema);
+
+/** The summary of a request session's structured result, or the problem with it. */
+export function readRequestResult(structured: unknown): { summary: string } | { problem: string } {
+	const parsed = structured === undefined ? undefined : RequestResultSchema.safeParse(structured);
+	return parsed?.success ? { summary: parsed.data.summary.trim() } : { problem: problemWith(parsed?.error) };
+}
+
+const PullRequestDescriptionSchema = z.object({
+	title: z.string().describe("One line, imperative mood, at most ~70 characters."),
+	body: z.string().describe("The markdown description."),
+});
+
+/** `outputFormat` schema of the session that writes a PR/MR title and description. */
+export const PR_DESCRIPTION_SCHEMA = jsonSchema(PullRequestDescriptionSchema);
+
+/** The title and description from a describe session's structured result, if it produced both. */
+export function readPullRequestDescription(structured: unknown): { title: string; body: string } | undefined {
+	const parsed = PullRequestDescriptionSchema.safeParse(structured);
+	if (!parsed.success) return undefined;
+	const title = parsed.data.title.replace(/\s+/g, " ").trim().replace(/^["'`]+|["'`]+$/g, "");
+	const body = parsed.data.body.trim();
+	return title && body ? { title: title.slice(0, 200), body } : undefined;
+}
+
+/** A stash entry offered to a story session for review (see `## Stashed Work`). */
+export interface OfferedStash {
+	sha: string;
+	label: string;
+	/** When it was stashed (ISO 8601). */
+	date: string;
 }
 
 export interface PromptContext {
@@ -74,15 +144,17 @@ export interface PromptContext {
 	appendInstruction?: string;
 	/** Markdown list of downloaded Linear attachments (see formatAttachments). */
 	attachments?: string;
-	/** The orchestrator files `<follow-up>` blocks as sub-issues of the epic (Linear-backed epics only). */
+	/** The orchestrator files `followUps` as sub-issues of the epic (Linear-backed epics only). */
 	followUps?: boolean;
 	/** The story's repository, when it isn't the epic's main one. */
 	repository?: string;
 	/**
-	 * Commands the orchestrator runs itself after the agent signals completion. Quality gates among them
+	 * Commands the orchestrator runs itself after the agent reports the story complete. Quality gates among them
 	 * aren't repeated as the agent's to run, so each check runs once.
 	 */
 	verifyCommands?: string[];
+	/** Stash entries of earlier sessions of this story that haven't been applied yet. */
+	stashes?: OfferedStash[];
 }
 
 export const DEFAULT_STORY_TEMPLATE = `You are working through a PRD epic from Linear, one user story per session.
@@ -132,13 +204,13 @@ Files attached in Linear (screenshots, mockups, documents). Open each one with t
 
 {{/if}}
 {{#if qualityGates}}
-### Quality Gates (must pass before you signal completion)
+### Quality Gates (must pass before you report the story complete)
 {{qualityGates}}
 
 {{/if}}
 {{#if verifyCommands}}
 ### Checked by the Orchestrator
-The orchestrator runs these itself after you signal completion and sends any failure back to you, so you don't need to run them as a final check (run one earlier only if you need its output while working):
+The orchestrator runs these itself after you report the story complete and sends any failure back to you, so you don't need to run them as a final check (run one earlier only if you need its output while working):
 {{verifyCommands}}
 
 {{/if}}
@@ -154,6 +226,14 @@ The previous attempt at this story did not complete. Fix the problems below:
 {{previousAttemptFeedback}}
 
 {{/if}}
+{{#if stashes}}
+## Stashed Work From Earlier Sessions
+Earlier sessions of {{storyId}} ended with uncommitted changes, which the orchestrator stashed so that every session starts from a clean tree:
+{{stashes}}
+
+Review each one with \`git stash show -p --include-untracked <sha>\` and apply what's still relevant with \`git stash apply <sha>\`. Never \`pop\` or \`drop\` them: the stash list is shared with other worktrees. Report the SHAs you applied in \`appliedStashes\`. Entries you leave out stay stashed until the story's work is committed, and are dropped then.
+
+{{/if}}
 {{#if recentProgress}}
 ## Recent Progress
 {{recentProgress}}
@@ -166,7 +246,7 @@ The previous attempt at this story did not complete. Fix the problems below:
 4. Run the quality gates and fix any failures.
 5. Do NOT create git commits or push. The orchestrator commits after verifying the story.
 6. Document learnings (see below).
-7. Signal completion.
+7. Report the outcome (see the Stop Condition).
 
 ## Before Completing
 APPEND to \`{{progressFile}}\`:
@@ -186,22 +266,20 @@ If you discovered a **reusable pattern**, also add it to the \`## Codebase Patte
 {{/if}}
 
 ## Stop Condition
-If the story is already implemented (e.g. by a previous session), verify it meets the acceptance criteria and signal completion immediately.
-Only when every acceptance criterion is met and the quality gates pass, end your final message with:
-<promise>COMPLETE</promise>
-If you are blocked by something another attempt can't get past (missing access or credentials, an unavailable service, a decision only a person can make), explain precisely why and what would unblock you, and end your final message with:
-<promise>BLOCKED</promise>
-The story is then set aside without retries until someone replies. If the story is just unfinished, leave out both signals and it gets another attempt.
+Your session ends with a structured result (the JSON schema you were given). It alone decides what happens next: nothing in your message text does.
+- \`status: "complete"\` only when every acceptance criterion is met and the quality gates pass. If the story is already implemented (e.g. by a previous session), verify it meets the acceptance criteria and report it complete straight away.
+- \`status: "blocked"\` when something another attempt can't get past stops you (missing access or credentials, an unavailable service, a decision only a person can make). Explain in \`summary\` precisely why and what would unblock you. The story is then set aside without retries until someone replies. If you made changes worth keeping, add \`commit: { summary }\` with a one-line description of them: the orchestrator commits them as work in progress when its checks pass, and stashes them otherwise.
+- \`status: "incomplete"\` when the story is just unfinished: it gets another attempt.
+- \`summary\` is posted to Linear: what you did, or what is in the way.
 {{#if followUps}}
 
 ## Follow-up Work
-If you find work this story needs that is outside its scope (bugs elsewhere, missing pieces, problems a validation turns up), don't create Linear issues yourself and don't leave it as a note. Put one block per item in your final message, and the orchestrator files each as a new story (a sub-issue of {{epicIdentifier}}):
-<follow-up title="Short imperative title">
-What is wrong, where, and what done looks like (acceptance criteria as \`- [ ]\` checkboxes).
-</follow-up>
-- If {{storyId}} can't be completed until they are fixed, leave out the completion signal. They will block {{storyId}}, be worked first, and then {{storyId}} runs again.
-- If {{storyId}} is complete anyway, add the completion signal too, and they join the epic as new stories.
-- If an item is work only a person can do (granting access, changing settings in an outside service, a decision), mark it manual: \`<follow-up title="…" manual>\`. It is filed for a person and never attempted by an agent; stories it blocks wait until a person marks it done.
+If you find work this story needs that is outside its scope (bugs elsewhere, missing pieces, problems a validation turns up), don't create Linear issues yourself and don't leave it as a note. Add one entry per item to \`followUps\`, and the orchestrator files each as a new story (a sub-issue of {{epicIdentifier}}): a short imperative \`title\`, and a \`description\` of what is wrong, where, and what done looks like (acceptance criteria as \`- [ ]\` checkboxes).
+- If {{storyId}} can't be completed until they are fixed, don't report it complete. They will block {{storyId}}, be worked first, and then {{storyId}} runs again.
+- If {{storyId}} is complete anyway, report it complete, and they join the epic as new stories.
+- If an item is work only a person can do (granting access, changing settings in an outside service, a decision), set \`manual: true\`. It is filed for a person and never attempted by an agent; stories it blocks wait until a person marks it done.
+{{else}}
+- Leave \`followUps\` empty.
 {{/if}}
 `;
 
@@ -278,6 +356,7 @@ export function buildStoryPrompt(ctx: PromptContext, template = DEFAULT_STORY_TE
 		attachments: ctx.attachments,
 		followUps: ctx.followUps ? "yes" : undefined,
 		repository: ctx.repository,
+		stashes: ctx.stashes?.length ? ctx.stashes.map((e) => `- \`${e.sha}\` ${e.label} (${e.date})`).join("\n") : undefined,
 	};
 	return renderTemplate(template, vars).trim();
 }
@@ -346,7 +425,7 @@ export function buildRequestPrompt(ctx: RequestPromptContext): string {
 		...(ctx.forgeInstructions ? [`- ${ctx.forgeInstructions}`] : ["- There is no `origin` remote yet, so pushing or opening a pull/merge request isn't possible until one is added."]),
 		"- If you change code, run the quality gates and commit with a clear message.",
 		"- If the request is ambiguous or can't be done (e.g. missing credentials), say exactly what's missing instead of guessing.",
-		`- Finish with a short summary for the Linear thread of what you did, including any ${ctx.prTerm ?? "pull request"} URL.`,
+		`- Finish with a short summary for the Linear thread of what you did, including any ${ctx.prTerm ?? "pull request"} URL, as the \`summary\` of your structured result.`,
 	];
 	return lines.join("\n").trim();
 }
@@ -370,7 +449,7 @@ export const PR_DESCRIPTION_HEADING = "## Write the title and description";
 /** System prompt addition for the read-only session that writes a PR/MR title and description. */
 export const PR_DESCRIPTION_SYSTEM_APPEND = `You are "cyralph", writing the title and description of a pull/merge request for work that is already committed.
 - Only read: inspect the repository and git history. Don't edit files, commit, push, or run gh/glab.
-- Your final message must contain the <pr-title> and <pr-description> blocks the prompt asks for.`;
+- Report the title and description in your structured result (\`title\`, \`body\`).`;
 
 /**
  * Prompt for a short session that reads the branch's changes and writes the PR/MR title and
@@ -405,18 +484,6 @@ export function buildPullRequestPrompt(ctx: PullRequestPromptContext): string {
 		"   - Be concrete and concise; don't pad with generic statements or restate the diff line by line.",
 		"3. Don't change any files.",
 		"",
-		"End your final message with exactly these two blocks:",
-		"<pr-title>The title</pr-title>",
-		"<pr-description>",
-		"The markdown description",
-		"</pr-description>",
+		"Report them as the `title` and the markdown `body` of your structured result.",
 	].join("\n");
-}
-
-/** The title and description from a describe session's final message, if it produced both. */
-export function parsePullRequestDescription(output: string): { title: string; body: string } | undefined {
-	const title = [...output.matchAll(/<pr-title>([\s\S]*?)<\/pr-title>/gi)].pop()?.[1]?.replace(/\s+/g, " ").trim();
-	const body = [...output.matchAll(/<pr-description>([\s\S]*?)<\/pr-description>/gi)].pop()?.[1]?.trim();
-	if (!title || !body) return undefined;
-	return { title: title.replace(/^["'`]+|["'`]+$/g, "").slice(0, 200), body };
 }

@@ -13,6 +13,40 @@ export type SessionStatus = "queued" | "running" | "awaiting_input" | "blocked" 
  */
 export type SessionMode = "epic" | "request";
 
+/** A stash entry cyralph made in a lane's repository, kept so it can be offered back, dropped or handed to a person. */
+export interface StashRecord {
+	/** The stash commit (indexes shift; the stash list is shared by every worktree of the repository). */
+	sha: string;
+	label: string;
+	/** The story whose work it holds; absent for work no story owns (pre-run, request sessions, cleanup). */
+	storyKey?: string;
+	/** Why it was stashed, e.g. "blocked" or "pre-run". */
+	reason: string;
+	createdAt: string;
+	/** The story's agent applied it, so its changes went into a later stash or commit. */
+	applied?: boolean;
+}
+
+/** A question about leftovers of a merged epic, posted in its session and waiting for a reply. */
+export type CleanupRequest =
+	| {
+			kind: "stashes";
+			repoId: string;
+			/** Stash entries (by commit SHA) that were never applied. */
+			shas: string[];
+			askedAt: string;
+	  }
+	| {
+			kind: "branch";
+			repoId: string;
+			/** Local branch with commits the merge doesn't contain. */
+			branch: string;
+			commits: number;
+			askedAt: string;
+			/** Without an answer by then the branch is deleted (`unmergedBranchTimeoutMinutes`). */
+			deadline: string;
+	  };
+
 /**
  * One repository an epic works in: its branch, worktree and PR/MR, and the requests (review findings,
  * CI failures) to work on there. The session record is the lane of its main repository; stories routed
@@ -40,6 +74,8 @@ export interface RepoLane {
 	requestClaudeSessionId?: string;
 	/** Requests not yet acted on, run as a direct request session in this lane's worktree. */
 	pendingRequests?: string[];
+	/** Uncommitted work cyralph stashed in this repository and hasn't dropped or pushed yet. */
+	stashes?: StashRecord[];
 }
 
 export interface SessionRecord extends RepoLane {
@@ -58,7 +94,7 @@ export interface SessionRecord extends RepoLane {
 	lanes?: Record<string, RepoLane>;
 	/** Iterations spent per story key. */
 	attempts: Record<string, number>;
-	/** Stories whose agent reported `<promise>BLOCKED</promise>`: set aside without retries until a reply. */
+	/** Stories whose agent reported the status "blocked": set aside without retries until a reply. */
 	blockedKeys?: string[];
 	/** Why the last attempt of a story failed, fed into the next attempt. */
 	lastFeedback: Record<string, string>;
@@ -80,6 +116,8 @@ export interface SessionRecord extends RepoLane {
 	waitingOn: Array<{ id: string; identifier: string }>;
 	/** A human said to start despite open blockers. */
 	ignoreBlockers?: boolean;
+	/** Questions about a merged epic's leftovers (stashes, unmerged commits) still waiting for an answer. */
+	cleanupRequests?: CleanupRequest[];
 	totalCostUsd: number;
 	createdAt: string;
 	updatedAt: string;
@@ -107,6 +145,7 @@ const LANE_FIELDS: Record<Exclude<keyof RepoLane, "pendingRequests">, true> = {
 	handledCiShas: true,
 	ciFixRounds: true,
 	requestClaudeSessionId: true,
+	stashes: true,
 };
 
 /**

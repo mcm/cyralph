@@ -2,7 +2,10 @@
  * The Ralph loop, driven by a Linear agent session:
  *
  *   load epic -> prepare worktree -> repeat { pick next ready story -> fresh agent session ->
- *   check <promise>COMPLETE</promise> -> run verify commands -> commit/push/PR -> mark story Done }
+ *   read its structured result -> run verify commands -> commit/push/PR -> mark story Done }
+ *
+ * Every agent session starts from a clean worktree: whatever a session leaves uncommitted is stashed
+ * under a `cyralph: …` label, recorded on the session, and offered back when its story runs again.
  *
  * Linear sub-issues are the tracker, the agent session is the
  * activity log, and the session plan shows story checklist progress.
@@ -28,17 +31,20 @@ import type { IssueSummary, LinearGateway, PlanStep } from "../linear/gateway.js
 import type { Logger } from "../logger.js";
 import { ensureProgressFile, extractCodebasePatterns, readProgress, recentProgressEntries } from "../ralph/progress.js";
 import {
-	BLOCKED_PATTERN,
-	COMPLETE_PATTERN,
 	DEFAULT_STORY_TEMPLATE,
+	type FollowUp,
+	type OfferedStash,
+	PR_DESCRIPTION_SCHEMA,
 	PR_DESCRIPTION_SYSTEM_APPEND,
+	REQUEST_OUTPUT_SCHEMA,
+	STORY_OUTPUT_SCHEMA,
 	asksForPushOrPullRequest,
 	buildPullRequestPrompt,
 	buildRequestPrompt,
-	type FollowUp,
 	buildStoryPrompt,
-	parseFollowUps,
-	parsePullRequestDescription,
+	readPullRequestDescription,
+	readRequestResult,
+	readStoryOutcome,
 	uniqueCommands,
 } from "../ralph/prompt.js";
 import { blockedStories, isEpicComplete, isStoryDone, selectNextStory } from "../ralph/selection.js";
@@ -75,6 +81,21 @@ export interface EngineRun {
 	setInjector?: (inject: ((text: string) => boolean) | undefined, repoId?: string) => void;
 	/** Worktrees prepared during this run, by repository id (set by the engine). */
 	workspaces?: Map<string, Workspace>;
+}
+
+/** Label of a stash entry cyralph makes: `cyralph: <epic> <story or session> <reason>`. */
+export function stashLabel(epic: string, reason: string, owner?: string): string {
+	return `cyralph: ${epic}${owner ? ` ${owner}` : ""} ${reason}`;
+}
+
+/** The SDK's result subtype when the agent never produced output matching the schema. */
+const STRUCTURED_RETRIES_EXHAUSTED = "error_max_structured_output_retries";
+
+/** Why an agent session errored, for feedback and the thread. */
+function sessionError(errorMessage: string | undefined): string {
+	return errorMessage === STRUCTURED_RETRIES_EXHAUSTED
+		? `it never produced a structured result matching the JSON schema (${STRUCTURED_RETRIES_EXHAUSTED})`
+		: `it errored (${errorMessage ?? "unknown error"})`;
 }
 
 /** Tell the user an epic moved to another repository, and where its earlier work stays. */
@@ -472,6 +493,7 @@ export class EpicEngine {
 			prTerm: forge?.term,
 			attachments: formatAttachments(ctx.attachments ?? []),
 		});
+		await this.startClean(ctx, epic, ws, "request");
 		const runOnce = (resume?: string) =>
 			runner.run({
 				prompt,
@@ -487,6 +509,7 @@ export class EpicEngine {
 				onInjector: (inject) => ctx.setInjector?.(inject, repo.id),
 				systemAppend: requestSystemAppend(historyRewrite),
 				resume,
+				outputSchema: REQUEST_OUTPUT_SCHEMA,
 			});
 		// Follow-ups continue the previous request conversation, like Cyrus resuming its Claude session.
 		let result = await runOnce(lane.requestClaudeSessionId);
@@ -496,11 +519,18 @@ export class EpicEngine {
 		}
 		if (result.sessionId) lane.requestClaudeSessionId = result.sessionId;
 		ctx.record.totalCostUsd += result.costUsd ?? 0;
+		// The agent commits what it means to keep; anything else is set aside so the next session starts clean.
+		const stashed = await this.stash(ctx, epic, ws, "unfinished", { owner: "request" });
 		if (result.aborted) return undefined; // keep the requests pending for the next run
 		lane.pendingRequests = (lane.pendingRequests ?? []).filter((r) => !requests.includes(r));
 		await ctx.persist();
-		if (result.isError) return `I ran into an error working on your request (${result.errorMessage ?? "unknown error"}).\n\n${tail(result.output, 2000)}`.trim();
-		return result.output.trim() || "Done.";
+		const read = result.isError ? undefined : readRequestResult(result.structured);
+		const note = stashed ? `\n\nThe session left uncommitted changes, which I stashed as \`${stashed.slice(0, 10)}\`.` : "";
+		if (!read || "problem" in read) {
+			const why = read ? `it ended without a valid structured result (${read.problem})` : sessionError(result.errorMessage);
+			return `I ran into an error working on your request: ${why}.\n\n${tail(result.output, 2000)}`.trim() + note;
+		}
+		return (read.summary || "Done.") + note;
 	}
 
 	/** The session's PR/MR links not already in `text`, appended one per line (named by repository when there are several). */
@@ -664,6 +694,8 @@ export class EpicEngine {
 		await reporter.plan(planFor(epic, story, args.exhausted()));
 		await reporter.thought(`▶️ **${story.storyId}: ${story.title}** (attempt ${attempt}/${max})`);
 
+		// Whatever an earlier session left behind is set aside first, so this story's commit holds only its work.
+		await this.startClean(ctx, epic, ws, story.storyId);
 		const pendingAtStart = [...record.pendingRequests];
 		const progress = await readProgress(progressFile);
 		const prompt = buildStoryPrompt(
@@ -682,6 +714,7 @@ export class EpicEngine {
 				followUps: epic.kind === "children",
 				repository: story.repo?.name,
 				verifyCommands,
+				stashes: await this.offeredStashes(ctx, ws, story),
 			},
 			template,
 		);
@@ -698,6 +731,7 @@ export class EpicEngine {
 			abortSignal: ctx.abortSignal,
 			onEvent: reporter.onRunnerEvent,
 			onInjector: (inject) => ctx.setInjector?.(inject, repo.id),
+			outputSchema: STORY_OUTPUT_SCHEMA,
 		});
 		record.totalCostUsd += result.costUsd ?? 0;
 		if (!result.aborted) {
@@ -708,31 +742,42 @@ export class EpicEngine {
 
 		if (result.aborted) {
 			record.attempts[story.key] = attempt - 1; // an interrupted attempt doesn't count
+			await this.stash(ctx, epic, ws, "stopped", { story });
 			await ctx.persist();
 			return;
 		}
 
-		// An explicit "blocked" wins over a completion signal: unfinished work is never committed.
-		const blocked = !result.isError && BLOCKED_PATTERN.test(result.output);
-		const complete = !result.isError && !blocked && COMPLETE_PATTERN.test(result.output);
-		if (await this.handleFollowUps({ ctx, epic, story, output: result.output, complete, depsBefore, attempt, exhausted: args.exhausted })) return;
+		// The structured result alone decides the outcome; the message text is only shown.
+		const read = result.isError ? undefined : readStoryOutcome(result.structured);
+		const outcome = read && "outcome" in read ? read.outcome : undefined;
+		if (outcome?.appliedStashes?.length) this.markApplied(ws, story, outcome.appliedStashes);
+		const blocked = outcome?.status === "blocked";
+		const complete = outcome?.status === "complete";
+		const summary = outcome?.summary.trim() || result.output.trim();
+
+		// Blocked work worth keeping is committed when it passes the checks, and stashed otherwise.
+		const kept = blocked && outcome?.commit ? await this.commitBlockedWork({ ctx, epic, story, ws, verifyCommands, summary: outcome.commit.summary }) : undefined;
+
+		if (
+			await this.handleFollowUps({ ctx, epic, story, summary, followUps: outcome?.followUps ?? [], complete, depsBefore, attempt, exhausted: args.exhausted })
+		) {
+			await this.stash(ctx, epic, ws, "follow-up", { story });
+			return;
+		}
 
 		let feedback: string | undefined;
 		if (result.isError) {
-			feedback = `The agent session errored (${result.errorMessage ?? "unknown error"}). Last message:\n\n${quote(tail(result.output, 2000))}`;
+			feedback = `The previous session failed: ${sessionError(result.errorMessage)}. Last message:\n\n${quote(tail(result.output, 2000))}`;
+		} else if (!outcome) {
+			feedback = `The previous session ended without a valid structured result (${read && "problem" in read ? read.problem : "none"}). End the session with a result matching the JSON schema you are given. Its final message was:\n\n${quote(tail(result.output, 3000))}`;
 		} else if (blocked) {
-			feedback = `The previous session reported it was blocked. Its final message was:\n\n${quote(tail(result.output, 3000))}`;
+			feedback = `The previous session reported it was blocked. Its summary was:\n\n${quote(tail(summary, 3000))}`;
 		} else if (!complete) {
-			feedback = `The previous session ended without the completion signal. Its final message was:\n\n${quote(tail(result.output, 3000))}`;
+			feedback = `The previous session reported the story incomplete. Its summary was:\n\n${quote(tail(summary, 3000))}`;
 		} else {
-			for (const cmd of verifyCommands) {
-				await reporter.action("Verify", cmd);
-				const r = await this.deps.shell(cmd, worktree);
-				await reporter.action("Verify", cmd, r.code === 0 ? "passed" : `failed (exit ${r.code})`);
-				if (r.code !== 0) {
-					feedback = `The agent signalled completion, but the verification command \`${cmd}\` failed (exit ${r.code}):\n\n\`\`\`\n${tail(`${r.stdout}\n${r.stderr}`.trim(), MAX_FEEDBACK)}\n\`\`\``;
-					break;
-				}
+			const failed = await this.verify(ctx, verifyCommands, worktree);
+			if (failed) {
+				feedback = `The agent reported the story complete, but the verification command \`${failed.cmd}\` failed (exit ${failed.code}):\n\n\`\`\`\n${tail(failed.output, MAX_FEEDBACK)}\n\`\`\``;
 			}
 		}
 
@@ -751,22 +796,168 @@ export class EpicEngine {
 				record.blockedKeys = [...new Set([...(record.blockedKeys ?? []), story.key])];
 			}
 			await ctx.persist();
+			const reason = blocked ? "blocked" : attempt >= max ? "exhausted" : !outcome ? "error" : complete ? "unverified" : "incomplete";
+			// Nothing uncommitted carries over: the next session starts clean, and this story's next one is offered the stash.
+			const stashed = (await this.stash(ctx, epic, ws, reason, { story })) ?? kept?.stashed;
 			if (blocked || attempt >= max) {
-				// Park the partial work so the next story starts from a clean tree.
-				const stashed = await this.deps.git.stashAll(worktree, `cyralph: incomplete ${story.storyId} (${epic.identifier})`).catch(() => false);
 				story.status = story.issueId ? "in_progress" : "open";
 				const lead = blocked
 					? `🚧 ${story.storyId} is blocked; setting it aside without retrying`
 					: `⚠️ ${story.storyId} did not complete after ${attempt} attempts; setting it aside`;
-				await reporter.thought(`${lead}${stashed ? " (partial work stashed)" : ""}.\n\n${feedback}`);
+				const saved = kept?.sha ? ` (work so far committed as \`${kept.sha.slice(0, 10)}\`)` : stashed ? " (partial work stashed)" : "";
+				await reporter.thought(`${lead}${saved}.\n\n${feedback}`);
 			} else {
-				await reporter.thought(`${story.storyId} attempt ${attempt} did not complete; retrying with feedback.\n\n${tail(feedback, 1500)}`);
+				const saved = stashed ? " Its changes are stashed and offered to the next attempt." : "";
+				await reporter.thought(`${story.storyId} attempt ${attempt} did not complete; retrying with feedback.${saved}\n\n${tail(feedback, 1500)}`);
 			}
 			await reporter.plan(planFor(epic, undefined, args.exhausted()));
 			return;
 		}
 
-		await this.completeStory({ ctx, epic, story, ws, sha, summary: result.output.replace(COMPLETE_PATTERN, "").trim() });
+		// The story's work is committed: its stash entries are in the commit or deliberately left out.
+		if (sha) await this.dropStoryStashes(ctx, ws, story);
+		await this.completeStory({ ctx, epic, story, ws, sha, summary });
+	}
+
+	/** Run the verify commands in order; the first that fails, if any. */
+	private async verify(ctx: EngineRun, commands: string[], worktree: string): Promise<{ cmd: string; code: number; output: string } | undefined> {
+		for (const cmd of commands) {
+			await ctx.reporter.action("Verify", cmd);
+			const r = await this.deps.shell(cmd, worktree);
+			await ctx.reporter.action("Verify", cmd, r.code === 0 ? "passed" : `failed (exit ${r.code})`);
+			if (r.code !== 0) return { cmd, code: r.code, output: `${r.stdout}\n${r.stderr}`.trim() };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Commit the work of a story whose agent reported it blocked and asked to keep its changes, as
+	 * `wip(<storyId>): <summary>`, once the verify commands pass; push it like a completed story. When a
+	 * check fails (or the commit does), the work is stashed instead. The story stays blocked either way.
+	 */
+	private async commitBlockedWork(args: {
+		ctx: EngineRun;
+		epic: Epic;
+		story: Story;
+		ws: Workspace;
+		verifyCommands: string[];
+		summary: string;
+	}): Promise<{ sha?: string; stashed?: string }> {
+		const { ctx, epic, story, ws, verifyCommands, summary } = args;
+		const { config, git } = this.deps;
+		const { reporter } = ctx;
+		const { worktree } = ws;
+		if (!config.ralph.commitPerStory) return {};
+		if ((await git.uncommittedChanges(worktree).catch(() => [])).length === 0) return {};
+		const failed = await this.verify(ctx, verifyCommands, worktree);
+		if (failed) {
+			const stashed = await this.stash(ctx, epic, ws, "blocked", { story });
+			await reporter.thought(
+				`${story.storyId}'s work so far didn't pass \`${failed.cmd}\` (exit ${failed.code}), so I stashed it${stashed ? ` (\`${stashed.slice(0, 10)}\`)` : ""} instead of committing it.`,
+			);
+			return { stashed };
+		}
+		let sha: string | undefined;
+		try {
+			sha = await git.commitAll(worktree, `wip(${story.storyId}): ${summary}\n\nEpic: ${epic.identifier} ${epic.title}`);
+		} catch (e) {
+			const stashed = await this.stash(ctx, epic, ws, "blocked", { story });
+			await reporter.thought(`Committing ${story.storyId}'s work so far failed, so I stashed it instead:\n\n\`\`\`\n${tail(String(e), 1500)}\n\`\`\``);
+			return { stashed };
+		}
+		if (!sha) return {};
+		await this.dropStoryStashes(ctx, ws, story);
+		// Anything the commit didn't take (rewritten by a hook, say) is set aside, offered again next time.
+		const stashed = await this.stash(ctx, epic, ws, "blocked", { story });
+		await reporter.thought(`Committed ${story.storyId}'s work so far as \`${sha.slice(0, 10)}\` (\`wip(${story.storyId}): ${summary}\`).`);
+		await this.publishStoryCommit(ctx, epic, ws, sha);
+		return { sha, stashed };
+	}
+
+	/** Push a story's commit and keep the PR/MR in step, when `pushPerStory` is on and there is a remote. */
+	private async publishStoryCommit(ctx: EngineRun, epic: Epic, ws: Workspace, sha: string | undefined): Promise<void> {
+		const { config, git } = this.deps;
+		const { lane, worktree } = ws;
+		// No remote yet is fine: commits stay local and are pushed once `origin` exists.
+		if (!sha || !config.ralph.pushPerStory || !lane.branch || !(await git.remoteUrl(worktree))) return;
+		try {
+			await git.push(worktree, lane.branch);
+			await this.syncPullRequest(ctx, epic, ws, { ready: false, open: config.ralph.openPullRequestEarly, final: false });
+		} catch (err) {
+			await ctx.reporter.error(`Push failed: ${String(err)}`);
+		}
+	}
+
+	/**
+	 * Stash what a session left uncommitted under a `cyralph: …` label and record the entry on the lane:
+	 * with the story whose work it is, or as the epic's when no story owns it. Returns the entry's SHA.
+	 */
+	private async stash(ctx: EngineRun, epic: Epic, ws: Workspace, reason: string, by: { story?: Story; owner?: string }): Promise<string | undefined> {
+		// Without per-story commits, finished stories' work stays uncommitted in the worktree on purpose.
+		if (!this.deps.config.ralph.commitPerStory) return undefined;
+		const label = stashLabel(epic.identifier, reason, by.story?.storyId ?? by.owner);
+		let sha: string | undefined;
+		try {
+			sha = await this.deps.git.stashAll(ws.worktree, label);
+		} catch (err) {
+			this.deps.log.warn(`${epic.identifier}: could not stash "${label}": ${String(err)}`);
+			await ctx.reporter.error(`I couldn't stash the uncommitted changes in \`${ws.worktree}\` ("${label}"): ${String(err)}`);
+			return undefined;
+		}
+		if (!sha) return undefined;
+		ws.lane.stashes = [...(ws.lane.stashes ?? []), { sha, label, ...(by.story && { storyKey: by.story.key }), reason, createdAt: new Date().toISOString() }];
+		await ctx.persist();
+		return sha;
+	}
+
+	/** Before an agent session: stash anything left in the worktree (`pre-run`), so the session starts clean. */
+	private async startClean(ctx: EngineRun, epic: Epic, ws: Workspace, owner: string): Promise<void> {
+		const sha = await this.stash(ctx, epic, ws, "pre-run", { owner });
+		if (sha) await ctx.reporter.thought(`The worktree had uncommitted changes from an earlier session, so I stashed them first (\`${sha.slice(0, 10)}\`).`);
+	}
+
+	/** Unapplied stash entries recorded for a story that are still in the stash list (the rest are forgotten). */
+	private async offeredStashes(ctx: EngineRun, ws: Workspace, story: Story): Promise<OfferedStash[]> {
+		const mine = (ws.lane.stashes ?? []).filter((e) => e.storyKey === story.key);
+		if (mine.length === 0) return [];
+		let live: Set<string>;
+		try {
+			live = new Set((await this.deps.git.listStashes(ws.worktree)).map((e) => e.sha));
+		} catch (err) {
+			this.deps.log.warn(`could not list stashes in ${ws.worktree}: ${String(err)}`);
+			return [];
+		}
+		const gone = mine.filter((e) => !live.has(e.sha));
+		if (gone.length) {
+			ws.lane.stashes = (ws.lane.stashes ?? []).filter((e) => !gone.includes(e));
+			await ctx.persist();
+		}
+		return mine.filter((e) => live.has(e.sha) && !e.applied).map((e) => ({ sha: e.sha, label: e.label, date: e.createdAt }));
+	}
+
+	/** Note the story's stash entries its agent applied (by full or abbreviated SHA), so they aren't offered again. */
+	private markApplied(ws: Workspace, story: Story, shas: string[]): void {
+		const wanted = shas.map((x) => x.trim().toLowerCase()).filter((x) => x.length >= 7);
+		for (const e of ws.lane.stashes ?? []) {
+			if (e.storyKey === story.key && wanted.some((x) => e.sha.startsWith(x))) e.applied = true;
+		}
+	}
+
+	/** Drop every stash entry recorded for a story (its work is committed), leaving all other entries alone. */
+	private async dropStoryStashes(ctx: EngineRun, ws: Workspace, story: Story): Promise<void> {
+		const mine = (ws.lane.stashes ?? []).filter((e) => e.storyKey === story.key);
+		if (mine.length === 0) return;
+		const dropped = new Set<string>();
+		for (const e of mine) {
+			try {
+				await this.deps.git.dropStash(ws.worktree, e.sha);
+				dropped.add(e.sha);
+			} catch (err) {
+				this.deps.log.warn(`could not drop stash ${e.sha} (${e.label}): ${String(err)}`);
+			}
+		}
+		ws.lane.stashes = (ws.lane.stashes ?? []).filter((e) => !dropped.has(e.sha));
+		await ctx.persist();
 	}
 
 	/**
@@ -784,7 +975,7 @@ export class EpicEngine {
 			sha = await git.commitAll(worktree, `${subject}\n\nEpic: ${epic.identifier} ${epic.title}`);
 		} catch (e) {
 			return {
-				feedback: `The agent signalled completion and verification passed, but committing the work failed:\n\n\`\`\`\n${tail(String(e), MAX_FEEDBACK)}\n\`\`\`\n\nFix what stops the commit (for example a git hook that rejects it). Don't commit yourself: the orchestrator commits once the story completes.`,
+				feedback: `The agent reported the story complete and verification passed, but committing the work failed:\n\n\`\`\`\n${tail(String(e), MAX_FEEDBACK)}\n\`\`\`\n\nFix what stops the commit (for example a git hook that rejects it). Don't commit yourself: the orchestrator commits once the story completes.`,
 			};
 		}
 		let left: string[];
@@ -797,30 +988,32 @@ export class EpicEngine {
 		const shown = left.slice(0, 50).join("\n") + (left.length > 50 ? `\n… and ${left.length - 50} more` : "");
 		return {
 			sha,
-			feedback: `The agent signalled completion, but after the orchestrator committed the story these files were still uncommitted (\`git status --porcelain\`):\n\n\`\`\`\n${shown}\n\`\`\`\n\nThe worktree must be clean when the story is done. Files that belong to the story must be committable (not inside a nested git repository, not rewritten by a git hook after staging); anything else should be deleted, or added to \`.gitignore\` if it's generated. Don't commit yourself: the orchestrator commits once the story completes.`,
+			feedback: `The agent reported the story complete, but after the orchestrator committed the story these files were still uncommitted (\`git status --porcelain\`):\n\n\`\`\`\n${shown}\n\`\`\`\n\nThe worktree must be clean when the story is done. Files that belong to the story must be committable (not inside a nested git repository, not rewritten by a git hook after staging); anything else should be deleted, or added to \`.gitignore\` if it's generated. Don't commit yourself: the orchestrator commits once the story completes.`,
 		};
 	}
 
 	/**
-	 * File the story session's `<follow-up>` blocks as sub-issues of the epic (blocking the story when it
-	 * didn't complete), then re-read the epic. Returns true when the story now waits on issues filed during
-	 * its session, through these blocks or by the agent itself: the attempt doesn't count, those issues are
+	 * File the story session's `followUps` as sub-issues of the epic (blocking the story when it didn't
+	 * complete), then re-read the epic. Returns true when the story now waits on issues filed during its
+	 * session, through its result or by the agent itself: the attempt doesn't count, those issues are
 	 * worked first (or waited for, outside the epic), and the story runs again once they're done.
 	 */
 	private async handleFollowUps(args: {
 		ctx: EngineRun;
 		epic: Epic;
 		story: Story;
-		output: string;
+		/** The session's summary of its work. */
+		summary: string;
+		followUps: FollowUp[];
 		complete: boolean;
 		depsBefore: ReadonlySet<string>;
 		attempt: number;
 		exhausted: () => Set<string>;
 	}): Promise<boolean> {
-		const { ctx, epic, story, output, complete, depsBefore, attempt } = args;
+		const { ctx, epic, story, summary, complete, depsBefore, attempt } = args;
 		if (epic.kind !== "children") return false;
 		const { record, reporter } = ctx;
-		const requested = parseFollowUps(output);
+		const requested = args.followUps;
 		if (requested.length > 0) await this.fileFollowUps(ctx, epic, story, requested, !complete);
 		if (complete) return false;
 
@@ -841,7 +1034,7 @@ export class EpicEngine {
 		record.followUpKeys = [...new Set([...(record.followUpKeys ?? []), ...inEpic])];
 		const names = added.map((d) => dependencyLabel(epic, d));
 		record.lastFeedback[story.key] =
-			`The previous session found work that had to be done first, so this story waited for ${names.join(", ")}. That work is finished now: check every acceptance criterion again. The previous session's final message was:\n\n${quote(tail(output, 2000))}`;
+			`The previous session found work that had to be done first, so this story waited for ${names.join(", ")}. That work is finished now: check every acceptance criterion again. The previous session's summary was:\n\n${quote(tail(summary, 2000))}`;
 		await ctx.persist();
 
 		const bold = (ids: string[]) => ids.map((d) => `**${dependencyLabel(epic, d)}**`).join(", ");
@@ -962,8 +1155,8 @@ export class EpicEngine {
 
 	private async completeStory(args: { ctx: EngineRun; epic: Epic; story: Story; ws: Workspace; sha?: string; summary: string }) {
 		const { ctx, epic, story, ws, sha, summary } = args;
-		const { worktree, lane } = ws;
-		const { config, linear, git, log } = this.deps;
+		const { lane } = ws;
+		const { linear, log } = this.deps;
 		const { record, reporter } = ctx;
 
 		story.status = "completed";
@@ -980,15 +1173,7 @@ export class EpicEngine {
 			await linear.addComment(story.issueId, note).catch((e: unknown) => log.warn(String(e)));
 		}
 
-		// No remote yet is fine: commits stay local and are pushed once `origin` exists.
-		if (sha && config.ralph.pushPerStory && lane.branch && (await git.remoteUrl(worktree))) {
-			try {
-				await git.push(worktree, lane.branch);
-				await this.syncPullRequest(ctx, epic, ws, { ready: false, open: config.ralph.openPullRequestEarly, final: false });
-			} catch (err) {
-				await reporter.error(`Push failed: ${String(err)}`);
-			}
-		}
+		await this.publishStoryCommit(ctx, epic, ws, sha);
 		const done = epic.stories.filter(isStoryDone).length;
 		await reporter.thought(`✅ **${story.storyId}** complete${sha ? ` (\`${sha.slice(0, 10)}\`)` : ""}. ${done}/${epic.stories.length} stories done.`);
 	}
@@ -1070,6 +1255,7 @@ export class EpicEngine {
 		if (!config.ralph.describePullRequest || !lane.branch || ctx.abortSignal.aborted) return undefined;
 		const progressFile = join(config.stateDir, "epics", epic.identifier, "progress.md");
 		await reporter.thought(`Writing the ${forge.term} title and description${lane === record ? "" : ` for \`${repo.name}\``}.`);
+		await this.startClean(ctx, epic, ws, "pr-description");
 		const result = await runner
 			.run({
 				prompt: buildPullRequestPrompt({ epic, branch: lane.branch, baseBranch: repo.baseBranch, prTerm: forge.term, progressFile }),
@@ -1082,15 +1268,17 @@ export class EpicEngine {
 				permissionMode: config.permissionMode,
 				abortSignal: ctx.abortSignal,
 				systemAppend: PR_DESCRIPTION_SYSTEM_APPEND,
+				outputSchema: PR_DESCRIPTION_SCHEMA,
 			})
 			.catch((e: unknown) => {
 				log.warn(`${forge.term} description session failed: ${String(e)}`);
 				return undefined;
 			});
+		await this.stash(ctx, epic, ws, "unfinished", { owner: "pr-description" });
 		if (!result) return undefined;
 		record.totalCostUsd += result.costUsd ?? 0;
-		const text = result.isError || result.aborted ? undefined : parsePullRequestDescription(result.output);
-		if (!text) log.warn(`no ${forge.term} description from the agent (${result.errorMessage ?? "missing <pr-title>/<pr-description>"}); using a plain one`);
+		const text = result.isError || result.aborted ? undefined : readPullRequestDescription(result.structured);
+		if (!text) log.warn(`no ${forge.term} description from the agent (${result.errorMessage ?? "no valid structured result"}); using a plain one`);
 		return text;
 	}
 

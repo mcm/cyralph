@@ -4,7 +4,8 @@
  */
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { type Forge, type ForgeKind, createForge, detectForgeKind } from "./forge.js";
@@ -49,12 +50,12 @@ export async function runShell(command: string, cwd: string, timeoutMs?: number)
 	return run("bash", ["-lc", command], cwd, timeoutMs);
 }
 
-async function git(args: string[], cwd: string): Promise<CommandResult> {
-	return run("git", args, cwd);
+async function git(args: string[], cwd: string, env?: Record<string, string>): Promise<CommandResult> {
+	return run("git", args, cwd, undefined, env);
 }
 
-async function gitOrThrow(args: string[], cwd: string): Promise<string> {
-	const r = await git(args, cwd);
+async function gitOrThrow(args: string[], cwd: string, env?: Record<string, string>): Promise<string> {
+	const r = await git(args, cwd, env);
 	if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr.trim() || r.stdout.trim()}`);
 	return r.stdout.trim();
 }
@@ -70,6 +71,26 @@ export function sanitizeBranchName(name: string): string {
 			.replace(/^[-./]+|[-./]+$/g, "")
 			.replace(/\.lock$/i, "") || "cyralph-work"
 	);
+}
+
+/** One entry of the stash list, which every worktree of a repository shares. */
+export interface StashEntry {
+	/** The stash commit: stable, unlike its `stash@{n}` index. */
+	sha: string;
+	/** Its current `stash@{n}`. */
+	ref: string;
+	/** When it was stashed (ISO 8601). */
+	date: string;
+	/** The message it was stashed with. */
+	label: string;
+}
+
+/** What `removeWorkspace` did besides removing the worktree. */
+export interface RemovedWorkspace {
+	/** Stash entry holding the worktree's uncommitted changes. */
+	stashed?: string;
+	/** Commits the merge doesn't contain: the local branch was kept for them. */
+	unmerged?: number;
 }
 
 export interface PreparedWorkspace {
@@ -92,15 +113,29 @@ export interface GitWorkspace {
 	needsPush(cwd: string, baseBranch: string): Promise<boolean>;
 	/** True when the branch has commits its base branch doesn't (on `origin` when it has the base). */
 	hasCommits(cwd: string, baseBranch: string): Promise<boolean>;
-	/** Set aside uncommitted work (including untracked files) so the next story starts clean. */
-	stashAll(cwd: string, message: string): Promise<boolean>;
+	/**
+	 * Set aside uncommitted work (including untracked files) so the next session starts clean. Returns the
+	 * SHA of the new stash entry, or undefined when there was nothing to stash.
+	 */
+	stashAll(cwd: string, message: string): Promise<string | undefined>;
+	/** The stash list (shared by every worktree of the repository), newest first. */
+	listStashes(cwd: string): Promise<StashEntry[]>;
+	/** Drop the stash entry with this commit SHA; false when it isn't in the list (anymore). */
+	dropStash(cwd: string, sha: string): Promise<boolean>;
+	/**
+	 * Store stash entries on `branch` on `origin`, one commit per entry (oldest first, on top of the branch
+	 * when it exists already), each with the entry's tracked and untracked files and its label as message.
+	 */
+	pushStashes(cwd: string, branch: string, entries: StashEntry[]): Promise<void>;
+	/** Delete a local branch (nothing to do when it doesn't exist). */
+	deleteBranch(cwd: string, branch: string): Promise<void>;
 	push(cwd: string, branch: string): Promise<void>;
 	/**
-	 * Remove a worktree and its local branch once their work was merged. Nothing is removed while the
-	 * worktree has uncommitted changes or the branch has commits `mergedSha` doesn't contain; the
-	 * reason is returned instead.
+	 * Remove a worktree and its local branch once their work was merged. Uncommitted changes are stashed
+	 * with `stashMessage` first, and a branch with commits `mergedSha` doesn't contain is kept (only the
+	 * worktree goes).
 	 */
-	removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string }): Promise<string | undefined>;
+	removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string; stashMessage: string }): Promise<RemovedWorkspace>;
 	/** The PR/MR host for this worktree's `origin` (undefined when there is no remote). */
 	forge(cwd: string, opts?: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string }): Promise<Forge | undefined>;
 }
@@ -195,42 +230,91 @@ export class CliGitWorkspace implements GitWorkspace {
 		return count.code === 0 && Number(count.stdout.trim()) > 0;
 	}
 
-	async stashAll(cwd: string, message: string): Promise<boolean> {
+	async stashAll(cwd: string, message: string): Promise<string | undefined> {
 		const status = await gitOrThrow(["status", "--porcelain"], cwd);
-		if (!status) return false;
+		if (!status) return undefined;
 		await gitOrThrow(["stash", "push", "--include-untracked", "-m", message], cwd);
+		// Other worktrees push to the same list, so find the entry by its label rather than taking stash@{0}.
+		const entry = (await this.listStashes(cwd)).find((e) => e.label === message);
+		if (!entry) throw new Error(`stashed "${message}", but the entry isn't in the stash list`);
+		return entry.sha;
+	}
+
+	async listStashes(cwd: string): Promise<StashEntry[]> {
+		const out = await gitOrThrow(["stash", "list", "--format=%H%x1f%gd%x1f%cI%x1f%gs"], cwd);
+		return out
+			.split("\n")
+			.filter((l) => l.trim())
+			.map((line) => {
+				const [sha = "", ref = "", date = "", subject = ""] = line.split("\x1f");
+				// `git stash push -m` records "On <branch>: <message>".
+				return { sha, ref, date, label: subject.replace(/^(?:WIP on|On) [^:]*: /, "") };
+			});
+	}
+
+	async dropStash(cwd: string, sha: string): Promise<boolean> {
+		// Indexes shift as entries come and go, so look up the current one right before dropping.
+		const entry = (await this.listStashes(cwd)).find((e) => e.sha === sha);
+		if (!entry) return false;
+		await gitOrThrow(["stash", "drop", entry.ref], cwd);
 		return true;
+	}
+
+	async pushStashes(cwd: string, branch: string, entries: StashEntry[]): Promise<void> {
+		if (entries.length === 0) return;
+		const existing = await git(["fetch", "origin", `refs/heads/${branch}`], cwd);
+		let tip = existing.code === 0 ? await gitOrThrow(["rev-parse", "FETCH_HEAD"], cwd) : undefined;
+		const dir = await mkdtemp(join(tmpdir(), "cyralph-stash-"));
+		const env = { GIT_INDEX_FILE: join(dir, "index") };
+		try {
+			for (const e of [...entries].reverse()) {
+				// A stash commit's tree has the tracked files; its third parent, if any, the untracked ones.
+				const untracked = await git(["rev-parse", "--verify", "--quiet", `${e.sha}^3`], cwd);
+				const trees = [`${e.sha}^{tree}`, ...(untracked.code === 0 ? [`${e.sha}^3^{tree}`] : [])];
+				await gitOrThrow(["read-tree", ...trees], cwd, env);
+				const tree = await gitOrThrow(["write-tree"], cwd, env);
+				const base = await gitOrThrow(["rev-parse", `${e.sha}^1`], cwd);
+				const message = `${e.label}\n\nStash ${e.sha} from ${e.date}, made on top of ${base}.`;
+				tip = await gitOrThrow(["commit-tree", tree, "-p", tip ?? base, "-m", message], cwd);
+			}
+		} finally {
+			await rm(dir, { recursive: true, force: true });
+		}
+		await gitOrThrow(["push", "origin", `${tip}:refs/heads/${branch}`], cwd);
+	}
+
+	async deleteBranch(cwd: string, branch: string): Promise<void> {
+		// Already gone (deleted by hand, say) is what was asked for.
+		if ((await git(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`], cwd)).code !== 0) return;
+		await gitOrThrow(["branch", "-D", branch], cwd);
 	}
 
 	async push(cwd: string, branch: string): Promise<void> {
 		await gitOrThrow(["push", "-u", "origin", branch], cwd);
 	}
 
-	async removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string }): Promise<string | undefined> {
+	async removeWorkspace(opts: { repositoryPath: string; path: string; branch: string; mergedSha?: string; stashMessage: string }): Promise<RemovedWorkspace> {
 		const repo = opts.repositoryPath;
 		const hasWorktree = existsSync(join(opts.path, ".git"));
 		const tip = await git(["rev-parse", "--verify", "--quiet", `refs/heads/${opts.branch}`], repo);
-		if (!hasWorktree && tip.code !== 0) return undefined;
-		if (hasWorktree) {
-			const status = await git(["status", "--porcelain"], opts.path);
-			if (status.code !== 0) return `\`git status\` failed in ${opts.path}: ${status.stderr.trim()}`;
-			if (status.stdout.trim()) return "the worktree has uncommitted changes";
-		}
+		if (!hasWorktree && tip.code !== 0) return {};
+		const stashed = hasWorktree ? await this.stashAll(opts.path, opts.stashMessage) : undefined;
 		const heads = [hasWorktree ? (await git(["rev-parse", "HEAD"], opts.path)).stdout.trim() : "", tip.code === 0 ? tip.stdout.trim() : ""].filter(Boolean);
+		let unmerged = 0;
 		if (opts.mergedSha) {
 			const merged = opts.mergedSha;
 			// The merged head may only be on the remote (e.g. pushed by someone else).
 			if ((await git(["cat-file", "-e", `${merged}^{commit}`], repo)).code !== 0) await git(["fetch", "origin"], repo);
 			for (const head of heads) {
-				if (head !== merged && (await git(["merge-base", "--is-ancestor", head, merged], repo)).code !== 0) {
-					return `\`${opts.branch}\` has commits that weren't merged`;
-				}
+				if (head === merged || (await git(["merge-base", "--is-ancestor", head, merged], repo)).code === 0) continue;
+				const count = await git(["rev-list", "--count", head, `^${merged}`], repo);
+				unmerged = Math.max(unmerged, Number(count.stdout.trim()) || 1);
 			}
 		}
 		if (hasWorktree) await gitOrThrow(["worktree", "remove", "--force", opts.path], repo);
 		await git(["worktree", "prune"], repo);
-		if (tip.code === 0) await gitOrThrow(["branch", "-D", opts.branch], repo);
-		return undefined;
+		if (tip.code === 0 && unmerged === 0) await gitOrThrow(["branch", "-D", opts.branch], repo);
+		return { ...(stashed && { stashed }), ...(unmerged > 0 && { unmerged }) };
 	}
 
 	async forge(cwd: string, opts: { forge?: ForgeKind; gitlabHosts?: string[]; gitlabHost?: string } = {}): Promise<Forge | undefined> {
