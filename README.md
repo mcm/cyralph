@@ -149,6 +149,69 @@ triggers a wake:
   blockers or manual stories. Other story-to-story dependencies inside the epic still apply, and the
   manual stories themselves are still left to a person.
 
+### Preparation steps on manual stories
+
+Some manual steps start with mechanical setup that cyralph could do, but shouldn't do unattended
+because it's destructive or reaches outside the repository: force-pushing the epic to a staging
+branch before a live smoke test, or triggering a deploy hook. A manual story can carry the exact
+shell commands for that setup in one or more fenced blocks with the info string `cyralph-prepare`:
+
+- Each non-empty line is one command, run as written (no templating or placeholders), with the
+  epic worktree as the working directory. Leading and trailing whitespace is dropped. Several blocks
+  run in order as one sequence.
+- Blocks are honoured **only in manual stories** of an epic. In agent stories, the epic issue itself,
+  @mention sessions and single-issue delegations they are ignored.
+- cyralph knows nothing about what the commands are for, and it never marks the manual story done.
+  The person still does the rest of the step and moves it to Done.
+
+When a manual story with preparation is unblocked (every story it depends on is done), cyralph
+pushes the epic branch, so `origin` has the commit it shows, and asks in the epic's session with
+the commands, the branch and its `HEAD` commit. It asks instead of parking (or, if the run otherwise
+finished, right after the *Finished* message). One question is open at a time, in story order. The
+options:
+
+| Answer | What happens |
+| --- | --- |
+| **Run it** | The commands run one at a time. Each command and its output (the last 4000 characters) are posted to the session. The first non-zero exit stops the sequence. |
+| **I'll do it myself** | Nothing runs, and cyralph doesn't ask about that story again. |
+| **Not yet** | Nothing runs, and the question stays open. Answer it later. |
+
+You can pick an option or reply with its text or its number (`1`-`3`). Anyone who can reply in the
+session can answer.
+
+- **Approval binding.** "Run it" applies to the commands and the commit that were shown. Before
+  running, cyralph re-reads the story from Linear and checks the worktree `HEAD`. If the commands
+  were edited or `HEAD` moved, it runs nothing and asks again with the new values.
+- **Failure.** When a command fails, its output is posted, the rest of the sequence is skipped and
+  the question is asked again. Nothing is retried on its own.
+- **After a successful run** the story isn't asked about again, even when the epic branch moves
+  later. Reply `rerun preparation` to be asked again about the earliest open manual story whose
+  preparation can run (also after "I'll do it myself"). The parked and finished messages remind you
+  of this while such a story is open.
+- **`allowPreparation`** (under `ralph`, default `true`, and per repository, which overrides it):
+  set it to `false` to never offer preparation. cyralph then posts a note that the commands are left
+  to a person and parks or finishes as usual.
+
+Commands run on the cyralph host with its credentials, nothing more. There is no flag to skip the
+question: work that should run unattended belongs in an agent story.
+
+For example, a manual smoke-test story that depends on the epic's last agent story:
+
+````markdown
+Smoke-test the epic on staging.
+
+```cyralph-prepare
+git push --force origin HEAD:staging
+```
+
+Once staging has redeployed, sign in on https://staging.example.com, run through the checkout flow
+and mark this story Done.
+````
+
+When the last agent story is done, the session asks whether to run
+`git push --force origin HEAD:staging`. On **Run it** the push happens and its output appears in
+the session. The session stays parked on the smoke-test story until a person marks it done.
+
 ## Ralph semantics kept from ralph-tui
 
 - **One story per session.** Each story runs in a fresh context. The PRD, the progress log and the
